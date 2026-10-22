@@ -4,7 +4,7 @@ members = ["."]
 
 [package]
 name = "vpngate-gui"
-version = "0.4.4"
+version = "0.4.5"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -14,7 +14,7 @@ description = "Opt-in eframe/egui GUI preview for VPN Gate Connect"
 publish = false
 
 [dependencies]
-eframe = { version = "0.37.0", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
+eframe = { version = "0.37.0", default-features = false, features = ["accesskit", "default_fonts", "glow", "system_fonts", "wayland", "x11"] }
 vpngate-core = { path = "../vpngate-core" }
 
 [lints.rust]
