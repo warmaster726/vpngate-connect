@@ -14,7 +14,7 @@ import { connect } from "cloudflare:sockets";
  *  - Completely isolated from root `Cargo.toml`, `Cargo.lock`, and desktop installer scripts.
  */
 
-const APP_VERSION = "0.2.0";
+const APP_VERSION = "0.2.1";
 const POOL_CACHE_TTL_MS = 180_000;
 const POOL_CACHE_KEY_URL = "https://vpngate-edge-cache.internal/v1/pool-snapshot";
 const USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) VPNGate-WebWorker/0.2";
@@ -32,6 +32,7 @@ const OFFICIAL_MIRROR_SITES_URLS = [
   "https://www.vpngate.net/en/sites.aspx",
   "http://www.vpngate.net/en/sites.aspx",
   "https://www.vpngate.net/ja/sites.aspx",
+  "https://www.vpngate.net/cn/sites.aspx",
 ];
 
 const DAILY_MIRROR_JSON_URLS = [
@@ -42,8 +43,10 @@ const DAILY_MIRROR_JSON_URLS = [
 const WAYBACK_MIRROR_SITES_CDX_URL =
   "https://web.archive.org/cdx/search/cdx?url=www.vpngate.net/en/sites.aspx&output=json&limit=-2&filter=statuscode:200&collapse=timestamp:8";
 
-const WAYBACK_PORTAL_CDX_URL =
-  "https://web.archive.org/cdx/search/cdx?url=www.vpngate.net/en/&output=json&limit=-2&filter=statuscode:200&collapse=timestamp:8";
+const WAYBACK_PORTAL_CDX_URLS = [
+  "https://web.archive.org/cdx/search/cdx?url=www.vpngate.net/en/&output=json&limit=-6&filter=statuscode:200&collapse=timestamp:8",
+  "https://web.archive.org/cdx/search/cdx?url=www.vpngate.net/ja/&output=json&limit=-4&filter=statuscode:200&collapse=timestamp:8",
+];
 
 const MIRROR_CSV_URLS = [
   "https://cdn.jsdelivr.net/gh/GeorgeXie2333/vpngate-list-mirror@latest/data/vpngate.csv",
@@ -51,7 +54,12 @@ const MIRROR_CSV_URLS = [
   "https://raw.githubusercontent.com/sinspired/VpngateAPI/main/servers.csv",
   "https://raw.githubusercontent.com/cjsl99/VpngateAPI/main/servers.csv",
   "https://raw.githubusercontent.com/NetLops/vpngate-mirror/main/vpngate.csv",
+  "https://raw.githubusercontent.com/GeorgeXie2333/vpngate-mirror/main/data/servers.csv",
+  "https://raw.githubusercontent.com/funcra/vpngate-mirror/main/api/iphone.csv",
 ];
+
+const SDISE_CSV_URL = "https://raw.githubusercontent.com/sdise/vpngate/main/vpngate.csv";
+const MAX_OFFICIAL_MIRROR_CSV = 12;
 
 const SAFE_PROBE_PORTS = new Set([443, 995, 1194, 1195, 1701, 5555, 8080, 8443]);
 
@@ -339,6 +347,43 @@ export function parseVpngateCsvInto(csvRaw, serversByIp) {
         ovpn_b64: ovpnOk ? b64 : "",
       });
     }
+  }
+}
+
+/** Rolling `sdise/vpngate` candidate CSV (`Country,Hostname,IP,Speed_Mbps`). Protocol flags stay false until handshake. */
+export function parseSdiseCsvInto(csvRaw, serversByIp) {
+  if (!csvRaw) return;
+  const lines = csvRaw.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
+    if (!trimmed) continue;
+    const row = splitCsvRowFast(trimmed, 5);
+    if (row.length < 4) continue;
+    if (row[0].trim().toLowerCase() === "country") continue;
+    const ip = validPublicIpv4(row[2]);
+    if (!ip || serversByIp.has(ip)) continue;
+    const [countryLong, countryShort] = normalizeCountryPair(row[0], "");
+    let host = (row[1] || "").trim().replace(/\.opengw\.net$/i, "");
+    if (!host) host = ip;
+    const mbps = parseFloat(String(row[3]).replace(/,/g, "")) || 0;
+    const speedBps = Math.round(Math.max(0, mbps) * 1_000_000);
+    serversByIp.set(ip, {
+      hostname: host,
+      ip,
+      score: Math.max(100_000, Math.floor(speedBps / 500)),
+      ping_ms: 9999,
+      speed_bps: speedBps,
+      country_long: countryLong,
+      country_short: countryShort,
+      sessions: 0,
+      uptime_ms: 0,
+      operator: "VPNGate Volunteer",
+      l2tp: false,
+      openvpn: false,
+      tcp_port: 0,
+      udp_port: 0,
+      ovpn_b64: "",
+    });
   }
 }
 
@@ -845,6 +890,45 @@ async function fetchFromOfficialMirrorPortal(mirror) {
   return { csvBody, baseHtml, l2tpHtml, ovpnHtml, extraMirrors };
 }
 
+async function fetchMirrorCsvOnly(mirror) {
+  const csvRes = await fetchTextTimeout(`${mirror.base_url}/api/iphone/`, 4000);
+  if (csvRes && (csvRes.text.includes("*vpn_servers") || csvRes.text.includes("#HostName"))) {
+    return csvRes.text;
+  }
+  return "";
+}
+
+async function fetchHttpsCsvBodies() {
+  const tasks = MIRROR_CSV_URLS.map((u) => fetchTextTimeout(u, 4500));
+  const sdiseTask = fetchTextTimeout(SDISE_CSV_URL, 4000);
+  const [csvResults, sdise] = await Promise.all([Promise.all(tasks), sdiseTask]);
+  const bodies = [];
+  for (const r of csvResults) {
+    if (r && (r.text.includes("*vpn_servers") || r.text.includes("#HostName"))) {
+      bodies.push(r.text);
+    }
+  }
+  return { bodies, sdiseText: sdise ? sdise.text : "" };
+}
+
+async function fetchWaybackPortalHtml() {
+  for (const cdxUrl of WAYBACK_PORTAL_CDX_URLS) {
+    const cdx = await fetchTextTimeout(cdxUrl, 2600);
+    if (!cdx) continue;
+    try {
+      const rows = JSON.parse(cdx.text);
+      if (!Array.isArray(rows) || rows.length < 2) continue;
+      const last = rows[rows.length - 1];
+      if (!Array.isArray(last) || last.length < 3) continue;
+      const snap = await fetchTextTimeout(`https://web.archive.org/web/${last[1]}id_/${last[2]}`, 3500);
+      if (snap && snap.text.includes("vg_table_row_")) return snap.text;
+    } catch {
+      // try next CDX
+    }
+  }
+  return "";
+}
+
 function summarizeCountries(servers) {
   const map = new Map();
   for (const s of servers) {
@@ -866,8 +950,8 @@ function summarizeCountries(servers) {
     }
     entry.total_servers += 1;
     if (s.l2tp) entry.l2tp_count += 1;
-    if (s.openvpn && (s.udp_port > 0 || (s.has_ovpn_cert && s.tcp_port === 0))) entry.openvpn_udp_count += 1;
-    if (s.openvpn && (s.tcp_port > 0 || (s.has_ovpn_cert && s.udp_port === 0))) entry.openvpn_tcp_count += 1;
+    if (supportsOpenvpnUdp(s)) entry.openvpn_udp_count += 1;
+    if (supportsOpenvpnTcp(s)) entry.openvpn_tcp_count += 1;
     if (s.speed_bps > entry.max_speed_bps) entry.max_speed_bps = s.speed_bps;
     if (s.ping_ms > 0 && s.ping_ms < entry.best_ping_ms) entry.best_ping_ms = s.ping_ms;
   }
@@ -879,11 +963,57 @@ function summarizeCountries(servers) {
   );
 }
 
+function hasOvpnCert(s) {
+  return Boolean((s && s.has_ovpn_cert) || (s && s.ovpn_b64 && s.ovpn_b64.length > 40));
+}
+
+function supportsOpenvpnUdp(s) {
+  return Boolean(s.openvpn && (s.udp_port > 0 || (hasOvpnCert(s) && s.tcp_port === 0)));
+}
+
+function supportsOpenvpnTcp(s) {
+  return Boolean(s.openvpn && (s.tcp_port > 0 || (hasOvpnCert(s) && s.udp_port === 0)));
+}
+
 function autoPriorityTier(s) {
   if (s.l2tp) return 0;
-  if (s.openvpn && s.udp_port > 0) return 1;
-  if (s.openvpn) return 2;
+  if (supportsOpenvpnUdp(s)) return 1;
+  if (supportsOpenvpnTcp(s) || s.openvpn) return 2;
   return 3;
+}
+
+function effectivePing(s) {
+  const n = Number(s && s.ping_ms) || 0;
+  return n === 0 || n >= 9999 ? 999999 : n;
+}
+
+/** Desktop `sort_servers` parity (`Recommended` / `Speed` / `Ping` / `Score`). */
+function sortServersDesktop(list, sortKey, protoFilter) {
+  return list.slice().sort((a, b) => {
+    const liveA = a.verify_state === "live" ? 0 : a.verify_state === "dead" ? 2 : 1;
+    const liveB = b.verify_state === "live" ? 0 : b.verify_state === "dead" ? 2 : 1;
+    if (liveA !== liveB) return liveA - liveB;
+
+    let tierDiff = 0;
+    if (protoFilter === "auto" || protoFilter === "all" || !protoFilter) {
+      tierDiff = autoPriorityTier(a) - autoPriorityTier(b);
+    } else if (protoFilter === "openvpn") {
+      tierDiff = Number(supportsOpenvpnUdp(b)) - Number(supportsOpenvpnUdp(a));
+    }
+
+    const pingA = effectivePing(a);
+    const pingB = effectivePing(b);
+    if (sortKey === "speed") {
+      return (b.speed_bps - a.speed_bps) || tierDiff || (b.score - a.score);
+    }
+    if (sortKey === "ping") {
+      return (pingA - pingB) || tierDiff || (b.speed_bps - a.speed_bps);
+    }
+    if (sortKey === "score") {
+      return tierDiff || (b.score - a.score) || (b.speed_bps - a.speed_bps);
+    }
+    return tierDiff || (b.score - a.score) || (b.speed_bps - a.speed_bps) || (pingA - pingB);
+  });
 }
 
 async function discoverPoolFresh(customMirrorRaw = "") {
@@ -900,7 +1030,7 @@ async function discoverPoolFresh(customMirrorRaw = "") {
         location: "Custom Mirror",
         source: "custom",
       });
-      logs.push({ level: "info", msg: `Using custom Official Mirror Portal: ${norm.portal_url}` });
+      logs.push({ level: "info", msg: `Seeding extra Official Mirror Portal (merged with all others): ${norm.portal_url}` });
     } else {
       logs.push({ level: "warn", msg: "Ignored invalid or private custom mirror URL." });
     }
@@ -912,8 +1042,8 @@ async function discoverPoolFresh(customMirrorRaw = "") {
   let ovpnHtml = "";
   let primaryMirrors = [];
 
-  // Stage 1: Primary vpngate.net (skipped first only if user explicitly requested a custom mirror test)
-  if (customMirrors.length === 0) {
+  // Stage 1: Primary vpngate.net is always queried. Extra portals are seeds, never exclusive replacements.
+  {
     logs.push({ level: "info", msg: "Querying primary vpngate.net (/api/iphone/ + /en/ + sites.aspx) ..." });
     const [csvRes, htmlRes, sitesRes] = await Promise.all([
       (async () => {
@@ -973,79 +1103,77 @@ async function discoverPoolFresh(customMirrorRaw = "") {
 
   let harvestedMirrors = mergeMirrorLists(customMirrors, primaryMirrors);
 
-  // Stage 1b: Official VPNGate Mirror Portals (automatic failover or custom mirror)
-  if (serversByIp.size === 0 || !l2tpHtml || customMirrors.length > 0) {
-    if (harvestedMirrors.length === 0) {
-      const fb = await fetchFallbackMirrors();
-      harvestedMirrors = mergeMirrorLists(harvestedMirrors, fb);
+  // Stage 1b: apply EVERY Official VPNGate Mirror Portal CSV (do not list without merging).
+  logs.push({ level: "info", msg: "Harvesting Official VPNGate Mirror Portals for direct pool merge ..." });
+  const fbMirrors = await fetchFallbackMirrors();
+  harvestedMirrors = mergeMirrorLists(harvestedMirrors, fbMirrors);
+
+  const mirrorSlice = harvestedMirrors.slice(0, MAX_OFFICIAL_MIRROR_CSV);
+  if (mirrorSlice.length > 0) {
+    const csvBodies = await Promise.all(mirrorSlice.map((m) => fetchMirrorCsvOnly(m)));
+    let portalHits = 0;
+    for (let i = 0; i < csvBodies.length; i++) {
+      if (!csvBodies[i]) continue;
+      parseVpngateCsvInto(csvBodies[i], serversByIp);
+      portalHits += 1;
+      mirrorSlice[i].reachable = true;
     }
-    const candidates = harvestedMirrors.slice(0, 3);
-    for (const m of candidates) {
+    if (portalHits > 0) {
+      logs.push({
+        level: "ok",
+        msg: `Merged ${portalHits}/${mirrorSlice.length} Official Mirror /api/iphone/ feed(s) directly into the pool.`,
+      });
+    } else {
+      logs.push({ level: "warn", msg: "Official Mirror CSVs were unreachable this round — continuing with other feeds." });
+    }
+  }
+
+  // Full HTML+ASP.NET tables only when L2TP listing is still missing, or a custom portal was seeded.
+  if (!l2tpHtml || customMirrors.length > 0) {
+    const deep = (customMirrors.length > 0 ? customMirrors : harvestedMirrors).slice(0, 2);
+    for (const m of deep) {
       const res = await fetchFromOfficialMirrorPortal(m);
-      if (res) {
-        if (res.csvBody) parseVpngateCsvInto(res.csvBody, serversByIp);
-        parseVpngateHtmlInto(res.ovpnHtml, serversByIp);
-        parseVpngateHtmlInto(res.l2tpHtml, serversByIp);
-        parseVpngateHtmlInto(res.baseHtml, serversByIp);
-        if (res.l2tpHtml && !l2tpHtml) l2tpHtml = res.l2tpHtml;
-        if (res.extraMirrors.length > 0) {
-          harvestedMirrors = mergeMirrorLists(harvestedMirrors, res.extraMirrors);
-        }
-        logs.push({
-          level: "ok",
-          msg: `Official Mirror ${m.portal_url} (${m.location}) online — merged live relay tables.`,
-        });
-        break;
+      if (!res) continue;
+      if (res.csvBody) parseVpngateCsvInto(res.csvBody, serversByIp);
+      parseVpngateHtmlInto(res.ovpnHtml, serversByIp);
+      parseVpngateHtmlInto(res.l2tpHtml, serversByIp);
+      parseVpngateHtmlInto(res.baseHtml, serversByIp);
+      if (res.l2tpHtml && !l2tpHtml) l2tpHtml = res.l2tpHtml;
+      if (res.extraMirrors.length > 0) {
+        harvestedMirrors = mergeMirrorLists(harvestedMirrors, res.extraMirrors);
       }
+      logs.push({
+        level: "ok",
+        msg: `Official Mirror ${m.portal_url} (${m.location}) HTML tables merged.`,
+      });
+      if (l2tpHtml) break;
     }
   }
 
-  // Stage 2: HTTPS Multi-Mirror CSV + Wayback L2TP Metadata Enrichment
-  if (serversByIp.size < 80 || (!primaryCsv && serversByIp.size < 120) || !l2tpHtml) {
-    logs.push({ level: "info", msg: "Enriching relay pool via HTTPS CDN/GitHub mirrors ..." });
-    const csvTasks = MIRROR_CSV_URLS.slice(0, 4).map((u) => fetchTextTimeout(u, 4500));
-    const wbTask = !l2tpHtml
-      ? (async () => {
-          const cdx = await fetchTextTimeout(WAYBACK_PORTAL_CDX_URL, 2600);
-          if (!cdx) return "";
-          try {
-            const rows = JSON.parse(cdx.text);
-            if (Array.isArray(rows) && rows.length >= 2) {
-              const last = rows[rows.length - 1];
-              const snap = await fetchTextTimeout(`https://web.archive.org/web/${last[1]}id_/${last[2]}`, 3500);
-              return snap ? snap.text : "";
-            }
-          } catch {
-            return "";
-          }
-          return "";
-        })()
-      : Promise.resolve("");
-
-    const [csvResults, wbHtml] = await Promise.all([Promise.all(csvTasks), wbTask]);
-    let hits = 0;
-    for (const r of csvResults) {
-      if (r && (r.text.includes("*vpn_servers") || r.text.includes("#HostName"))) {
-        parseVpngateCsvInto(r.text, serversByIp);
-        hits++;
-      }
-    }
-    if (wbHtml) {
-      const wbMap = new Map();
-      parseVpngateHtmlInto(wbHtml, wbMap);
-      for (const [ip, wbSrv] of wbMap.entries()) {
-        if (wbSrv.l2tp && serversByIp.has(ip)) {
-          serversByIp.get(ip).l2tp = true;
-        }
-      }
-    }
-    if (hits > 0) {
-      logs.push({ level: "ok", msg: `Merged ${hits} HTTPS CSV mirror feed(s) (${serversByIp.size} total relays).` });
+  // Stage 2: ALL HTTPS CSV mirrors + SDISE + Wayback L2TP metadata (desktop parity, always applied)
+  logs.push({ level: "info", msg: "Merging every HTTPS CSV / SDISE / archive feed into the live pool ..." });
+  const [{ bodies: httpsBodies, sdiseText }, wbHtml] = await Promise.all([
+    fetchHttpsCsvBodies(),
+    l2tpHtml ? Promise.resolve("") : fetchWaybackPortalHtml(),
+  ]);
+  let hits = 0;
+  for (const body of httpsBodies) {
+    parseVpngateCsvInto(body, serversByIp);
+    hits += 1;
+  }
+  if (sdiseText) parseSdiseCsvInto(sdiseText, serversByIp);
+  if (wbHtml) {
+    const wbMap = new Map();
+    parseVpngateHtmlInto(wbHtml, wbMap);
+    for (const [ip, wbSrv] of wbMap.entries()) {
+      if (wbSrv.l2tp && serversByIp.has(ip)) serversByIp.get(ip).l2tp = true;
     }
   }
-
-  if (harvestedMirrors.length === 0) {
-    harvestedMirrors = await fetchFallbackMirrors();
+  if (hits > 0) {
+    logs.push({
+      level: "ok",
+      msg: `Merged ${hits} HTTPS CSV mirror feed(s)${sdiseText ? " + SDISE" : ""} (${serversByIp.size} total relays).`,
+    });
   }
 
   // Locate shared SoftEther public client certificate template for HTML-only OpenVPN rows
@@ -1066,16 +1194,10 @@ async function discoverPoolFresh(customMirrorRaw = "") {
     fullServers.push(s);
   }
 
-  fullServers.sort((a, b) => {
-    const tierDiff = autoPriorityTier(a) - autoPriorityTier(b);
-    if (tierDiff !== 0) return tierDiff;
-    if (b.score !== a.score) return b.score - a.score;
-    if (b.speed_bps !== a.speed_bps) return b.speed_bps - a.speed_bps;
-    return (a.ping_ms || 9999) - (b.ping_ms || 9999);
-  });
+  const rankedServers = sortServersDesktop(fullServers, "recommended", "auto");
 
   const ovpnByIp = new Map();
-  const lightServers = fullServers.map((s) => {
+  const lightServers = rankedServers.map((s) => {
     if (s.ovpn_b64) ovpnByIp.set(s.ip, s.ovpn_b64);
     return {
       hostname: s.hostname,
@@ -1188,17 +1310,16 @@ function matchCountryServer(srv, query) {
   const low = q.toLowerCase();
   return (
     (srv.country_short || "").toUpperCase() === up ||
-    (srv.country_long || "").toLowerCase().includes(low) ||
-    (srv.hostname || "").toLowerCase().includes(low) ||
-    (srv.ip || "").includes(low)
+    (srv.country_long || "").toLowerCase().includes(low)
   );
 }
 
 function matchProtoServer(srv, proto) {
   if (!proto || proto === "auto" || proto === "all") return Boolean(srv.l2tp || srv.openvpn);
   if (proto === "l2tp") return Boolean(srv.l2tp);
-  if (proto === "udp") return Boolean(srv.openvpn && srv.udp_port > 0);
-  if (proto === "tcp") return Boolean(srv.openvpn && srv.tcp_port > 0);
+  if (proto === "openvpn" || proto === "ovpn") return Boolean(srv.openvpn);
+  if (proto === "udp" || proto === "openvpn-udp") return supportsOpenvpnUdp(srv);
+  if (proto === "tcp" || proto === "openvpn-tcp") return supportsOpenvpnTcp(srv);
   return Boolean(srv.l2tp || srv.openvpn);
 }
 
@@ -1423,23 +1544,15 @@ function unlockedProfiles(server, result) {
   return unlocked;
 }
 
-function sortVerifyCandidates(list) {
-  return list.slice().sort((a, b) => {
-    const liveA = a.verify_state === "live" ? 0 : a.verify_state === "dead" ? 2 : 1;
-    const liveB = b.verify_state === "live" ? 0 : b.verify_state === "dead" ? 2 : 1;
-    if (liveA !== liveB) return liveA - liveB;
-    const tier = autoPriorityTier(a) - autoPriorityTier(b);
-    if (tier !== 0) return tier;
-    if (b.score !== a.score) return b.score - a.score;
-    if (b.speed_bps !== a.speed_bps) return b.speed_bps - a.speed_bps;
-    return (a.ping_ms || 9999) - (b.ping_ms || 9999);
-  });
+function sortVerifyCandidates(list, sortKey = "recommended", proto = "auto") {
+  return sortServersDesktop(list, sortKey, proto);
 }
 
 async function recursiveVerifyRelays({
   servers,
   country = "ALL",
   proto = "auto",
+  sort = "recommended",
   exclude = [],
   ip = "",
   force = false,
@@ -1452,12 +1565,16 @@ async function recursiveVerifyRelays({
     candidates = found ? [found] : [];
   } else {
     candidates = sortVerifyCandidates(
-      servers.filter((s) => matchCountryServer(s, country) && matchProtoServer(s, proto) && !excludeSet.has(s.ip))
+      servers.filter((s) => matchCountryServer(s, country) && matchProtoServer(s, proto) && !excludeSet.has(s.ip)),
+      sort,
+      proto
     );
     if (candidates.length === 0 && country && country !== "ALL") {
       widened = true;
       candidates = sortVerifyCandidates(
-        servers.filter((s) => matchProtoServer(s, proto) && !excludeSet.has(s.ip))
+        servers.filter((s) => matchProtoServer(s, proto) && !excludeSet.has(s.ip)),
+        sort,
+        proto
       );
     }
   }
@@ -1851,6 +1968,7 @@ const PORTAL_JS = String.raw`
     proto: "auto",
     compat: "mobile3",
     dns: "1.1.1.1,1.0.0.1",
+    connectSort: "recommended",
     selectedIndex: 0,
     relaySearch: "",
     relayProto: "all",
@@ -1960,17 +2078,34 @@ const PORTAL_JS = String.raw`
     var low = q.toLowerCase();
     return (
       (srv.country_short || "").toUpperCase() === up ||
-      (srv.country_long || "").toLowerCase().indexOf(low) !== -1 ||
+      (srv.country_long || "").toLowerCase().indexOf(low) !== -1
+    );
+  }
+
+  function matchRelayQuery(srv, query) {
+    if (!query) return true;
+    if (matchCountry(srv, query)) return true;
+    var low = query.trim().toLowerCase();
+    return (
       (srv.hostname || "").toLowerCase().indexOf(low) !== -1 ||
       (srv.ip || "").indexOf(low) !== -1
     );
   }
 
+  function supportsUdp(srv) {
+    return Boolean(srv.openvpn && (srv.udp_port > 0 || (srv.has_ovpn_cert && srv.tcp_port === 0)));
+  }
+
+  function supportsTcp(srv) {
+    return Boolean(srv.openvpn && (srv.tcp_port > 0 || (srv.has_ovpn_cert && srv.udp_port === 0)));
+  }
+
   function matchProto(srv, proto) {
     if (!proto || proto === "auto" || proto === "all") return srv.l2tp || srv.openvpn;
     if (proto === "l2tp") return Boolean(srv.l2tp);
-    if (proto === "udp") return Boolean(srv.openvpn && srv.udp_port > 0);
-    if (proto === "tcp") return Boolean(srv.openvpn && srv.tcp_port > 0);
+    if (proto === "openvpn" || proto === "ovpn") return Boolean(srv.openvpn);
+    if (proto === "udp") return supportsUdp(srv);
+    if (proto === "tcp") return supportsTcp(srv);
     return true;
   }
 
@@ -1979,11 +2114,13 @@ const PORTAL_JS = String.raw`
       var liveA = a.verify_state === "live" ? 0 : a.verify_state === "dead" ? 2 : 1;
       var liveB = b.verify_state === "live" ? 0 : b.verify_state === "dead" ? 2 : 1;
       if (liveA !== liveB) return liveA - liveB;
-      var tierA = a.l2tp ? 0 : (a.openvpn && a.udp_port > 0 ? 1 : 2);
-      var tierB = b.l2tp ? 0 : (b.openvpn && b.udp_port > 0 ? 1 : 2);
-      var tierDiff = (protoFilter === "auto" || protoFilter === "all") ? (tierA - tierB) : 0;
-      var pingA = a.ping_ms > 0 ? a.ping_ms : 99999;
-      var pingB = b.ping_ms > 0 ? b.ping_ms : 99999;
+      var tierA = a.l2tp ? 0 : (supportsUdp(a) ? 1 : 2);
+      var tierB = b.l2tp ? 0 : (supportsUdp(b) ? 1 : 2);
+      var tierDiff = 0;
+      if (protoFilter === "auto" || protoFilter === "all" || !protoFilter) tierDiff = tierA - tierB;
+      else if (protoFilter === "openvpn") tierDiff = (supportsUdp(b) ? 1 : 0) - (supportsUdp(a) ? 1 : 0);
+      var pingA = (!a.ping_ms || a.ping_ms >= 9999) ? 999999 : a.ping_ms;
+      var pingB = (!b.ping_ms || b.ping_ms >= 9999) ? 999999 : b.ping_ms;
       if (sortKey === "speed") return (b.speed_bps - a.speed_bps) || tierDiff || (b.score - a.score);
       if (sortKey === "ping") return (pingA - pingB) || tierDiff || (b.speed_bps - a.speed_bps);
       if (sortKey === "score") return tierDiff || (b.score - a.score) || (b.speed_bps - a.speed_bps);
@@ -2067,7 +2204,7 @@ const PORTAL_JS = String.raw`
     var filtered = state.servers.filter(function (s) {
       return matchCountry(s, state.country) && matchProto(s, state.proto);
     });
-    return sortList(filtered, "recommended", state.proto);
+    return sortList(filtered, state.connectSort, state.proto);
   }
 
   function applyVerifiedToServers(verified, attempts) {
@@ -2225,7 +2362,7 @@ const PORTAL_JS = String.raw`
     if (!listEl || !metaEl) return;
 
     var filtered = state.servers.filter(function (s) {
-      return matchCountry(s, state.relaySearch) && matchProto(s, state.relayProto);
+      return matchRelayQuery(s, state.relaySearch) && matchProto(s, state.relayProto);
     });
     var sorted = sortList(filtered, state.relaySort, state.relayProto);
     var liveN = sorted.filter(function (s) { return s.verify_state === "live"; }).length;
@@ -2289,9 +2426,9 @@ const PORTAL_JS = String.raw`
     var listEl = document.getElementById("mirrors-list");
     var cntEl = document.getElementById("mirrors-count");
     if (!listEl || !cntEl) return;
-    cntEl.textContent = state.mirrors.length + " Official Mirror Portal(s)";
+    cntEl.textContent = state.mirrors.length + " portal(s) auto-merged into the live pool";
     if (state.mirrors.length === 0) {
-      listEl.innerHTML = '<div class="card-subtitle">No mirrors loaded yet. Tap "Probe Official Mirrors" above.</div>';
+      listEl.innerHTML = '<div class="card-subtitle">Directory empty this round — HTTPS CSV feeds were still merged.</div>';
       return;
     }
     var out = "";
@@ -2314,7 +2451,7 @@ const PORTAL_JS = String.raw`
           '<div class="badges">' + statusBadge + "</div>" +
         "</div>" +
         '<div class="btn-row" style="margin-top:8px">' +
-          '<button type="button" class="btn btn-sm" data-use-mirror="' + esc(m.portal_url) + '">Sync pool via this mirror</button>' +
+          '<span class="btn btn-sm btn-lock">Auto-merged</span>' +
           '<a class="btn btn-sm" href="' + esc(m.portal_url) + '" target="_blank" rel="noopener noreferrer">Open portal</a>' +
         "</div>" +
       "</div>";
@@ -2375,6 +2512,7 @@ const PORTAL_JS = String.raw`
       var qs = new URLSearchParams();
       qs.set("proto", state.proto);
       qs.set("country", state.country);
+      qs.set("sort", state.connectSort);
       if (opts.ip) qs.set("ip", opts.ip);
       if (opts.force) qs.set("force", "1");
       if (opts.exclude && opts.exclude.length) qs.set("exclude", opts.exclude.join(","));
@@ -2526,6 +2664,16 @@ const PORTAL_JS = String.raw`
       onFilterChange();
     });
 
+    document.getElementById("connect-sort-pills").addEventListener("click", function (e) {
+      var btn = e.target.closest("[data-csort]");
+      if (!btn) return;
+      state.connectSort = btn.getAttribute("data-csort");
+      document.querySelectorAll("#connect-sort-pills .chip").forEach(function (c) {
+        c.classList.toggle("active", c === btn);
+      });
+      onFilterChange();
+    });
+
     document.getElementById("connect-compat").addEventListener("change", function (e) {
       state.compat = e.target.value;
       renderConnectHero();
@@ -2662,12 +2810,19 @@ function renderPortalHtml() {
             <select id="connect-proto">
               <option value="auto">Auto (L2TP → OVPN UDP → OVPN TCP)</option>
               <option value="l2tp">Apple native L2TP/IPsec</option>
+              <option value="openvpn">OpenVPN (UDP + TCP)</option>
               <option value="udp">OpenVPN UDP</option>
               <option value="tcp">OpenVPN TCP</option>
             </select>
           </div>
         </div>
         <div class="pill-row" id="quick-country-pills"></div>
+        <label class="field-label" style="margin-top:10px">Sort order (desktop parity)</label>
+        <div class="pill-row" id="connect-sort-pills" style="margin-top:4px">
+          <button type="button" class="chip active" data-csort="recommended">1 · Highest score</button>
+          <button type="button" class="chip" data-csort="speed">2 · Fastest speed</button>
+          <button type="button" class="chip" data-csort="ping">3 · Lowest ping</button>
+        </div>
         <details class="adv">
           <summary>Advanced · cipher profile &amp; tunnel DNS</summary>
           <div class="grid-2" style="margin-top:10px">
@@ -2734,6 +2889,7 @@ function renderPortalHtml() {
         <div class="pill-row" id="relay-proto-pills">
           <button type="button" class="chip active" data-rproto="all">All protocols</button>
           <button type="button" class="chip" data-rproto="l2tp">L2TP/IPsec</button>
+          <button type="button" class="chip" data-rproto="openvpn">OpenVPN</button>
           <button type="button" class="chip" data-rproto="udp">OVPN UDP</button>
           <button type="button" class="chip" data-rproto="tcp">OVPN TCP</button>
         </div>
@@ -2752,14 +2908,15 @@ function renderPortalHtml() {
         <div class="card-header">
           <div>
             <div class="card-title">Official VPNGate mirror portals</div>
-            <div class="card-subtitle" id="mirrors-count">Discovering mirrors...</div>
+            <div class="card-subtitle" id="mirrors-count">All listed portals are merged into the live pool automatically</div>
           </div>
-          <button type="button" class="btn btn-sm" id="btn-probe-mirrors">Probe official mirrors</button>
+          <button type="button" class="btn btn-sm" id="btn-probe-mirrors">Re-probe reachability</button>
         </div>
-        <label class="field-label" for="custom-mirror-input">Custom daily mirror portal</label>
+        <div class="card-subtitle" style="margin-bottom:8px">Discovery already pulls <code>/api/iphone/</code> from every official portal plus all HTTPS CSV feeds. Add an extra portal only if you have a URL that is not in the directory.</div>
+        <label class="field-label" for="custom-mirror-input">Extra portal to merge (optional)</label>
         <div style="display:flex;gap:8px">
           <input type="text" id="custom-mirror-input" placeholder="http://host:port/en/" autocomplete="off" spellcheck="false">
-          <button type="button" class="btn btn-sm" id="btn-apply-mirror">Apply</button>
+          <button type="button" class="btn btn-sm" id="btn-apply-mirror">Merge extra</button>
         </div>
       </div>
       <div class="relay-list" id="mirrors-list"></div>
@@ -2862,6 +3019,8 @@ async function handleVerifyEndpoint(url, ctx) {
   const ip = validPublicIpv4(url.searchParams.get("ip") || "");
   const proto = (url.searchParams.get("proto") || "auto").toLowerCase();
   const country = url.searchParams.get("country") || "ALL";
+  const sortRaw = (url.searchParams.get("sort") || "recommended").toLowerCase();
+  const sort = ["recommended", "speed", "ping", "score"].includes(sortRaw) ? sortRaw : "recommended";
   const force = url.searchParams.get("force") === "1";
   const exclude = (url.searchParams.get("exclude") || "")
     .split(",")
@@ -2872,6 +3031,7 @@ async function handleVerifyEndpoint(url, ctx) {
     servers,
     country,
     proto,
+    sort,
     exclude,
     ip: ip || "",
     force,
