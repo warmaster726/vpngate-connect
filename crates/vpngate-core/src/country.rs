@@ -181,7 +181,7 @@ pub fn normalize_country_pair(raw_long: &str, raw_short: &str) -> (String, Strin
     (final_long, final_short)
 }
 
-/// Per-country protocol availability summary for CLI/TUI & Flutter dashboards.
+/// Per-country protocol availability summary for CLI and interactive console views.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CountrySummary {
     pub country_short: String,

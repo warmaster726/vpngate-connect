@@ -1,11 +1,15 @@
 [package]
 name = "vpngate-core"
-description = "Shared cross-platform VPN Gate discovery, DoH, pre-flight probing, profile patching, and tunnel engine"
+description = "Pure-Rust SoftEther VPN Gate discovery, Official Mirror failover, Cloudflare DoH, 1-RTT IKEv1/XFRM cryptography, and desktop tunnel engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
 
 [dependencies]
 aes.workspace = true

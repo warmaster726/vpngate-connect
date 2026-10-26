@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::protocol::{ProtocolFilter, SortBy, VpnProtocol};
 
-/// Unified VPN Gate relay server record shared across CLI/TUI and Flutter FFI.
+/// Unified VPN Gate relay server record shared across the core engine and CLI/TUI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VpnServer {
     pub hostname: String,

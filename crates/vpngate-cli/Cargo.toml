@@ -1,11 +1,15 @@
 [package]
 name = "vpngate-cli"
-description = "Cross-platform CLI + interactive console for VPN Gate Connect (Windows, macOS, Linux)"
+description = "Censorship-resilient SoftEther VPN Gate desktop CLI and interactive console for Linux, Windows 11, and macOS"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
 
 [[bin]]
 name = "vpngate"

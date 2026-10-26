@@ -10,7 +10,10 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/warmaster726/vpngate-connect"
+homepage = "https://github.com/warmaster726/vpngate-connect"
 authors = ["warmaster726 <warmaster726@users.noreply.github.com>"]
+keywords = ["vpn", "vpngate", "l2tp", "ipsec", "openvpn"]
+categories = ["command-line-utilities", "network-programming"]
 
 [workspace.dependencies]
 aes = "0.8"
@@ -39,7 +42,7 @@ unsafe_code = "allow"
 [workspace.lints.clippy]
 all = "warn"
 
-# Optimized for small, fast release binaries
+# Optimized for small, fast static desktop binaries
 [profile.release]
 opt-level = "z"
 lto = "thin"

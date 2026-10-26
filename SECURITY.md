@@ -2,17 +2,18 @@
 
 ## Supported Versions
 
-Security fixes are applied on the active **`main`** branch (Pure-Rust Cross-Platform Edition). The **`PY`** branch is preserved for historical reference only.
+Security fixes are applied exclusively on the active **`main`** branch (Pure-Rust Cross-Platform Desktop Edition). The **`PY`** branch is an inactive, frozen historical reference and receives no updates.
 
-| Branch / Version | Supported |
-| :--- | :--- |
-| `main` (Rust Workspace `0.1.x`) | Yes |
-| `PY` (Legacy Python `v5.3`) | Reference only |
+| Branch / Version | Status | Supported |
+| :--- | :--- | :--- |
+| **`main`** (Rust Workspace `0.1.x`) | Active | Yes |
+| **`PY`** (Legacy Python `v5.3`) | Inactive / Frozen Reference | No |
 
 ## Security Architecture Highlights
 
 - **Memory-Safe TLS & Cryptography**: Uses pure-Rust `rustls` and pure-Rust `AES-256/128/3DES` + `HMAC-SHA1/MD5` + `MODP-1024` IKEv1 packet handling without linking C OpenSSL into the core binary.
-- **Strict Cryptographic Pre-Flight**: Archive or mirror-sourced L2TP candidate IPs are treated as untrusted until live IKEv1 Aggressive Mode `HASH_R` verification succeeds and tunnel data-plane egress is verified.
+- **Strict Cryptographic Pre-Flight**: Archive or mirror-sourced L2TP candidate IPs are treated as untrusted until live IKEv1 Aggressive Mode `HASH_R` (`PSK == "vpn"`) verification succeeds and tunnel data-plane egress is verified.
+- **DNS & Route Leak Prevention**: Locks tunnel DNS (`/etc/resolv.conf` + `systemd-resolved` on Linux, interface DNS & `block-outside-dns` on Windows 11) and preserves loopback IPv6 while restoring host networking cleanly on `vpngate disconnect` or `Ctrl+C`.
 - **Least-Privilege File Ownership & Permissions**: Ephemeral tunnel credentials and PID/state files under `/run/vpngate-l2tp` and `~/.cache/vpngate` use restricted permissions and are scrubbed on `vpngate disconnect` and `--uninstall`.
 
 ## Reporting a Vulnerability
