@@ -98,25 +98,7 @@ pub struct AppPaths {
 }
 
 impl AppPaths {
-    pub fn resolve() -> Self {
-        let cache_dir = if let Ok(override_dir) = env::var("VPNGATE_CACHE_DIR")
-            && !override_dir.trim().is_empty()
-        {
-            PathBuf::from(override_dir)
-        } else if cfg!(target_os = "windows") {
-            env::var("LOCALAPPDATA")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| resolve_user_home().join("AppData").join("Local"))
-                .join("vpngate")
-        } else if cfg!(target_os = "macos") {
-            resolve_user_home()
-                .join("Library")
-                .join("Caches")
-                .join("vpngate")
-        } else {
-            resolve_user_home().join(".cache").join("vpngate")
-        };
-
+    pub fn with_base_dir(cache_dir: PathBuf) -> Self {
         let l2tp_run_dir = if cfg!(target_os = "linux") {
             PathBuf::from("/run/vpngate-l2tp")
         } else {
@@ -140,6 +122,28 @@ impl AppPaths {
             l2tp_run_dir,
             cache_dir,
         }
+    }
+
+    pub fn resolve() -> Self {
+        let cache_dir = if let Ok(override_dir) = env::var("VPNGATE_CACHE_DIR")
+            && !override_dir.trim().is_empty()
+        {
+            PathBuf::from(override_dir)
+        } else if cfg!(target_os = "windows") {
+            env::var("LOCALAPPDATA")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| resolve_user_home().join("AppData").join("Local"))
+                .join("vpngate")
+        } else if cfg!(target_os = "macos") {
+            resolve_user_home()
+                .join("Library")
+                .join("Caches")
+                .join("vpngate")
+        } else {
+            resolve_user_home().join(".cache").join("vpngate")
+        };
+
+        Self::with_base_dir(cache_dir)
     }
 
     pub fn ensure_dirs(&self) -> Result<()> {

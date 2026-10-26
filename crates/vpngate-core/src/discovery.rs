@@ -4,7 +4,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
 use crate::doh::resolve_ipv4_via_cloudflare_doh;
@@ -17,7 +17,8 @@ use crate::parser::{
 use crate::server::VpnServer;
 
 /// Live command execution progress events (exact parity with Python `v5.3` console UX).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
 pub enum ProgressEvent {
     /// Transient in-place spinner/counter line (`\r[*] [|] <stage> [Xs/Ys] - Press Ctrl+C to interrupt`).
     Transient {
@@ -121,7 +122,7 @@ pub struct DiscoveryOutcome {
     pub official_mirrors: Vec<OfficialMirrorSite>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MirrorProbeResult {
     pub mirror: OfficialMirrorSite,
     pub reachable: bool,

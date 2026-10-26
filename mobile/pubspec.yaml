@@ -1,0 +1,26 @@
+name: vpngate_mobile
+description: >-
+  Censorship-resilient VPN Gate client for Android & iOS powered by vpngate-core
+  (User-Space L2TP/IPsec PSK='vpn' + OpenVPN UDP/TCP + Official Mirror failover).
+publish_to: "none"
+version: 0.1.0+1
+
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+  flutter: ">=3.22.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  ffi: ^2.1.3
+  openvpn_flutter: ^1.3.3
+  path_provider: ^2.1.5
+  share_plus: ^10.1.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true

@@ -9,6 +9,7 @@ Cross-platform **SoftEther VPN Gate** client engineered around a **100% pure-Rus
 - **Automatic Multi-Protocol Failover (`Auto: L2TP/IPsec -> OpenVPN UDP -> OpenVPN TCP`)**
   - **1-RTT Cryptographic Pre-Flight Verification**: Verifies SoftEther `IKEv1` Aggressive Mode `HASH_R` (`PSK == "vpn"`, zero `IKEv2`) in a single UDP round-trip before dialing, pruning dead or custom-PSK volunteer nodes automatically.
   - **Built-In Pure-Rust Linux IKEv1/XFRM Engine**: Negotiates IKEv1 Phase 1 + Quick Mode NAT-T (`UDP 4500` `ESPinUDP`) and programs Linux kernel `XFRM` Security Associations directly—no `strongswan` or `libreswan` daemon conflicts.
+  - **Pure-Rust Mobile User-Space L2TP/IPsec + OpenVPN (`Android` & `iOS`)**: On Android 12+ (where Google removed legacy system L2TP), drives full `IKEv1 + ESP-in-UDP + L2TPv2 + PPP/IPCP` (`PSK = "vpn"`, zero `IKEv2`) in pure Rust over an unprivileged `VpnService` `TUN` file descriptor alongside `OpenVPN UDP/TCP`; on iOS, pairs an `NEPacketTunnelProvider` (`<15 MB` RAM) for `OpenVPN UDP/TCP` with one-tap native `.mobileconfig` L2TP profile export.
   - **Native Windows 11 & macOS Support**: Automates Windows 11 `RASMAN`/`IKEEXT` L2TP (`AssumeUDPEncapsulationContextOnSendRule = 2`) + headless Zero-Prompt OpenVPN Community (`OpenVPN.OpenVPN`), and generates signed-ready Apple `.mobileconfig` + patched OpenVPN profiles on macOS/iOS.
 - **Multi-Layer Censorship & Firewall Resilience**
   - **Official VPN Gate Daily Mirror Sites (`sites.aspx`)**: Automatically harvests, caches (`mirrors_cache.json`), probes, and fails over to Official VPN Gate Mirror Portals (`http://<mirror>:<port>/en/` & `/api/iphone/`), including ASP.NET `C_L2TP=on` / `C_OpenVPN=on` protocol tables.
@@ -24,7 +25,7 @@ Cross-platform **SoftEther VPN Gate** client engineered around a **100% pure-Rus
 
 | Branch | Description |
 | :--- | :--- |
-| **`main`** | **Active Cross-Platform Rust + Flutter Edition** (`vpngate-core`, `vpngate-cli`, `vpngate-bridge`, Desktop installers & GNOME launcher) |
+| **`main`** | **Active Cross-Platform Rust + Flutter Edition** (`vpngate-core`, `vpngate-cli`, `vpngate-bridge`, `mobile/` Android & iOS client, Desktop installers & GNOME launcher) |
 | **`PY`** | **Legacy Python `v5.3` Single-Script Edition** (preserved as a reference implementation) |
 
 ---
@@ -86,6 +87,27 @@ cargo build --release --locked -p vpngate-cli
 
 ---
 
+### Mobile App From Source (`Android` & `iOS` — Zero Codegen Required)
+
+The `mobile/` Flutter client links directly to `crates/vpngate-bridge` over a zero-codegen `extern "C"` C-ABI (`dart:ffi` + Android `JNI`), so **no external FFI codegen tools (`flutter_rust_bridge_codegen`, `cbindgen`, etc.) are required**:
+
+```bash
+# Android (Linux / macOS / Windows WSL with Flutter SDK + Android NDK + Rust):
+cd mobile
+./build-android.sh
+# Compiles crates/vpngate-bridge (--release --locked) for arm64-v8a / armeabi-v7a / x86_64
+# and outputs: mobile/build/app/outputs/flutter-apk/app-release.apk
+# (Gradle's cargoBuildRustBridge task also builds jniLibs/ automatically during `flutter run`)
+
+# iOS (macOS with Xcode + CocoaPods + Flutter SDK + Rust):
+cd mobile
+./build-ios.sh
+# Compiles crates/vpngate-bridge (--release --locked) into ios/Frameworks/libvpngate_bridge.a
+# and builds mobile/build/ios/iphoneos/Runner.app (requires Apple Network Extension entitlement to sign)
+```
+
+---
+
 ## Usage (`vpngate`)
 
 ```bash
@@ -110,9 +132,15 @@ vpngate disconnect             # Tear down active VPN and restore host routes, D
 ```text
 vpngate-connect/
 ├── crates/
-│   ├── vpngate-core/      # Pure-Rust discovery, Official Mirrors, DoH, IKEv1/XFRM & desktop tunnel drivers
+│   ├── vpngate-core/      # Pure-Rust discovery, Official Mirrors, DoH, IKEv1/XFRM & user-space L2TP/PPP
 │   ├── vpngate-cli/       # Single-binary `vpngate` CLI & [0-9] Interactive Console
-│   └── vpngate-bridge/    # flutter_rust_bridge FFI crate (cdylib + staticlib) for Mobile & Desktop UI
+│   └── vpngate-bridge/    # Zero-codegen C-ABI FFI crate (cdylib + staticlib) for Flutter & JNI
+├── mobile/                # Flutter Android & iOS client (Auto L2TP/OVPN failover + Official Mirrors)
+│   ├── lib/               # Dark console UI, dart:ffi RustBridge & 15s Watchdog TunnelController
+│   ├── android/           # Kotlin VpnGateVpnService (user-space L2TP TUN) + C11 JNI + NDK Gradle hook
+│   ├── ios/               # Swift AppDelegate + <15 MB NEPacketTunnelProvider + .mobileconfig export
+│   ├── build-android.sh   # Deterministic --locked Android NDK + APK source builder
+│   └── build-ios.sh       # Deterministic --locked iOS staticlib + Runner source builder
 ├── vpngate-launcher.py    # GNOME GTK3/GTK4 + VTE dynamic-resizing dark window launcher
 ├── vpngate.desktop        # XDG Desktop Entry + GNOME Dash Quick Actions
 ├── install-vpngate.sh     # POSIX /bin/sh Linux & macOS installer, residue cleaner & uninstaller
