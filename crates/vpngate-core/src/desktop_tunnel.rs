@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -24,6 +26,45 @@ use crate::server::{VpnServer, filter_by_country, filter_by_protocol, sort_serve
 pub const NM_PROFILE_PREFIX: &str = "vpngate-";
 pub const WIN_VPN_PROFILE_NAME: &str = "VPNGate-L2TP";
 const NFT_COMMENT_TAG: &str = "vpngate-l2tp";
+
+#[cfg(windows)]
+pub const WIN_CREATE_NO_WINDOW: u32 = 0x0800_0000;
+#[cfg(windows)]
+pub const WIN_DETACHED_FLAGS: u32 = 0x0000_0008 | 0x0000_0200 | 0x0800_0000;
+
+#[cfg(windows)]
+mod win_ffi {
+    use std::ffi::c_void;
+
+    pub const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    pub const STILL_ACTIVE: u32 = 259;
+
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        pub fn IsUserAnAdmin() -> i32;
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        pub fn OpenProcess(
+            desired_access: u32,
+            inherit_handle: i32,
+            process_id: u32,
+        ) -> *mut c_void;
+        pub fn GetExitCodeProcess(process: *mut c_void, exit_code: *mut u32) -> i32;
+        pub fn CloseHandle(object: *mut c_void) -> i32;
+    }
+}
+
+fn quiet_cmd(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    #[allow(unused_mut)]
+    let mut cmd = Command::new(program);
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(WIN_CREATE_NO_WINDOW);
+    }
+    cmd
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GatewayInfo {
@@ -64,13 +105,8 @@ pub fn is_root_or_admin() -> bool {
     }
     #[cfg(windows)]
     {
-        Command::new("net")
-            .args(["session"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+        // SAFETY: `IsUserAnAdmin` is a thread-safe Shell32 call with no arguments.
+        unsafe { win_ffi::IsUserAnAdmin() != 0 }
     }
 }
 
@@ -106,11 +142,17 @@ pub fn is_pid_alive(pid: u32) -> bool {
     }
     #[cfg(windows)]
     {
-        Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
-            .unwrap_or(false)
+        // SAFETY: Win32 `OpenProcess` + `GetExitCodeProcess` checks liveness with zero child process spawns.
+        unsafe {
+            let h = win_ffi::OpenProcess(win_ffi::PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h.is_null() {
+                return false;
+            }
+            let mut code: u32 = 0;
+            let ok = win_ffi::GetExitCodeProcess(h, &mut code);
+            let _ = win_ffi::CloseHandle(h);
+            ok != 0 && code == win_ffi::STILL_ACTIVE
+        }
     }
 }
 
@@ -151,7 +193,7 @@ pub fn terminate_pid(pid: u32, force: bool) {
         if force {
             args.insert(0, "/F".to_string());
         }
-        let _ = Command::new("taskkill")
+        let _ = quiet_cmd("taskkill")
             .args(&args)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -167,6 +209,20 @@ pub fn get_running_monitor_pid(paths: &AppPaths) -> u32 {
         return 0;
     };
     if pid != std::process::id() && pid_matches_cmdline(pid, "_monitor") {
+        pid
+    } else {
+        0
+    }
+}
+
+pub fn get_running_openvpn_pid(paths: &AppPaths) -> u32 {
+    let Ok(txt) = fs::read_to_string(&paths.ovpn_pid) else {
+        return 0;
+    };
+    let Ok(pid) = txt.trim().parse::<u32>() else {
+        return 0;
+    };
+    if pid != 0 && pid != std::process::id() && pid_matches_cmdline(pid, "openvpn") {
         pid
     } else {
         0
@@ -237,7 +293,7 @@ pub fn get_default_gateway() -> GatewayInfo {
             }
         }
     } else if cfg!(target_os = "windows")
-        && let Ok(out) = Command::new("powershell")
+        && let Ok(out) = quiet_cmd("powershell")
             .args([
                 "-NoProfile",
                 "-Command",
@@ -285,7 +341,7 @@ fn query_linux_ifaces(prefixes: &[&str]) -> BTreeMap<String, String> {
 pub fn get_ppp_interfaces() -> BTreeMap<String, String> {
     if cfg!(target_os = "windows") {
         let mut map = BTreeMap::new();
-        if let Ok(out) = Command::new("rasdial").output() {
+        if let Ok(out) = quiet_cmd("rasdial").output() {
             let txt = String::from_utf8_lossy(&out.stdout);
             if txt.contains(WIN_VPN_PROFILE_NAME) {
                 map.insert(WIN_VPN_PROFILE_NAME.to_string(), "connected".to_string());
@@ -321,7 +377,10 @@ pub fn get_tun_interfaces() -> BTreeMap<String, String> {
 }
 
 pub fn prune_stale_state_if_dead(paths: &AppPaths) {
-    if !paths.active_state.exists() || get_running_monitor_pid(paths) > 0 {
+    if !paths.active_state.exists()
+        || get_running_monitor_pid(paths) > 0
+        || get_running_openvpn_pid(paths) > 0
+    {
         return;
     }
     if let Some(st) = read_json_opt::<ActiveSessionState>(&paths.active_state)
@@ -376,7 +435,7 @@ pub fn find_openvpn_bin() -> Option<PathBuf> {
 }
 
 pub fn detect_openvpn_compat(ovpn_bin: &Path) -> OpenVpnCompat {
-    let Ok(out) = Command::new(ovpn_bin).arg("--version").output() else {
+    let Ok(out) = quiet_cmd(ovpn_bin).arg("--version").output() else {
         return OpenVpnCompat::OpenVpn26;
     };
     let line = String::from_utf8_lossy(&out.stdout);
@@ -733,13 +792,13 @@ pub fn cleanup_existing_vpn_with_progress(
                 "Disconnecting Windows RAS profile '{WIN_VPN_PROFILE_NAME}' ..."
             )));
         }
-        let _ = Command::new("rasdial")
+        let _ = quiet_cmd("rasdial")
             .args([WIN_VPN_PROFILE_NAME, "/DISCONNECT"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
         if let Some(rt) = read_json_opt::<PinnedRouteRecord>(&paths.l2tp_route) {
-            let _ = Command::new("route")
+            let _ = quiet_cmd("route")
                 .args(["delete", &rt.server_ip])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -1094,7 +1153,7 @@ pub async fn connect_l2tp_windows(
 ) -> std::result::Result<String, String> {
     let gw = get_default_gateway();
     if !gw.gw.is_empty() {
-        let _ = Command::new("route")
+        let _ = quiet_cmd("route")
             .args([
                 "add",
                 &server.ip,
@@ -1117,7 +1176,7 @@ pub async fn connect_l2tp_windows(
         );
     }
 
-    let _ = Command::new("rasdial")
+    let _ = quiet_cmd("rasdial")
         .args([WIN_VPN_PROFILE_NAME, "/DISCONNECT"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1130,7 +1189,7 @@ pub async fn connect_l2tp_windows(
          else {{ Add-VpnConnection -Name '{WIN_VPN_PROFILE_NAME}' -ServerAddress '{}' -TunnelType L2tp -L2tpPsk 'vpn' -AuthenticationMethod Pap,Chap,MSChapv2 -EncryptionLevel Optional -SplitTunneling:$false -RememberCredential -Force | Out-Null }}",
         server.ip, server.ip
     );
-    let _ = Command::new("powershell")
+    let _ = quiet_cmd("powershell")
         .args(["-NoProfile", "-Command", &ps_script])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1139,10 +1198,16 @@ pub async fn connect_l2tp_windows(
     let eff_max = timeout_secs.max(30);
     let started = Instant::now();
     let mut tick = 0usize;
-    let mut child = tokio::process::Command::new("rasdial")
+    let mut ras_cmd = tokio::process::Command::new("rasdial");
+    ras_cmd
         .args([WIN_VPN_PROFILE_NAME, "vpn", "vpn"])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        ras_cmd.creation_flags(WIN_CREATE_NO_WINDOW);
+    }
+    let mut child = ras_cmd
         .spawn()
         .map_err(|e| format!("rasdial spawn error: {e}"))?;
 
@@ -1183,7 +1248,7 @@ pub async fn connect_l2tp_windows(
         let dns_ps = format!(
             "Set-DnsClientServerAddress -InterfaceAlias '{WIN_VPN_PROFILE_NAME}' -ServerAddresses @({joined}) -ErrorAction SilentlyContinue"
         );
-        let _ = Command::new("powershell")
+        let _ = quiet_cmd("powershell")
             .args(["-NoProfile", "-Command", &dns_ps])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -1335,6 +1400,10 @@ pub async fn connect_openvpn_desktop(
             return Err("openvpn --daemon exited with error".to_string());
         }
     } else {
+        #[cfg(windows)]
+        {
+            cmd.creation_flags(WIN_DETACHED_FLAGS);
+        }
         let child = cmd.spawn().map_err(|e| format!("openvpn spawn: {e}"))?;
         let _ = fs::write(&paths.ovpn_pid, format!("{}\n", child.id()));
     }
@@ -1413,7 +1482,13 @@ pub async fn connect_openvpn_desktop(
             .find(|d| !before_tun.contains_key(*d))
             .or_else(|| cur.keys().next())
             .cloned()
-            .unwrap_or_else(|| "tun0".to_string());
+            .unwrap_or_else(|| {
+                if cfg!(target_os = "windows") {
+                    "TAP/Wintun".to_string()
+                } else {
+                    "tun0".to_string()
+                }
+            });
 
         apply_linux_tunnel_dns(paths, &dev, dns_servers);
         return Ok((dev, "openvpn-daemon".to_string()));
@@ -1504,7 +1579,11 @@ pub async fn is_vpn_tunnel_healthy(
                 return (false, "built-in IKEv1/XFRM daemon exited".to_string());
             }
         }
-    } else if get_tun_interfaces().is_empty() && !cfg!(target_os = "windows") {
+    } else if cfg!(target_os = "windows") {
+        if get_running_openvpn_pid(paths) == 0 {
+            return (false, "OpenVPN daemon process exited".to_string());
+        }
+    } else if get_tun_interfaces().is_empty() {
         return (false, "TUN interface went down".to_string());
     }
 
@@ -1530,13 +1609,16 @@ pub fn spawn_auto_reconnect_monitor(paths: &AppPaths) -> u32 {
     let Ok(self_exe) = env::current_exe() else {
         return 0;
     };
-    let Ok(child) = Command::new(self_exe)
-        .arg("_monitor")
+    let mut cmd = Command::new(self_exe);
+    cmd.arg("_monitor")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(WIN_DETACHED_FLAGS);
+    }
+    let Ok(child) = cmd.spawn() else {
         return 0;
     };
     let pid = child.id();

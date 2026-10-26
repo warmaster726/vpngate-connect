@@ -6,13 +6,15 @@ mod term_ui;
 
 use std::env;
 use std::io;
-use std::path::Path;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+use std::path::{Path, PathBuf};
 
 use commands::{
     ConnectArgs, cmd_connect, cmd_countries, cmd_disconnect, cmd_doctor, cmd_list, cmd_mirrors,
     cmd_probe, cmd_refresh, cmd_status, cmd_watchdog, interactive_menu,
 };
-use term_ui::{err, set_dynamic_resize, set_screen_clear};
+use term_ui::{err, init_console, print_line, prompt_input, set_dynamic_resize, set_screen_clear};
 use vpngate_core::{AppPaths, ProtocolFilter, SortBy, run_ikev1_daemon, run_monitor_daemon};
 
 fn build_help_text() -> String {
@@ -65,68 +67,121 @@ fn delegate_to_window_launcher(raw_args: &[String]) -> i32 {
         .cloned()
         .collect();
 
-    if cfg!(target_os = "windows") {
+    #[cfg(windows)]
+    {
         let Ok(self_exe) = env::current_exe() else {
             err("Could not determine vpngate executable path.");
             return 1;
         };
+        let needs_hold = !filtered.is_empty()
+            && !filtered
+                .iter()
+                .any(|a| matches!(a.as_str(), "-i" | "--interactive" | "menu" | "interactive"));
+        let mut launch_args = filtered;
+        if needs_hold {
+            launch_args.push("--hold".to_string());
+        }
+
         if let Some(wt) = vpngate_core::which_bin("wt") {
             let mut cmd = std::process::Command::new(wt);
             cmd.args(["--title", "VPN Gate"])
                 .arg(self_exe)
-                .args(&filtered);
+                .args(&launch_args);
             return i32::from(cmd.spawn().is_err());
         }
+
+        let ps_bin = vpngate_core::which_bin("pwsh")
+            .or_else(|| vpngate_core::which_bin("powershell"))
+            .unwrap_or_else(|| PathBuf::from("powershell.exe"));
+        let mut quoted = vec![format!(
+            "'{}'",
+            self_exe.display().to_string().replace('\'', "''")
+        )];
+        for a in &launch_args {
+            quoted.push(format!("'{}'", a.replace('\'', "''")));
+        }
+        let ps_line = format!("& {}", quoted.join(" "));
         let mut cmd = std::process::Command::new("cmd");
         cmd.args(["/c", "start", "VPN Gate"])
-            .arg(self_exe)
-            .args(&filtered);
-        return i32::from(cmd.spawn().is_err());
+            .arg(ps_bin)
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps_line])
+            .creation_flags(0x0800_0000);
+        i32::from(cmd.spawn().is_err())
     }
 
-    let self_dir = env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
-    let mut cands = Vec::new();
-    if let Some(d) = self_dir {
-        cands.push(d.join("vpngate-launcher"));
-        cands.push(d.join("vpngate-launcher.py"));
-        if let Some(repo_root) = d.parent().and_then(|p| p.parent()) {
-            cands.push(repo_root.join("vpngate-launcher.py"));
-        }
-    }
-    cands.push(std::path::PathBuf::from("/usr/local/bin/vpngate-launcher"));
-    cands.push(std::path::PathBuf::from(
-        "/usr/local/bin/vpngate-launcher.py",
-    ));
-    if let Some(w) = vpngate_core::which_bin("vpngate-launcher")
-        .or_else(|| vpngate_core::which_bin("vpngate-launcher.py"))
+    #[cfg(not(windows))]
     {
-        cands.push(w);
-    }
+        let self_dir = env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
+        let mut cands = Vec::new();
+        if let Some(d) = self_dir {
+            cands.push(d.join("vpngate-launcher"));
+            cands.push(d.join("vpngate-launcher.py"));
+            if let Some(repo_root) = d.parent().and_then(|p| p.parent()) {
+                cands.push(repo_root.join("vpngate-launcher.py"));
+            }
+        }
+        cands.push(PathBuf::from("/usr/local/bin/vpngate-launcher"));
+        cands.push(PathBuf::from("/usr/local/bin/vpngate-launcher.py"));
+        if let Some(w) = vpngate_core::which_bin("vpngate-launcher")
+            .or_else(|| vpngate_core::which_bin("vpngate-launcher.py"))
+        {
+            cands.push(w);
+        }
 
-    let Some(launcher) = cands.into_iter().find(|p| p.is_file()) else {
-        err("Could not find 'vpngate-launcher'. Run `sh ./install-vpngate.sh` first.");
-        return 1;
-    };
+        let Some(launcher) = cands.into_iter().find(|p| p.is_file()) else {
+            err("Could not find 'vpngate-launcher'. Run `sh ./install-vpngate.sh` first.");
+            return 1;
+        };
 
-    let py_bin = if Path::new("/usr/bin/python3").is_file() {
-        "/usr/bin/python3"
-    } else {
-        "python3"
-    };
-    let mut cmd = std::process::Command::new(py_bin);
-    cmd.arg(launcher);
-    if !filtered.is_empty() {
-        cmd.arg("--hold");
+        let py_bin = if Path::new("/usr/bin/python3").is_file() {
+            "/usr/bin/python3"
+        } else {
+            "python3"
+        };
+        let mut cmd = std::process::Command::new(py_bin);
+        cmd.arg(launcher);
+        if !filtered.is_empty() {
+            cmd.arg("--hold");
+        }
+        cmd.args(&filtered);
+        cmd.status().ok().and_then(|s| s.code()).unwrap_or(1)
     }
-    cmd.args(&filtered);
-    cmd.status().ok().and_then(|s| s.code()).unwrap_or(1)
 }
 
 async fn dispatch() -> io::Result<i32> {
-    let raw_args: Vec<String> = env::args().skip(1).collect();
-    let paths = AppPaths::resolve();
+    let raw_all: Vec<String> = env::args().skip(1).collect();
+    let is_daemon = matches!(raw_all.first().map(String::as_str), Some("_monitor" | "_ikev1"));
+    init_console(!is_daemon);
+
+    // Pre-scan global `--cache-dir <DIR>` and `--hold` before dispatching
+    let mut cache_dir_override: Option<PathBuf> = None;
+    let mut hold_on_exit = false;
+    let mut raw_args: Vec<String> = Vec::with_capacity(raw_all.len());
+    let mut idx = 0usize;
+    while idx < raw_all.len() {
+        match raw_all[idx].as_str() {
+            "--cache-dir" => {
+                idx += 1;
+                if let Some(dir) = raw_all.get(idx)
+                    && !dir.trim().is_empty()
+                {
+                    cache_dir_override = Some(PathBuf::from(dir));
+                }
+            }
+            "--hold" => {
+                hold_on_exit = true;
+            }
+            other => raw_args.push(other.to_string()),
+        }
+        idx += 1;
+    }
+
+    let paths = match cache_dir_override {
+        Some(dir) => AppPaths::with_base_dir(dir),
+        None => AppPaths::resolve(),
+    };
 
     // Internal background daemons (exact match with Python v5.3 architecture)
     if raw_args.first().map(String::as_str) == Some("_monitor") {
@@ -139,9 +194,17 @@ async fn dispatch() -> io::Result<i32> {
         return Ok(delegate_to_window_launcher(&raw_args));
     }
 
+    let rc = dispatch_commands(&paths, &raw_args).await?;
+    if hold_on_exit && term_ui::is_stdout_tty() {
+        let _ = prompt_input("\nPress Enter to close this window...");
+    }
+    Ok(rc)
+}
+
+async fn dispatch_commands(paths: &AppPaths, raw_args: &[String]) -> io::Result<i32> {
     let help_text = build_help_text();
     if raw_args.is_empty() {
-        return interactive_menu(&paths, &help_text).await;
+        return interactive_menu(paths, &help_text).await;
     }
 
     let mut subcmd = String::new();
@@ -170,11 +233,11 @@ async fn dispatch() -> io::Result<i32> {
         let arg = &raw_args[i];
         match arg.as_str() {
             "-h" | "--help" | "help" => {
-                println!("{help_text}");
+                print_line(&help_text);
                 return Ok(0);
             }
-            "-v" | "--version" | "version" => {
-                println!("vpngate {}", env!("CARGO_PKG_VERSION"));
+            "-v" | "-V" | "--version" | "version" => {
+                print_line(&format!("vpngate {}", env!("CARGO_PKG_VERSION")));
                 return Ok(0);
             }
             "--no-resize" => set_dynamic_resize(false),
@@ -268,23 +331,23 @@ async fn dispatch() -> io::Result<i32> {
     let sort_by = SortBy::from_cli_str(&sort_str).unwrap_or(SortBy::Recommended);
 
     if flag_interactive || matches!(subcmd.as_str(), "menu" | "interactive") {
-        return interactive_menu(&paths, &help_text).await;
+        return interactive_menu(paths, &help_text).await;
     }
     if flag_disconnect || matches!(subcmd.as_str(), "disconnect" | "down" | "stop" | "d") {
-        return cmd_disconnect(&paths).await;
+        return cmd_disconnect(paths).await;
     }
     if flag_doctor || matches!(subcmd.as_str(), "doctor" | "check" | "diag") {
-        return cmd_doctor(&paths);
+        return cmd_doctor(paths);
     }
     if flag_status || matches!(subcmd.as_str(), "status" | "st") {
-        return cmd_status(&paths).await;
+        return cmd_status(paths).await;
     }
     if flag_mirrors || matches!(subcmd.as_str(), "mirrors" | "mirror" | "sites") {
-        return cmd_mirrors(&paths, &custom_mirrors).await;
+        return cmd_mirrors(paths, &custom_mirrors).await;
     }
     if matches!(subcmd.as_str(), "watchdog" | "wd") {
         let mode = positional.first().map(String::as_str).unwrap_or("status");
-        return Ok(cmd_watchdog(&paths, mode));
+        return Ok(cmd_watchdog(paths, mode));
     }
     if matches!(subcmd.as_str(), "probe") {
         let Some(ip) = positional.first() else {
@@ -294,15 +357,15 @@ async fn dispatch() -> io::Result<i32> {
         return cmd_probe(ip).await;
     }
     if matches!(subcmd.as_str(), "refresh" | "update") {
-        return cmd_refresh(&paths, &custom_mirrors).await;
+        return cmd_refresh(paths, &custom_mirrors).await;
     }
     if flag_countries || matches!(subcmd.as_str(), "countries" | "regions" | "c") {
-        return cmd_countries(&paths, proto_filter, force_refresh, &custom_mirrors).await;
+        return cmd_countries(paths, proto_filter, force_refresh, &custom_mirrors).await;
     }
     if flag_list || matches!(subcmd.as_str(), "list" | "ls" | "servers") {
         let target_cc = country.or_else(|| positional.first().cloned());
         return cmd_list(
-            &paths,
+            paths,
             target_cc.as_deref(),
             proto_filter,
             sort_by,
@@ -329,13 +392,13 @@ async fn dispatch() -> io::Result<i32> {
             auto_reconnect_override,
             custom_mirrors,
         };
-        return cmd_connect(&paths, &cargs).await;
+        return cmd_connect(paths, &cargs).await;
     }
     if force_refresh {
-        return cmd_refresh(&paths, &custom_mirrors).await;
+        return cmd_refresh(paths, &custom_mirrors).await;
     }
 
-    interactive_menu(&paths, &help_text).await
+    interactive_menu(paths, &help_text).await
 }
 
 #[tokio::main]

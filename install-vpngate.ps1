@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    VPN Gate Connect (Rust Single-Binary Edition) — Windows 11 Installer, Residue Cleaner & Uninstaller
+    VPN Gate Connect (Rust Single-Binary Edition) - Windows 11 Installer, Residue Cleaner & Uninstaller
 .DESCRIPTION
     - Install / Upgrade (default):
         Cleans legacy Python/Rust residues, builds or installs native `vpngate.exe` into
@@ -264,7 +264,7 @@ try {
             Invoke-WebRequest -Uri 'https://win.rustup.rs/x86_64' -UseBasicParsing -OutFile $RustupInit
 
             if ($KeepToolchain) {
-                Write-Info "Rust toolchain not found — installing minimal Rust ($DefaultHost) via rustup.rs (--keep-toolchain) ..."
+                Write-Info "Rust toolchain not found - installing minimal Rust ($DefaultHost) via rustup.rs (--keep-toolchain) ..."
                 & $RustupInit -y --profile minimal --default-host $DefaultHost
                 $ActiveCargoBinDir = $DefaultCargoBinDir
             } else {
@@ -273,7 +273,7 @@ try {
                 $env:CARGO_HOME  = Join-Path $TempInstallRoot 'cargo'
                 New-Item -ItemType Directory -Path $env:RUSTUP_HOME -Force | Out-Null
                 New-Item -ItemType Directory -Path $env:CARGO_HOME -Force | Out-Null
-                Write-Info "Rust toolchain not found — bootstrapping ephemeral minimal Rust ($DefaultHost, auto-removed after build) ..."
+                Write-Info "Rust toolchain not found - bootstrapping ephemeral minimal Rust ($DefaultHost, auto-removed after build) ..."
                 & $RustupInit -y --profile minimal --no-modify-path --default-host $DefaultHost
                 $ActiveCargoBinDir = Join-Path $env:CARGO_HOME 'bin'
             }
@@ -325,7 +325,7 @@ try {
                 }
             }
             if (-not (Get-Command 'gcc.exe' -ErrorAction SilentlyContinue) -and (Get-Command 'winget.exe' -ErrorAction SilentlyContinue)) {
-                Write-Info "MSVC linker not present — installing lightweight MinGW-w64 ('gcc.exe') via winget ..."
+                Write-Info "MSVC linker not present - installing lightweight MinGW-w64 ('gcc.exe') via winget ..."
                 & winget.exe install -e --id BrechtSanders.WinLibs.POSIX.UCRT --silent --accept-package-agreements --accept-source-agreements
                 $foundGcc = Get-ChildItem -LiteralPath "$env:LOCALAPPDATA\Microsoft\WinGet\Packages" -Filter 'gcc.exe' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
                 if ($foundGcc) {
@@ -439,7 +439,7 @@ if ((-not $OvpnExe -or $InstallOpenVPN) -and (-not $SkipOpenVPN) -and (Get-Comma
 Get-Process -Name 'openvpn-gui' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'OPENVPN-GUI' -ErrorAction SilentlyContinue
 
-# 5. Create Start Menu shortcut
+# 5. Create Start Menu shortcut (configured with SLDF_RUNAS_USER so Start Menu launches elevated)
 $WshShell = $null
 $Shortcut = $null
 try {
@@ -449,6 +449,13 @@ try {
     $Shortcut.WorkingDirectory = $InstallDir
     $Shortcut.Description = 'VPN Gate Connect Console'
     $Shortcut.Save()
+    if (-not $UserOnly -and (Test-Path -LiteralPath $StartMenuLnk)) {
+        $LnkBytes = [System.IO.File]::ReadAllBytes($StartMenuLnk)
+        if ($LnkBytes.Length -gt 0x15) {
+            $LnkBytes[0x15] = $LnkBytes[0x15] -bor 0x20
+            [System.IO.File]::WriteAllBytes($StartMenuLnk, $LnkBytes)
+        }
+    }
     Write-Ok "Created Start Menu shortcut: $StartMenuLnk"
 } catch {} finally {
     if ($Shortcut) { try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($Shortcut) | Out-Null } catch {} }

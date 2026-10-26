@@ -158,10 +158,26 @@ pub fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         fs::create_dir_all(parent)?;
         fix_owner(parent);
     }
-    let tmp = path.with_extension("json.tmp");
+    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
     let data = serde_json::to_string_pretty(value)?;
-    fs::write(&tmp, data)?;
-    fs::rename(&tmp, path)?;
+    fs::write(&tmp, &data)?;
+
+    let mut replaced = false;
+    let attempts = if cfg!(windows) { 12 } else { 1 };
+    for attempt in 0..attempts {
+        if fs::rename(&tmp, path).is_ok() {
+            replaced = true;
+            break;
+        }
+        if cfg!(windows) {
+            std::thread::sleep(Duration::from_millis(20 * (attempt as u64 + 1)));
+        }
+    }
+    if !replaced {
+        let write_res = fs::write(path, &data);
+        let _ = fs::remove_file(&tmp);
+        write_res?;
+    }
     fix_owner(path);
     Ok(())
 }

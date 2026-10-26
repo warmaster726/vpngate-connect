@@ -3,6 +3,8 @@ use std::env;
 use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -12,7 +14,7 @@ use vpngate_core::{
     OfficialMirrorSite, ProgressEvent, ProtocolFilter, ServerCacheFile, SortBy, VpnServer,
     cleanup_existing_vpn_with_progress, detect_host_os_label, engage_candidates_with_progress,
     filter_by_country, filter_by_protocol, find_openvpn_bin, get_default_gateway,
-    get_ppp_interfaces, get_public_ip_trace, get_running_monitor_pid,
+    get_ppp_interfaces, get_public_ip_trace, get_running_monitor_pid, get_running_openvpn_pid,
     get_servers_cached_with_progress, get_tun_interfaces, is_root_or_admin, load_cached_mirrors,
     load_cooldowns, load_watchdog_pref, normalize_mirror_base_url, now_unix_secs, probe_tcp,
     prune_stale_state_if_dead, read_json_opt, run_ikev1_crypto_self_test, save_cached_mirrors,
@@ -22,9 +24,10 @@ use vpngate_core::{
 
 use crate::term_ui::{
     Align, BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW, clear_screen_if_tty, clear_transient_line,
-    dynamic_resize_enabled, err, format_duration, format_thousands_u64, info, is_stdout_tty, ok,
-    prompt_input, render_dynamic_box, render_dynamic_table, render_progress_event,
-    request_window_resize, screen_clear_enabled, truncate_plain, visible_len, warn,
+    dynamic_resize_enabled, err, format_duration, format_thousands_u64, get_live_terminal_size,
+    info, is_stdout_tty, ok, print_line, prompt_input, render_dynamic_box, render_dynamic_table,
+    render_progress_event, request_window_resize, screen_clear_enabled, truncate_plain,
+    visible_len, warn, win_vt_enabled,
 };
 
 fn parse_custom_mirrors(urls: &[String]) -> Vec<OfficialMirrorSite> {
@@ -77,13 +80,14 @@ async fn trace_public_ip_with_spinner(
     res
 }
 
-pub fn elevate_self(sub_args: &[String]) -> i32 {
+pub fn elevate_self(paths: &AppPaths, sub_args: &[String]) -> i32 {
     let Ok(self_exe) = env::current_exe() else {
         err("Could not determine current executable path for elevation.");
         return 1;
     };
     #[cfg(unix)]
     {
+        let _ = paths;
         let status = Command::new("sudo")
             .arg("-E")
             .arg(self_exe)
@@ -99,22 +103,91 @@ pub fn elevate_self(sub_args: &[String]) -> i32 {
     }
     #[cfg(windows)]
     {
-        let escaped: Vec<String> = sub_args
+        let mut full_args = vec![
+            "--cache-dir".to_string(),
+            paths.cache_dir.display().to_string(),
+        ];
+        full_args.extend_from_slice(sub_args);
+        let escaped: Vec<String> = full_args
             .iter()
             .map(|a| format!("'{}'", a.replace('\'', "''")))
             .collect();
         let ps = format!(
-            "Start-Process -FilePath '{}' -ArgumentList @({}) -Verb RunAs -Wait",
+            "$p = Start-Process -FilePath '{}' -ArgumentList @({}) -Verb RunAs -Wait -PassThru; \
+             if ($null -eq $p) {{ exit 1 }}; exit $p.ExitCode",
             self_exe.display().to_string().replace('\'', "''"),
             escaped.join(",")
         );
-        Command::new("powershell")
-            .args(["-NoProfile", "-Command", &ps])
-            .status()
-            .ok()
-            .and_then(|s| s.code())
-            .unwrap_or(1)
+        let mut cmd = Command::new("powershell");
+        cmd.args(["-NoProfile", "-Command", &ps])
+            .creation_flags(0x0800_0000);
+        cmd.status().ok().and_then(|s| s.code()).unwrap_or(1)
     }
+}
+
+#[cfg(windows)]
+fn launch_elevated_interactive_console(paths: &AppPaths) -> bool {
+    let Ok(self_exe) = env::current_exe() else {
+        return false;
+    };
+    let cache_dir_s = paths.cache_dir.display().to_string().replace('\'', "''");
+    let exe_s = self_exe.display().to_string().replace('\'', "''");
+
+    let ps = if let Some(wt) = which_bin("wt") {
+        let wt_s = wt.display().to_string().replace('\'', "''");
+        format!(
+            "Start-Process -FilePath '{wt_s}' -ArgumentList @('--title','VPN Gate','{exe_s}','--cache-dir','{cache_dir_s}') -Verb RunAs"
+        )
+    } else {
+        format!(
+            "Start-Process -FilePath '{exe_s}' -ArgumentList @('--cache-dir','{cache_dir_s}') -Verb RunAs"
+        )
+    };
+    let mut cmd = Command::new("powershell");
+    cmd.args(["-NoProfile", "-Command", &ps])
+        .creation_flags(0x0800_0000);
+    cmd.status().is_ok_and(|s| s.success())
+}
+
+fn render_established_session_summary(st: &ActiveSessionState) -> io::Result<()> {
+    ok(&format!(
+        "ESTABLISHED VPN! Server: {BOLD}{}{RESET} ({} - {}) | Protocol: {BOLD}{}{RESET} [{}] | Egress IP: {GREEN}{}{RESET} ({})",
+        st.hostname,
+        st.country_short,
+        st.country_long,
+        st.protocol,
+        st.backend,
+        st.egress_ip,
+        st.egress_loc
+    ));
+    if is_stdout_tty() {
+        let box_lines = vec![
+            Some(format!("{GREEN}{BOLD}● VPN Tunnel Established{RESET}")),
+            None,
+            Some(format!(
+                "Server    : {BOLD}{}{RESET} ({})",
+                st.hostname, st.server_ip
+            )),
+            Some(format!(
+                "Region    : {BOLD}{}{RESET} — {}",
+                st.country_short, st.country_long
+            )),
+            Some(format!(
+                "Protocol  : {BOLD}{}{RESET} ({})",
+                st.protocol, st.backend
+            )),
+            Some(format!(
+                "Interface : {GREEN}{}{RESET}   |   DNS Locked : {CYAN}{}{RESET}",
+                st.device, st.dns
+            )),
+            Some(format!(
+                "Egress IP : {GREEN}{BOLD}{}{RESET} (Cloudflare Loc: {BOLD}{}{RESET})",
+                st.egress_ip, st.egress_loc
+            )),
+        ];
+        render_dynamic_box(&box_lines, 3, 64)?;
+    }
+    Ok(())
 }
 
 pub fn print_countries_table(
@@ -438,7 +511,17 @@ pub async fn cmd_connect(paths: &AppPaths, args: &ConnectArgs) -> io::Result<i32
         } else {
             "--no-autoreconnect".to_string()
         });
-        return Ok(elevate_self(&sub));
+        let rc = elevate_self(paths, &sub);
+        if cfg!(windows) {
+            if rc == 0
+                && let Some(st) = read_json_opt::<ActiveSessionState>(&paths.active_state)
+            {
+                render_established_session_summary(&st)?;
+            } else if rc != 0 {
+                err("Elevated connection session did not complete or was cancelled.");
+            }
+        }
+        return Ok(rc);
     }
 
     clear_screen_if_tty();
@@ -507,43 +590,7 @@ pub async fn cmd_connect(paths: &AppPaths, args: &ConnectArgs) -> io::Result<i32
     if rc == 0
         && let Some(st) = read_json_opt::<ActiveSessionState>(&paths.active_state)
     {
-        ok(&format!(
-            "ESTABLISHED VPN! Server: {BOLD}{}{RESET} ({} - {}) | Protocol: {BOLD}{}{RESET} [{}] | Egress IP: {GREEN}{}{RESET} ({})",
-            st.hostname,
-            st.country_short,
-            st.country_long,
-            st.protocol,
-            st.backend,
-            st.egress_ip,
-            st.egress_loc
-        ));
-        if is_stdout_tty() {
-            let box_lines = vec![
-                Some(format!("{GREEN}{BOLD}● VPN Tunnel Established{RESET}")),
-                None,
-                Some(format!(
-                    "Server    : {BOLD}{}{RESET} ({})",
-                    st.hostname, st.server_ip
-                )),
-                Some(format!(
-                    "Region    : {BOLD}{}{RESET} — {}",
-                    st.country_short, st.country_long
-                )),
-                Some(format!(
-                    "Protocol  : {BOLD}{}{RESET} ({})",
-                    st.protocol, st.backend
-                )),
-                Some(format!(
-                    "Interface : {GREEN}{}{RESET}   |   DNS Locked : {CYAN}{}{RESET}",
-                    st.device, st.dns
-                )),
-                Some(format!(
-                    "Egress IP : {GREEN}{BOLD}{}{RESET} (Cloudflare Loc: {BOLD}{}{RESET})",
-                    st.egress_ip, st.egress_loc
-                )),
-            ];
-            render_dynamic_box(&box_lines, 3, 64)?;
-        }
+        render_established_session_summary(&st)?;
     } else if rc != 0 {
         err("Exhausted candidate servers without establishing a verified tunnel.");
     }
@@ -565,7 +612,19 @@ pub async fn cmd_disconnect(paths: &AppPaths) -> io::Result<i32> {
         if !screen_clear_enabled() {
             sub.push("--no-clear".to_string());
         }
-        return Ok(elevate_self(&sub));
+        let rc = elevate_self(paths, &sub);
+        if cfg!(windows) && rc == 0 {
+            ok("Disconnected from VPN Gate and restored routes, DNS, firewall, and host network settings.");
+            if let Some(trace) = trace_public_ip_with_spinner(
+                "Verifying restored host public egress IP",
+                Duration::from_secs(5),
+            )
+            .await
+            {
+                info(&format!("Current public IP: {} ({})", trace.ip, trace.loc));
+            }
+        }
+        return Ok(rc);
     }
 
     clear_screen_if_tty();
@@ -858,6 +917,13 @@ pub async fn cmd_status(paths: &AppPaths) -> io::Result<i32> {
             "TUN Link  : {GREEN}{}{RESET}",
             desc.join(", ")
         )));
+    } else if cfg!(target_os = "windows") {
+        let ovpn_pid = get_running_openvpn_pid(paths);
+        if ovpn_pid > 0 {
+            box_lines.push(Some(format!(
+                "TUN Link  : {GREEN}TAP/Wintun (OpenVPN PID {ovpn_pid}){RESET}"
+            )));
+        }
     }
 
     let active_cd = load_cooldowns(paths).active_count();
@@ -936,7 +1002,7 @@ pub fn cmd_watchdog(paths: &AppPaths, mode_raw: &str) -> i32 {
             "Elevating privileges to {} active session Watchdog ...",
             if mode == "on" { "arm" } else { "stop" }
         ));
-        return elevate_self(&["watchdog".to_string(), mode.to_string()]);
+        return elevate_self(paths, &["watchdog".to_string(), mode.to_string()]);
     }
 
     if mode == "off" {
@@ -1049,10 +1115,16 @@ pub fn cmd_doctor(paths: &AppPaths) -> io::Result<i32> {
 
     // 4. Desktop Window / Console UI
     if cfg!(target_os = "windows") {
-        let wt_note = if which_bin("wt").is_some() {
-            "Windows Terminal (`wt.exe`) + PowerShell UTF-8/VT"
+        let (cols, rows) = get_live_terminal_size(100, 30);
+        let vt_tag = if win_vt_enabled() {
+            "VT100 ANSI"
         } else {
-            "PowerShell Console UTF-8/VT"
+            "ASCII Fallback"
+        };
+        let wt_note = if which_bin("wt").is_some() {
+            format!("Windows Terminal (`wt.exe`) + UTF-8 CP65001 ({vt_tag}, {cols}x{rows})")
+        } else {
+            format!("PowerShell Console UTF-8 CP65001 ({vt_tag}, {cols}x{rows})")
         };
         lines.push(Some(format!(
             "Console UI   : {GREEN}READY{RESET} — {wt_note}"
@@ -1260,8 +1332,10 @@ fn prompt_country(servers: &[VpnServer], proto: ProtocolFilter) -> io::Result<Op
         return Ok(None);
     }
     print_countries_table(&rows, proto.as_cli_str(), true)?;
-    println!("  {CYAN}[A]{RESET} All Regions / Best Available Worldwide");
-    println!("  {CYAN}[0]{RESET} Cancel / Back to Main Menu");
+    print_line(&format!(
+        "  {CYAN}[A]{RESET} All Regions / Best Available Worldwide"
+    ));
+    print_line(&format!("  {CYAN}[0]{RESET} Cancel / Back to Main Menu"));
     loop {
         let Some(ans) = prompt_input(&format!(
             "\nSelect region by {BOLD}Number (1-{}){RESET}, {BOLD}Country Code (e.g. JP){RESET}, {BOLD}A (All){RESET}, or {BOLD}0 (Back){RESET}: ",
@@ -1353,6 +1427,54 @@ fn local_pool_summary_line(paths: &AppPaths) -> String {
 pub async fn interactive_menu(paths: &AppPaths, help_text: &str) -> io::Result<i32> {
     let os_label = detect_host_os_label();
 
+    #[cfg(windows)]
+    if !is_root_or_admin() && is_stdout_tty() {
+        clear_screen_if_tty();
+        let admin_box = vec![
+            Some(format!(
+                "{YELLOW}{BOLD}Administrator Privileges Recommended on Windows 11{RESET}"
+            )),
+            None,
+            Some(format!(
+                "`vpngate` runs best inside an {BOLD}Administrator{RESET} console from startup so all"
+            )),
+            Some(
+                "L2TP/IPsec (RASMAN/IKEEXT), OpenVPN, routes, and Cloudflare DNS operations"
+                    .to_string(),
+            ),
+            Some(
+                "run directly inside one window with zero mid-session UAC window-jumping."
+                    .to_string(),
+            ),
+            None,
+            Some(format!(
+                " {CYAN}[1]{RESET} Open Elevated Administrator VPN Gate Console Now (UAC Prompt) {GREEN}[Default]{RESET}"
+            )),
+            Some(format!(
+                " {CYAN}[2]{RESET} Continue Here in Current Window (Browse Relays / Mirrors / Doctor)"
+            )),
+            Some(format!(" {CYAN}[0]{RESET} Exit")),
+        ];
+        render_dynamic_box(&admin_box, 4, 76)?;
+        let Some(ans) = prompt_input(&format!(
+            "\nSelect option {BOLD}[1-2, Enter=1, 0=Exit]{RESET}: "
+        )) else {
+            return Ok(0);
+        };
+        match ans.to_ascii_lowercase().as_str() {
+            "0" | "q" | "quit" | "exit" => return Ok(0),
+            "2" | "c" | "continue" => {}
+            _ => {
+                if launch_elevated_interactive_console(paths) {
+                    ok("Launched elevated Administrator VPN Gate console window.");
+                    return Ok(0);
+                }
+                warn("UAC elevation was cancelled or failed - continuing in current window.");
+                tokio::time::sleep(Duration::from_millis(900)).await;
+            }
+        }
+    }
+
     loop {
         clear_screen_if_tty();
         prune_stale_state_if_dead(paths);
@@ -1376,6 +1498,11 @@ pub async fn interactive_menu(paths: &AppPaths, help_text: &str) -> io::Result<i
         } else {
             let ppp = get_ppp_interfaces();
             let tun = get_tun_interfaces();
+            let ovpn_pid = if cfg!(target_os = "windows") {
+                get_running_openvpn_pid(paths)
+            } else {
+                0
+            };
             if let Some((dev, ip)) = ppp.iter().next() {
                 format!(
                     "Tunnel   : {GREEN}● ACTIVE PPP LINK{RESET} ({dev} -> {ip})  |  Watchdog: {wd_str}"
@@ -1383,6 +1510,10 @@ pub async fn interactive_menu(paths: &AppPaths, help_text: &str) -> io::Result<i
             } else if let Some((dev, ip)) = tun.iter().next() {
                 format!(
                     "Tunnel   : {GREEN}● ACTIVE TUN LINK{RESET} ({dev} -> {ip})  |  Watchdog: {wd_str}"
+                )
+            } else if ovpn_pid > 0 {
+                format!(
+                    "Tunnel   : {GREEN}● ACTIVE OPENVPN{RESET} (PID {ovpn_pid})  |  Watchdog: {wd_str}"
                 )
             } else {
                 format!("Tunnel   : {DIM}○ Disconnected{RESET}  |  Watchdog: {wd_str}")
@@ -1437,7 +1568,7 @@ pub async fn interactive_menu(paths: &AppPaths, help_text: &str) -> io::Result<i
         render_dynamic_box(&menu_lines, 5, 76)?;
 
         let Some(choice) = prompt_input(&format!("\nSelect an action {BOLD}[0-9]{RESET}: ")) else {
-            println!();
+            print_line("");
             return Ok(0);
         };
 
@@ -1591,7 +1722,7 @@ pub async fn interactive_menu(paths: &AppPaths, help_text: &str) -> io::Result<i
                         .unwrap_or(80)
                         .max(80);
                     request_window_resize(max_help_w + 4, (help_text.lines().count() + 5).min(46));
-                    println!("\n{help_text}");
+                    print_line(&format!("\n{help_text}"));
                     let _ = prompt_input("\nPress Enter to return to Dashboard...");
                 }
             }
