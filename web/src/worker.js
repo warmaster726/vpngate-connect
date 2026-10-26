@@ -1,3 +1,5 @@
+import { connect } from "cloudflare:sockets";
+
 /**
  * VPN Gate Connect — Isolated Cloudflare Workers Web Profile Portal
  * =================================================================
@@ -6,17 +8,16 @@
  * Capabilities:
  *  - Preserves the 4-tab Obsidian/Slate Dark Console UI (`Connect`, `Relays`, `Mirrors`, `Doctor`)
  *  - Multi-stage censorship-resilient discovery (`vpngate.net` + Official Mirror Portals + HTTPS CSV/Archive Mirrors)
- *  - Outbound live TCP socket probing via `cloudflare:sockets` (`GET /api/probe`)
- *  - Native iOS / iPadOS / macOS L2TP/IPsec `.mobileconfig` delivery (`Content-Type: application/x-apple-aspen-config`)
- *  - Zero-prompt patched `.ovpn` export (`MobileCore3`, `OpenVpn26`, `OpenVpn25`, `OpenVpn24`)
+ *  - Recursive live-path testing via OpenVPN TCP HARD_RESET (`cloudflare:sockets`)
+ *  - Native iOS / iPadOS / macOS L2TP/IPsec `.mobileconfig` — issued only after handshake
+ *  - Zero-prompt patched `.ovpn` export — issued only after handshake
  *  - Completely isolated from root `Cargo.toml`, `Cargo.lock`, and desktop installer scripts.
  */
 
-const APP_VERSION = "0.1.0";
+const APP_VERSION = "0.2.0";
 const POOL_CACHE_TTL_MS = 180_000;
 const POOL_CACHE_KEY_URL = "https://vpngate-edge-cache.internal/v1/pool-snapshot";
-const USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) VPNGate-WebWorker/0.1";
-
+const USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) VPNGate-WebWorker/0.2";
 const OFFICIAL_CSV_URLS = [
   "https://www.vpngate.net/api/iphone/",
   "http://www.vpngate.net/api/iphone/",
@@ -1166,184 +1167,607 @@ async function getPoolSnapshot(ctx, { forceRefresh = false, customMirror = "" } 
   return { ...fresh, cached: false };
 }
 
-async function probeTcpEdge(ip, port, timeoutMs = 2200) {
-  const t0 = Date.now();
-  try {
-    const socketsMod = await import("cloudflare:sockets");
-    const socket = socketsMod.connect({ hostname: ip, port });
-    let timer;
-    try {
-      await Promise.race([
-        socket.opened,
-        new Promise((_, reject) => {
-          timer = setTimeout(() => reject(new Error("TCP connect timeout")), timeoutMs);
-        }),
-      ]);
-      const rttMs = Math.max(1, Date.now() - t0);
-      try { await socket.close(); } catch {}
-      return { reachable: true, rtt_ms: rttMs, engine: "cloudflare:sockets" };
-    } finally {
-      clearTimeout(timer);
-      try { socket.close(); } catch {}
+const VERIFY_OK_TTL_MS = 180_000;
+const VERIFY_FAIL_TTL_MS = 45_000;
+const OPENVPN_HARD_RESET_CLIENT_V2 = 0x38;
+const OPENVPN_HARD_RESET_SERVER_V2 = 0x40;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function matchCountryServer(srv, query) {
+  if (!query || query === "ALL") return true;
+  const q = String(query).trim();
+  if (!q || q.toLowerCase() === "all" || q.toLowerCase() === "any") return true;
+  const up = q.toUpperCase();
+  if (q.length === 2 && /^[A-Za-z]{2}$/.test(q)) {
+    const iso = up === "UK" ? "GB" : up;
+    return (srv.country_short || "").toUpperCase() === iso;
+  }
+  const low = q.toLowerCase();
+  return (
+    (srv.country_short || "").toUpperCase() === up ||
+    (srv.country_long || "").toLowerCase().includes(low) ||
+    (srv.hostname || "").toLowerCase().includes(low) ||
+    (srv.ip || "").includes(low)
+  );
+}
+
+function matchProtoServer(srv, proto) {
+  if (!proto || proto === "auto" || proto === "all") return Boolean(srv.l2tp || srv.openvpn);
+  if (proto === "l2tp") return Boolean(srv.l2tp);
+  if (proto === "udp") return Boolean(srv.openvpn && srv.udp_port > 0);
+  if (proto === "tcp") return Boolean(srv.openvpn && srv.tcp_port > 0);
+  return Boolean(srv.l2tp || srv.openvpn);
+}
+
+function rememberVerify(ip, rec) {
+  if (!globalThis.__VG_VERIFIED) globalThis.__VG_VERIFIED = new Map();
+  globalThis.__VG_VERIFIED.set(ip, { ...rec, ts: Date.now() });
+}
+
+function recallVerify(ip) {
+  const mem = globalThis.__VG_VERIFIED;
+  if (!mem) return null;
+  const rec = mem.get(ip);
+  if (!rec) return null;
+  const ttl = rec.ok ? VERIFY_OK_TTL_MS : VERIFY_FAIL_TTL_MS;
+  if (Date.now() - rec.ts > ttl) return null;
+  return rec;
+}
+
+function decorateServersWithVerification(servers) {
+  const now = Date.now();
+  const mem = globalThis.__VG_VERIFIED;
+  return (servers || []).map((s) => {
+    const rec = mem ? mem.get(s.ip) : null;
+    if (!rec) return { ...s, verify_state: "untested" };
+    const ttl = rec.ok ? VERIFY_OK_TTL_MS : VERIFY_FAIL_TTL_MS;
+    if (now - rec.ts > ttl) return { ...s, verify_state: "untested" };
+    return {
+      ...s,
+      verify_state: rec.ok ? "live" : "dead",
+      verified_port: rec.port || 0,
+      verified_rtt_ms: rec.rtt_ms || null,
+    };
+  });
+}
+
+function buildOpenVpnHardReset() {
+  const sid = crypto.getRandomValues(new Uint8Array(8));
+  const pkt = new Uint8Array(16);
+  pkt[1] = 14;
+  pkt[2] = OPENVPN_HARD_RESET_CLIENT_V2;
+  pkt.set(sid, 3);
+  pkt[11] = 0;
+  return { pkt, sid };
+}
+
+function bufferContainsSid(buf, sid) {
+  if (!buf || buf.length < 8) return false;
+  for (let i = 0; i <= buf.length - 8; i++) {
+    let ok = true;
+    for (let j = 0; j < 8; j++) {
+      if (buf[i + j] !== sid[j]) {
+        ok = false;
+        break;
+      }
     }
+    if (ok) return true;
+  }
+  return false;
+}
+
+function parseOpenVpnHardResetReply(buf, clientSid) {
+  if (!buf || buf.length < 16) return false;
+  const opcode = buf[2];
+  if ((opcode & 0xf8) !== OPENVPN_HARD_RESET_SERVER_V2) return false;
+  return bufferContainsSid(buf, clientSid);
+}
+
+async function readSocketBytes(reader, minBytes, deadline) {
+  const chunks = [];
+  let total = 0;
+  while (total < minBytes && Date.now() < deadline) {
+    const waitMs = Math.max(1, deadline - Date.now());
+    let timedOut = false;
+    const next = await Promise.race([
+      reader.read(),
+      sleep(waitMs).then(() => {
+        timedOut = true;
+        return null;
+      }),
+    ]);
+    if (timedOut || !next || next.done) break;
+    if (next.value && next.value.byteLength) {
+      const piece = next.value instanceof Uint8Array ? next.value : new Uint8Array(next.value);
+      chunks.push(piece);
+      total += piece.byteLength;
+    }
+  }
+  if (!chunks.length) return null;
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    out.set(c, offset);
+    offset += c.byteLength;
+  }
+  return out;
+}
+
+async function probeOpenVpnHandshake(ip, port, timeoutMs = 2400) {
+  const t0 = Date.now();
+  const deadline = t0 + timeoutMs;
+  let socket;
+  try {
+    socket = connect({ hostname: ip, port: Number(port) });
+    await Promise.race([
+      socket.opened,
+      sleep(timeoutMs).then(() => {
+        throw new Error("TCP connect timeout");
+      }),
+    ]);
+    const { pkt, sid } = buildOpenVpnHardReset();
+    const writer = socket.writable.getWriter();
+    await writer.write(pkt);
+    const reader = socket.readable.getReader();
+    const buf = await readSocketBytes(reader, 16, deadline);
+    try { await writer.close(); } catch {}
+    try { reader.releaseLock(); } catch {}
+    try { await socket.close(); } catch {}
+    const handshake = parseOpenVpnHardResetReply(buf, sid);
+    return {
+      reachable: Boolean(handshake),
+      handshake,
+      rtt_ms: Math.max(1, Date.now() - t0),
+      engine: "openvpn-tcp-v2",
+      error: handshake ? undefined : "no OpenVPN HARD_RESET_SERVER_V2",
+    };
   } catch (err) {
+    try { if (socket) await socket.close(); } catch {}
     return {
       reachable: false,
+      handshake: false,
       rtt_ms: null,
-      engine: "cloudflare:sockets",
-      error: err && err.message ? String(err.message) : "TCP probe unavailable",
+      engine: "openvpn-tcp-v2",
+      error: err && err.message ? String(err.message) : "OpenVPN handshake unavailable",
     };
   }
 }
 
-// =============================================================================
-// 5. Embedded 4-Tab Obsidian/Slate Dark Console UI (`Connect`, `Relays`, `Mirrors`, `Doctor`)
-// =============================================================================
+async function probeTcpEdge(ip, port, timeoutMs = 2200) {
+  const handshake = await probeOpenVpnHandshake(ip, port, timeoutMs);
+  if (handshake.handshake) return handshake;
+  const t0 = Date.now();
+  let socket;
+  try {
+    socket = connect({ hostname: ip, port: Number(port) });
+    await Promise.race([
+      socket.opened,
+      sleep(timeoutMs).then(() => {
+        throw new Error("TCP connect timeout");
+      }),
+    ]);
+    try { await socket.close(); } catch {}
+    return {
+      reachable: true,
+      handshake: false,
+      rtt_ms: Math.max(1, Date.now() - t0),
+      engine: "tcp-connect",
+      error: handshake.error,
+    };
+  } catch (err) {
+    try { if (socket) await socket.close(); } catch {}
+    return {
+      reachable: false,
+      handshake: false,
+      rtt_ms: null,
+      engine: handshake.engine,
+      error: handshake.error || (err && err.message ? String(err.message) : "TCP probe unavailable"),
+    };
+  }
+}
+
+function portsToProbe(server) {
+  const ports = [];
+  const advertised = Number(server.tcp_port) || 0;
+  if (advertised > 0 && advertised <= 65535) ports.push(advertised);
+  for (const p of [443, 995, 5555]) {
+    if (!ports.includes(p)) ports.push(p);
+  }
+  return advertised > 0 ? ports.slice(0, 1) : ports.slice(0, 2);
+}
+
+async function verifyRelay(server) {
+  const ports = portsToProbe(server);
+  let last = {
+    ok: false,
+    port: ports[0] || 0,
+    rtt_ms: null,
+    engine: "openvpn-tcp-v2",
+    error: "no probe ports",
+  };
+  for (const port of ports) {
+    const r = await probeOpenVpnHandshake(server.ip, port, 2400);
+    if (r.handshake) {
+      return { ok: true, port, rtt_ms: r.rtt_ms, engine: r.engine };
+    }
+    last = {
+      ok: false,
+      port,
+      rtt_ms: r.rtt_ms,
+      engine: r.engine,
+      error: r.error || "handshake failed",
+    };
+  }
+  return last;
+}
+
+async function verifyRelayCached(server, { force = false } = {}) {
+  if (!force) {
+    const hit = recallVerify(server.ip);
+    if (hit) return hit;
+  }
+  const res = await verifyRelay(server);
+  rememberVerify(server.ip, res);
+  return res;
+}
+
+function unlockedProfiles(server, result) {
+  const unlocked = [];
+  if (!result || !result.ok) return unlocked;
+  if (server.l2tp) unlocked.push("l2tp");
+  if (server.openvpn && (server.tcp_port > 0 || result.port > 0)) unlocked.push("tcp");
+  if (server.openvpn && server.udp_port > 0) unlocked.push("udp");
+  return unlocked;
+}
+
+function sortVerifyCandidates(list) {
+  return list.slice().sort((a, b) => {
+    const liveA = a.verify_state === "live" ? 0 : a.verify_state === "dead" ? 2 : 1;
+    const liveB = b.verify_state === "live" ? 0 : b.verify_state === "dead" ? 2 : 1;
+    if (liveA !== liveB) return liveA - liveB;
+    const tier = autoPriorityTier(a) - autoPriorityTier(b);
+    if (tier !== 0) return tier;
+    if (b.score !== a.score) return b.score - a.score;
+    if (b.speed_bps !== a.speed_bps) return b.speed_bps - a.speed_bps;
+    return (a.ping_ms || 9999) - (b.ping_ms || 9999);
+  });
+}
+
+async function recursiveVerifyRelays({
+  servers,
+  country = "ALL",
+  proto = "auto",
+  exclude = [],
+  ip = "",
+  force = false,
+} = {}) {
+  const excludeSet = new Set(exclude);
+  let widened = false;
+  let candidates;
+  if (ip) {
+    const found = servers.find((s) => s.ip === ip);
+    candidates = found ? [found] : [];
+  } else {
+    candidates = sortVerifyCandidates(
+      servers.filter((s) => matchCountryServer(s, country) && matchProtoServer(s, proto) && !excludeSet.has(s.ip))
+    );
+    if (candidates.length === 0 && country && country !== "ALL") {
+      widened = true;
+      candidates = sortVerifyCandidates(
+        servers.filter((s) => matchProtoServer(s, proto) && !excludeSet.has(s.ip))
+      );
+    }
+  }
+
+  const maxAttempts = ip ? 1 : 12;
+  const batchSize = ip ? 1 : 4;
+  const slice = candidates.slice(0, maxAttempts);
+  const attempts = [];
+  let winner = null;
+
+  for (let i = 0; i < slice.length && !winner; i += batchSize) {
+    const batch = slice.slice(i, i + batchSize);
+    const results = await Promise.all(batch.map((s) => verifyRelayCached(s, { force })));
+    for (let j = 0; j < batch.length; j++) {
+      const srv = batch[j];
+      const res = results[j];
+      attempts.push({
+        ip: srv.ip,
+        hostname: srv.hostname,
+        country_short: srv.country_short,
+        port: res.port,
+        ok: Boolean(res.ok),
+        rtt_ms: res.rtt_ms || null,
+        error: res.ok ? undefined : res.error,
+        engine: res.engine,
+      });
+      if (res.ok && !winner) winner = { server: srv, result: res };
+    }
+  }
+
+  if (!winner) {
+    return {
+      verified: null,
+      attempts,
+      scanned: attempts.length,
+      widened,
+      remaining: Math.max(0, candidates.length - slice.length),
+    };
+  }
+
+  const srv = winner.server;
+  const res = winner.result;
+  return {
+    verified: {
+      ip: srv.ip,
+      hostname: srv.hostname,
+      country_short: srv.country_short,
+      country_long: srv.country_long,
+      port: res.port,
+      rtt_ms: res.rtt_ms,
+      handshake: "openvpn-tcp-v2",
+      l2tp: srv.l2tp,
+      openvpn: srv.openvpn,
+      tcp_port: srv.tcp_port,
+      udp_port: srv.udp_port,
+      has_ovpn_cert: srv.has_ovpn_cert,
+      score: srv.score,
+      speed_bps: srv.speed_bps,
+      ping_ms: srv.ping_ms,
+      sessions: srv.sessions,
+      operator: srv.operator,
+      unlocked: unlockedProfiles(srv, res),
+    },
+    attempts,
+    scanned: attempts.length,
+    widened,
+    remaining: Math.max(0, candidates.length - slice.length),
+  };
+}
+
+async function assertVerifiedForProfile(ctx, ip, kind) {
+  const snap = await getPoolSnapshot(ctx, { forceRefresh: false });
+  const found = (snap.public_payload.servers || []).find((s) => s.ip === ip);
+  if (!found) {
+    return { error: "Relay is not in the active VPN Gate pool.", status: 404 };
+  }
+  if (kind === "l2tp" && !found.l2tp) {
+    return { error: "Relay does not advertise L2TP/IPsec.", status: 409, found };
+  }
+  if (kind === "tcp" && !found.openvpn) {
+    return { error: "Relay does not advertise OpenVPN TCP.", status: 409, found };
+  }
+  if (kind === "udp" && !(found.openvpn && found.udp_port > 0)) {
+    return { error: "Relay does not advertise OpenVPN UDP.", status: 409, found };
+  }
+  const verified = await verifyRelayCached(found);
+  if (!verified.ok) {
+    return {
+      error: "Live handshake failed — profile withheld until the relay answers OpenVPN HARD_RESET.",
+      status: 409,
+      found,
+      verified,
+    };
+  }
+  const unlocked = unlockedProfiles(found, verified);
+  if (!unlocked.includes(kind)) {
+    return {
+      error: `Verified host does not unlock '${kind}' profile.`,
+      status: 409,
+      found,
+      verified,
+    };
+  }
+  return { found, verified, snap };
+}
 
 const PORTAL_CSS = String.raw`
 :root {
-  --bg: #0A0F1A;
-  --card: #131C2E;
-  --card-alt: #0E1625;
-  --border: #22304A;
+  --bg: #070B14;
+  --bg-glow: radial-gradient(1200px 500px at 50% -80px, rgba(56,189,248,0.08), transparent 70%);
+  --card: #101827;
+  --card-alt: #0C1320;
+  --border: #1E2B42;
   --cyan: #38BDF8;
   --cyan-dim: rgba(56, 189, 248, 0.14);
-  --emerald: #10B981;
-  --emerald-dim: rgba(16, 185, 129, 0.14);
-  --amber: #F59E0B;
-  --amber-dim: rgba(245, 158, 11, 0.14);
-  --coral: #F43F5E;
-  --coral-dim: rgba(244, 63, 94, 0.14);
-  --console: #070B12;
-  --text: #E2E8F0;
-  --muted: #94A3B8;
-  --mono: "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  --emerald: #34D399;
+  --emerald-dim: rgba(52, 211, 153, 0.14);
+  --amber: #FBBF24;
+  --amber-dim: rgba(251, 191, 36, 0.14);
+  --coral: #FB7185;
+  --coral-dim: rgba(251, 113, 133, 0.14);
+  --console: #060A11;
+  --text: #E8EEF7;
+  --muted: #8FA3BB;
+  --mono: ui-monospace, "SFMono-Regular", "Cascadia Code", Consolas, "Liberation Mono", Menlo, monospace;
   --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+  --radius: 14px;
+  --shadow: 0 10px 30px rgba(0,0,0,0.28);
 }
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html { color-scheme: dark; }
 html, body {
   margin: 0; padding: 0;
   background: var(--bg); color: var(--text);
-  font-family: var(--sans); font-size: 14px; line-height: 1.45;
+  font-family: var(--sans); font-size: 15px; line-height: 1.45;
   min-height: 100dvh;
+  background-image: var(--bg-glow);
 }
+body { touch-action: manipulation; }
 a { color: var(--cyan); text-decoration: none; }
 .app-shell {
-  max-width: 960px; margin: 0 auto;
-  padding: calc(12px + env(safe-area-inset-top, 0px)) 14px calc(86px + env(safe-area-inset-bottom, 0px));
+  max-width: 880px; margin: 0 auto;
+  padding: calc(10px + env(safe-area-inset-top, 0px)) 12px calc(92px + env(safe-area-inset-bottom, 0px));
 }
 .topbar {
   display: flex; align-items: center; justify-content: space-between; gap: 10px;
-  background: var(--card); border: 1px solid var(--border);
-  border-radius: 14px; padding: 12px 15px; margin-bottom: 14px;
+  background: rgba(16,24,39,0.92); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 10px 12px; margin-bottom: 12px;
+  box-shadow: var(--shadow); backdrop-filter: blur(12px);
+  position: sticky; top: env(safe-area-inset-top, 0px); z-index: 20;
 }
 .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .brand-icon {
-  width: 36px; height: 36px; border-radius: 10px; flex-shrink: 0;
-  background: linear-gradient(135deg, rgba(56,189,248,0.22), rgba(16,185,129,0.2));
-  border: 1px solid rgba(56,189,248,0.4);
-  display: grid; place-items: center; font-family: var(--mono); font-weight: 700; color: var(--cyan);
+  width: 38px; height: 38px; border-radius: 11px; flex-shrink: 0;
+  background: linear-gradient(160deg, rgba(56,189,248,0.28), rgba(16,185,129,0.16));
+  border: 1px solid rgba(56,189,248,0.42);
+  display: grid; place-items: center; font-family: var(--mono); font-weight: 800; color: var(--cyan);
+  letter-spacing: -0.04em;
 }
-.brand-title { font-weight: 700; font-size: 15px; letter-spacing: -0.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.brand-sub { font-size: 11.5px; color: var(--muted); font-family: var(--mono); }
+.brand-title { font-weight: 750; font-size: 15.5px; letter-spacing: -0.02em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.brand-sub { font-size: 11px; color: var(--muted); font-family: var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 52vw; }
 .topbar-right { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 .status-pill {
   display: inline-flex; align-items: center; gap: 6px;
-  padding: 5px 10px; border-radius: 999px; font-size: 11.5px; font-family: var(--mono); font-weight: 600;
-  background: var(--emerald-dim); color: var(--emerald); border: 1px solid rgba(16,185,129,0.35);
+  padding: 6px 10px; border-radius: 999px; font-size: 11px; font-family: var(--mono); font-weight: 700;
+  background: var(--emerald-dim); color: var(--emerald); border: 1px solid rgba(52,211,153,0.35);
+  max-width: 42vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .status-pill.syncing { background: var(--cyan-dim); color: var(--cyan); border-color: rgba(56,189,248,0.35); }
-.status-pill.error { background: var(--coral-dim); color: var(--coral); border-color: rgba(244,63,94,0.35); }
-.dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.status-pill.error { background: var(--coral-dim); color: var(--coral); border-color: rgba(251,113,133,0.35); }
+.dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; flex-shrink: 0; }
+.status-pill.syncing .dot { animation: pulse-dot 1.1s ease-in-out infinite; }
+@keyframes pulse-dot { 0%,100% { opacity: 1; transform: scale(1); } 50% { opacity: .35; transform: scale(.82); } }
 
 .card {
   background: var(--card); border: 1px solid var(--border);
-  border-radius: 14px; padding: 15px; margin-bottom: 12px;
+  border-radius: var(--radius); padding: 14px; margin-bottom: 12px;
 }
 .card-header {
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
   margin-bottom: 10px;
 }
-.card-title { font-weight: 700; font-size: 13.5px; letter-spacing: 0.01em; color: #F8FAFC; }
-.card-subtitle { font-size: 12px; color: var(--muted); }
+.card-title { font-weight: 750; font-size: 13.5px; letter-spacing: 0.01em; color: #F8FAFC; }
+.card-subtitle { font-size: 12.5px; color: var(--muted); }
+.card-subtitle code { font-family: var(--mono); font-size: 11.5px; color: var(--cyan); }
 
 .grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
 @media (max-width: 640px) { .grid-2 { grid-template-columns: 1fr; } }
 
 label.field-label {
-  display: block; font-size: 11.5px; font-weight: 600; color: var(--muted);
-  text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 5px; font-family: var(--mono);
+  display: block; font-size: 11px; font-weight: 700; color: var(--muted);
+  text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 6px; font-family: var(--mono);
 }
 select, input[type="text"] {
   width: 100%; background: var(--console); color: var(--text);
-  border: 1px solid var(--border); border-radius: 10px;
-  padding: 9px 11px; font-size: 13.5px; font-family: var(--sans); outline: none;
+  border: 1px solid var(--border); border-radius: 11px;
+  padding: 11px 12px; font-size: 16px; font-family: var(--sans); outline: none;
+  min-height: 44px;
 }
-select:focus, input[type="text"]:focus { border-color: var(--cyan); }
+select:focus, input[type="text"]:focus { border-color: var(--cyan); box-shadow: 0 0 0 3px rgba(56,189,248,0.15); }
+button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible {
+  outline: 2px solid var(--cyan); outline-offset: 2px;
+}
 
 .pill-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 .chip {
   background: var(--card-alt); color: var(--muted);
   border: 1px solid var(--border); border-radius: 999px;
-  padding: 5px 11px; font-size: 12px; font-family: var(--mono); cursor: pointer;
-  transition: all 0.14s ease;
+  padding: 7px 12px; font-size: 12px; font-family: var(--mono); cursor: pointer;
+  transition: border-color 0.14s ease, color 0.14s ease, background 0.14s ease;
+  min-height: 34px;
 }
 .chip:hover { border-color: var(--cyan); color: var(--text); }
 .chip.active {
   background: var(--cyan-dim); color: var(--cyan);
-  border-color: rgba(56, 189, 248, 0.55); font-weight: 600;
+  border-color: rgba(56, 189, 248, 0.55); font-weight: 700;
 }
 
-.hero-relay {
-  background: linear-gradient(180deg, rgba(56,189,248,0.07) 0%, rgba(19,28,46,0.95) 100%);
-  border: 1px solid rgba(56,189,248,0.38); border-radius: 14px; padding: 15px; margin-bottom: 12px;
+.stepper {
+  display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 6px;
+  margin: 0 0 12px;
 }
+.step {
+  background: var(--card-alt); border: 1px solid var(--border); border-radius: 10px;
+  padding: 8px 6px; text-align: center; font-family: var(--mono); font-size: 10.5px; color: var(--muted);
+}
+.step b { display: block; font-size: 11.5px; color: var(--text); font-weight: 700; margin-bottom: 2px; }
+.step.on { border-color: rgba(56,189,248,0.45); color: var(--cyan); }
+.step.ok { border-color: rgba(52,211,153,0.45); color: var(--emerald); }
+.step.bad { border-color: rgba(251,113,133,0.4); color: var(--coral); }
+
+.hero-relay {
+  background: linear-gradient(180deg, rgba(56,189,248,0.08) 0%, rgba(16,24,39,0.96) 42%);
+  border: 1px solid rgba(56,189,248,0.32); border-radius: var(--radius); padding: 15px; margin-bottom: 12px;
+  box-shadow: var(--shadow);
+}
+.hero-relay.live { border-color: rgba(52,211,153,0.5); background: linear-gradient(180deg, rgba(52,211,153,0.1) 0%, rgba(16,24,39,0.96) 46%); }
+.hero-relay.testing { border-color: rgba(56,189,248,0.55); }
+.hero-relay.dead { border-color: rgba(251,113,133,0.4); }
 .relay-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
-.relay-country { font-size: 16px; font-weight: 700; color: #F8FAFC; }
-.relay-host { font-family: var(--mono); font-size: 12px; color: var(--cyan); margin-top: 2px; word-break: break-all; }
+.relay-country { font-size: 17px; font-weight: 750; color: #F8FAFC; letter-spacing: -0.02em; }
+.relay-host { font-family: var(--mono); font-size: 12px; color: var(--cyan); margin-top: 3px; word-break: break-all; }
 .stats-strip {
   display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px;
   margin: 12px 0; background: var(--console); border: 1px solid var(--border);
-  border-radius: 10px; padding: 9px 10px;
+  border-radius: 11px; padding: 10px;
 }
-@media (max-width: 480px) { .stats-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 520px) { .stats-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 .stat-box { font-family: var(--mono); }
-.stat-k { font-size: 10.5px; color: var(--muted); text-transform: uppercase; }
-.stat-v { font-size: 13px; font-weight: 700; color: #F8FAFC; margin-top: 1px; }
+.stat-k { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+.stat-v { font-size: 13.5px; font-weight: 750; color: #F8FAFC; margin-top: 2px; }
 
-.badges { display: flex; flex-wrap: wrap; gap: 5px; }
+.badges { display: flex; flex-wrap: wrap; gap: 5px; justify-content: flex-end; }
 .badge {
-  display: inline-flex; align-items: center; padding: 2.5px 8px;
-  border-radius: 6px; font-family: var(--mono); font-size: 11px; font-weight: 600;
+  display: inline-flex; align-items: center; padding: 3px 8px;
+  border-radius: 6px; font-family: var(--mono); font-size: 10.5px; font-weight: 700;
 }
-.badge-l2tp { background: var(--emerald-dim); color: var(--emerald); border: 1px solid rgba(16,185,129,0.35); }
+.badge-l2tp { background: var(--emerald-dim); color: var(--emerald); border: 1px solid rgba(52,211,153,0.35); }
 .badge-udp { background: var(--cyan-dim); color: var(--cyan); border: 1px solid rgba(56,189,248,0.35); }
-.badge-tcp { background: var(--amber-dim); color: var(--amber); border: 1px solid rgba(245,158,11,0.35); }
-.badge-err { background: var(--coral-dim); color: var(--coral); border: 1px solid rgba(244,63,94,0.35); }
+.badge-tcp { background: var(--amber-dim); color: var(--amber); border: 1px solid rgba(251,191,36,0.35); }
+.badge-err { background: var(--coral-dim); color: var(--coral); border: 1px solid rgba(251,113,133,0.35); }
+.badge-live { background: var(--emerald-dim); color: var(--emerald); border: 1px solid rgba(52,211,153,0.45); }
+.badge-wait { background: var(--cyan-dim); color: var(--cyan); border: 1px solid rgba(56,189,248,0.35); }
+
+.lock-note {
+  display: flex; align-items: flex-start; gap: 8px;
+  background: rgba(251,191,36,0.08); border: 1px solid rgba(251,191,36,0.28);
+  color: #FDE68A; border-radius: 10px; padding: 9px 11px; font-size: 12.5px; margin-top: 10px;
+}
+.lock-note.ok {
+  background: rgba(52,211,153,0.08); border-color: rgba(52,211,153,0.3); color: #A7F3D0;
+}
+
+.progress-track {
+  height: 6px; background: #0B1220; border-radius: 99px; overflow: hidden;
+  border: 1px solid var(--border); margin: 10px 0 6px;
+}
+.progress-fill {
+  height: 100%; width: 8%;
+  background: linear-gradient(90deg, #0EA5E9, #34D399);
+  animation: load-slide 1.4s ease-in-out infinite;
+}
+@keyframes load-slide { 0% { width: 8%; margin-left: 0; } 50% { width: 55%; } 100% { width: 8%; margin-left: 92%; } }
+.progress-label { font-family: var(--mono); font-size: 11.5px; color: var(--cyan); }
 
 .btn-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 .btn {
   display: inline-flex; align-items: center; justify-content: center; gap: 7px;
-  padding: 10px 14px; border-radius: 10px; font-size: 13px; font-weight: 600;
+  padding: 12px 14px; border-radius: 11px; font-size: 13.5px; font-weight: 700;
   border: 1px solid var(--border); background: var(--card-alt); color: var(--text);
-  cursor: pointer; text-decoration: none; transition: all 0.14s ease;
+  cursor: pointer; text-decoration: none; transition: border-color 0.14s ease, transform 0.12s ease;
+  min-height: 44px;
 }
 .btn:hover { border-color: var(--cyan); color: #fff; }
 .btn-primary {
-  background: linear-gradient(135deg, #0EA5E9, #0284C7);
+  background: linear-gradient(135deg, #0EA5E9, #0369A1);
   border-color: #38BDF8; color: #fff; flex: 1 1 210px;
 }
 .btn-emerald {
-  background: linear-gradient(135deg, #10B981, #059669);
+  background: linear-gradient(135deg, #10B981, #047857);
   border-color: #34D399; color: #fff; flex: 1 1 210px;
 }
-.btn-sm { padding: 6px 10px; font-size: 12px; border-radius: 8px; font-family: var(--mono); }
+.btn-sm { padding: 8px 11px; font-size: 12px; border-radius: 9px; font-family: var(--mono); min-height: 38px; }
 .btn.disabled, .btn[disabled] { opacity: 0.42; pointer-events: none; }
+.btn-lock { opacity: 0.55; cursor: not-allowed; pointer-events: none; }
 
 .console-box {
   background: var(--console); border: 1px solid var(--border);
   border-radius: 12px; padding: 11px 12px; font-family: var(--mono);
-  font-size: 11.5px; max-height: 210px; overflow-y: auto;
+  font-size: 11.5px; max-height: 240px; overflow-y: auto;
 }
 .log-line { margin: 2px 0; word-break: break-word; }
 .log-ok { color: var(--emerald); }
@@ -1357,36 +1781,58 @@ select:focus, input[type="text"]:focus { border-color: var(--cyan); }
   border-radius: 12px; padding: 12px;
 }
 .relay-item:hover { border-color: rgba(56,189,248,0.45); }
+.relay-item.live { border-color: rgba(52,211,153,0.4); }
+.relay-item.dead { opacity: 0.72; }
 
 .code-copy {
   background: var(--console); border: 1px solid var(--border); border-radius: 9px;
-  padding: 8px 10px; font-family: var(--mono); font-size: 11.5px; color: var(--cyan);
-  overflow-x: auto; white-space: nowrap; margin-top: 6px;
+  padding: 10px 11px; font-family: var(--mono); font-size: 12px; color: var(--cyan);
+  overflow-x: auto; white-space: nowrap; margin-top: 8px;
 }
+
+details.adv {
+  margin-top: 10px; border-top: 1px solid var(--border); padding-top: 8px;
+}
+details.adv > summary {
+  cursor: pointer; color: var(--muted); font-family: var(--mono); font-size: 12px; font-weight: 700;
+  list-style: none; padding: 6px 0;
+}
+details.adv > summary::-webkit-details-marker { display: none; }
+
+.skeleton {
+  background: linear-gradient(90deg, #101827 0%, #1a2740 50%, #101827 100%);
+  background-size: 200% 100%; animation: shimmer 1.2s linear infinite;
+  border-radius: 10px; height: 14px; margin: 8px 0;
+}
+@keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
 
 .tab-panel { display: none; }
 .tab-panel.active { display: block; }
 
 .bottom-nav {
   position: fixed; left: 0; right: 0; bottom: 0; z-index: 50;
-  background: rgba(10, 15, 26, 0.94); backdrop-filter: blur(12px);
+  background: rgba(7, 11, 20, 0.94); backdrop-filter: blur(16px);
   border-top: 1px solid var(--border);
-  padding: 6px 10px calc(6px + env(safe-area-inset-bottom, 0px));
+  padding: 7px 10px calc(8px + env(safe-area-inset-bottom, 0px));
 }
 .bottom-nav-inner {
-  max-width: 960px; margin: 0 auto;
+  max-width: 880px; margin: 0 auto;
   display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px;
 }
 .nav-tab {
-  background: transparent; border: 1px solid transparent; border-radius: 10px;
-  color: var(--muted); padding: 7px 4px; cursor: pointer;
+  background: transparent; border: 1px solid transparent; border-radius: 12px;
+  color: var(--muted); padding: 8px 4px; cursor: pointer;
   display: flex; flex-direction: column; align-items: center; gap: 2px;
-  font-family: var(--mono); font-size: 11px; font-weight: 600;
+  font-family: var(--mono); font-size: 11px; font-weight: 700;
+  min-height: 48px;
 }
-.nav-tab .nav-ico { font-size: 15px; line-height: 1; }
+.nav-tab .nav-ico { font-size: 16px; line-height: 1; }
 .nav-tab.active {
   color: var(--cyan); background: var(--cyan-dim);
   border-color: rgba(56, 189, 248, 0.35);
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
 }
 `;
 
@@ -1394,6 +1840,7 @@ const PORTAL_JS = String.raw`
 (function () {
   "use strict";
 
+  var verifyGen = 0;
   var state = {
     tab: "connect",
     servers: [],
@@ -1410,7 +1857,12 @@ const PORTAL_JS = String.raw`
     relaySort: "recommended",
     relayLimit: 40,
     customMirror: "",
-    device: detectDevice()
+    device: detectDevice(),
+    verifying: false,
+    verifyLabel: "",
+    verified: null,
+    attempts: [],
+    step: "pool"
   };
 
   function detectDevice() {
@@ -1419,11 +1871,11 @@ const PORTAL_JS = String.raw`
     var isAndroid = /Android/i.test(ua);
     var isMac = !isIOS && /Macintosh|Mac OS X/i.test(ua);
     var isWin = /Windows/i.test(ua);
-    if (isIOS) return { id: "ios", label: "iOS / iPadOS (Safari Native .mobileconfig + OpenVPN)", apple: true, mobile: true };
-    if (isAndroid) return { id: "android", label: "Android (OpenVPN Connect / OpenVPN for Android)", apple: false, mobile: true };
-    if (isMac) return { id: "macos", label: "macOS (Native .mobileconfig + OpenVPN 2.6)", apple: true, mobile: false };
-    if (isWin) return { id: "windows", label: "Windows 11 (Patched .ovpn + Native CLI Suite)", apple: false, mobile: false };
-    return { id: "linux", label: "Linux Desktop (Patched .ovpn + Native CLI Suite)", apple: false, mobile: false };
+    if (isIOS) return { id: "ios", label: "iOS / iPadOS · Safari native profile", apple: true, mobile: true };
+    if (isAndroid) return { id: "android", label: "Android · OpenVPN Connect / for Android", apple: false, mobile: true };
+    if (isMac) return { id: "macos", label: "macOS · Native L2TP + OpenVPN 2.6", apple: true, mobile: false };
+    if (isWin) return { id: "windows", label: "Windows 11 · Patched .ovpn + native CLI", apple: false, mobile: false };
+    return { id: "linux", label: "Linux · Patched .ovpn + native CLI", apple: false, mobile: false };
   }
 
   function flagEmoji(cc) {
@@ -1451,6 +1903,15 @@ const PORTAL_JS = String.raw`
     return (Number(n) || 0).toLocaleString();
   }
 
+  function hostLabel(srv) {
+    var h = String((srv && srv.hostname) || "");
+    var ip = String((srv && srv.ip) || "");
+    if (!h || h === ip) return ip;
+    if (/\.opengw\.net$/i.test(h)) return h;
+    if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(h)) return h;
+    return h + ".opengw.net";
+  }
+
   function appendLog(level, msg) {
     var box = document.getElementById("console-log");
     if (!box) return;
@@ -1470,6 +1931,21 @@ const PORTAL_JS = String.raw`
     if (!pill || !txt) return;
     pill.className = "status-pill" + (mode ? " " + mode : "");
     txt.textContent = text;
+  }
+
+  function setStepper(step) {
+    state.step = step;
+    var nodes = document.querySelectorAll("[data-step]");
+    var order = ["pool", "probe", "handshake", "profile"];
+    var idx = order.indexOf(step);
+    for (var i = 0; i < nodes.length; i++) {
+      var id = nodes[i].getAttribute("data-step");
+      var n = order.indexOf(id);
+      nodes[i].classList.remove("on", "ok", "bad");
+      if (step === "fail" && n >= 1) nodes[i].classList.add("bad");
+      else if (n < idx) nodes[i].classList.add("ok");
+      else if (n === idx) nodes[i].classList.add("on");
+    }
   }
 
   function matchCountry(srv, query) {
@@ -1493,13 +1969,16 @@ const PORTAL_JS = String.raw`
   function matchProto(srv, proto) {
     if (!proto || proto === "auto" || proto === "all") return srv.l2tp || srv.openvpn;
     if (proto === "l2tp") return Boolean(srv.l2tp);
-    if (proto === "udp") return Boolean(srv.openvpn && (srv.udp_port > 0 || (srv.has_ovpn_cert && srv.tcp_port === 0)));
-    if (proto === "tcp") return Boolean(srv.openvpn && (srv.tcp_port > 0 || (srv.has_ovpn_cert && srv.udp_port === 0)));
+    if (proto === "udp") return Boolean(srv.openvpn && srv.udp_port > 0);
+    if (proto === "tcp") return Boolean(srv.openvpn && srv.tcp_port > 0);
     return true;
   }
 
   function sortList(list, sortKey, protoFilter) {
     return list.slice().sort(function (a, b) {
+      var liveA = a.verify_state === "live" ? 0 : a.verify_state === "dead" ? 2 : 1;
+      var liveB = b.verify_state === "live" ? 0 : b.verify_state === "dead" ? 2 : 1;
+      if (liveA !== liveB) return liveA - liveB;
       var tierA = a.l2tp ? 0 : (a.openvpn && a.udp_port > 0 ? 1 : 2);
       var tierB = b.l2tp ? 0 : (b.openvpn && b.udp_port > 0 ? 1 : 2);
       var tierDiff = (protoFilter === "auto" || protoFilter === "all") ? (tierA - tierB) : 0;
@@ -1539,12 +2018,14 @@ const PORTAL_JS = String.raw`
 
   function renderBadges(srv) {
     var out = "";
+    if (srv.verify_state === "live") out += '<span class="badge badge-live">LIVE HANDSHAKE</span>';
+    else if (srv.verify_state === "dead") out += '<span class="badge badge-err">DEAD</span>';
     if (srv.l2tp) out += '<span class="badge badge-l2tp">L2TP PSK=vpn</span>';
-    if (srv.openvpn && (srv.udp_port > 0 || (srv.has_ovpn_cert && srv.tcp_port === 0))) {
-      out += '<span class="badge badge-udp">OVPN UDP' + (srv.udp_port ? ":" + srv.udp_port : "") + "</span>";
+    if (srv.openvpn && srv.udp_port > 0) {
+      out += '<span class="badge badge-udp">OVPN UDP:' + srv.udp_port + "</span>";
     }
-    if (srv.openvpn && (srv.tcp_port > 0 || (srv.has_ovpn_cert && srv.udp_port === 0))) {
-      out += '<span class="badge badge-tcp">OVPN TCP' + (srv.tcp_port ? ":" + srv.tcp_port : "") + "</span>";
+    if (srv.openvpn && srv.tcp_port > 0) {
+      out += '<span class="badge badge-tcp">OVPN TCP:' + srv.tcp_port + "</span>";
     }
     return out;
   }
@@ -1554,7 +2035,7 @@ const PORTAL_JS = String.raw`
     var pills = document.getElementById("quick-country-pills");
     if (!sel || !pills) return;
 
-    var opts = '<option value="ALL">🌐 All Countries (' + state.counts.total + ' relays)</option>';
+    var opts = '<option value="ALL">🌐 All Countries (' + state.counts.total + " relays)</option>";
     for (var i = 0; i < state.countries.length; i++) {
       var c = state.countries[i];
       var selected = state.country === c.country_short ? " selected" : "";
@@ -1563,11 +2044,15 @@ const PORTAL_JS = String.raw`
         c.total_servers + " (" + c.l2tp_count + " L2TP)</option>";
     }
     sel.innerHTML = opts;
+    if (state.country && state.country !== "ALL") sel.value = state.country;
 
     var topCodes = ["ALL"];
-    for (var j = 0; j < Math.min(7, state.countries.length); j++) {
+    var hasCurrent = state.country === "ALL";
+    for (var j = 0; j < Math.min(6, state.countries.length); j++) {
       topCodes.push(state.countries[j].country_short);
+      if (state.countries[j].country_short === state.country) hasCurrent = true;
     }
+    if (!hasCurrent && state.country) topCodes.splice(1, 0, state.country);
     var pillHtml = "";
     for (var k = 0; k < topCodes.length; k++) {
       var code = topCodes[k];
@@ -1585,57 +2070,149 @@ const PORTAL_JS = String.raw`
     return sortList(filtered, "recommended", state.proto);
   }
 
+  function applyVerifiedToServers(verified, attempts) {
+    var dead = {};
+    var liveIp = verified && verified.ip;
+    if (Array.isArray(attempts)) {
+      for (var i = 0; i < attempts.length; i++) {
+        if (!attempts[i].ok) dead[attempts[i].ip] = true;
+      }
+    }
+    for (var j = 0; j < state.servers.length; j++) {
+      var s = state.servers[j];
+      if (liveIp && s.ip === liveIp) {
+        s.verify_state = "live";
+        s.verified_port = verified.port;
+        s.verified_rtt_ms = verified.rtt_ms;
+      } else if (dead[s.ip]) {
+        s.verify_state = "dead";
+      }
+    }
+  }
+
+  function unlockedFor(srv) {
+    if (!state.verified || !srv || state.verified.ip !== srv.ip) return [];
+    return state.verified.unlocked || [];
+  }
+
   function renderConnectHero() {
     var wrap = document.getElementById("hero-container");
     if (!wrap) return;
     var candidates = getConnectCandidates();
     if (candidates.length === 0) {
-      wrap.innerHTML = '<div class="card"><div class="card-title">No Matching Relays</div>' +
-        '<div class="card-subtitle">Try switching Country to ALL or Protocol to Auto Recommended, or refresh the pool.</div></div>';
+      wrap.innerHTML = '<div class="card"><div class="card-title">No matching relays</div>' +
+        '<div class="card-subtitle">Switch country to ALL, protocol to Auto, or refresh the pool.</div></div>';
       return;
     }
-    if (state.selectedIndex >= candidates.length) state.selectedIndex = 0;
-    var srv = candidates[state.selectedIndex];
-    var canUdp = srv.openvpn && (srv.udp_port > 0 || (srv.has_ovpn_cert && srv.tcp_port === 0));
-    var canTcp = srv.openvpn && (srv.tcp_port > 0 || (srv.has_ovpn_cert && srv.udp_port === 0));
-    var probePort = srv.tcp_port || 443;
 
-    var html = '<div class="hero-relay">' +
+    var srv = null;
+    if (state.verified) {
+      for (var i = 0; i < candidates.length; i++) {
+        if (candidates[i].ip === state.verified.ip) {
+          srv = candidates[i];
+          state.selectedIndex = i;
+          break;
+        }
+      }
+    }
+    if (!srv) {
+      if (state.selectedIndex >= candidates.length) state.selectedIndex = 0;
+      srv = candidates[state.selectedIndex];
+    }
+
+    var unlocked = unlockedFor(srv);
+    var canL2tp = unlocked.indexOf("l2tp") !== -1;
+    var canUdp = unlocked.indexOf("udp") !== -1;
+    var canTcp = unlocked.indexOf("tcp") !== -1;
+    var heroClass = "hero-relay";
+    if (state.verifying) heroClass += " testing";
+    else if (canL2tp || canUdp || canTcp) heroClass += " live";
+    else if (srv.verify_state === "dead") heroClass += " dead";
+
+    var handshakeMs = (state.verified && state.verified.ip === srv.ip && state.verified.rtt_ms)
+      ? (state.verified.rtt_ms + " ms")
+      : (srv.verified_rtt_ms ? srv.verified_rtt_ms + " ms" : "—");
+
+    var lockHtml;
+    if (state.verifying) {
+      lockHtml = '<div class="progress-track"><div class="progress-fill"></div></div>' +
+        '<div class="progress-label">' + esc(state.verifyLabel || "Recursively probing live paths…") + "</div>";
+    } else if (canL2tp || canUdp || canTcp) {
+      lockHtml = '<div class="lock-note ok">Live OpenVPN HARD_RESET completed on ' +
+        esc(srv.ip) + ":" + esc(state.verified.port) + " · profiles unlocked for this relay only.</div>";
+    } else {
+      lockHtml = '<div class="lock-note">Profiles stay locked until this edge proves a live tunnel handshake. Dead listings are never exported.</div>';
+    }
+
+    var profileBtns = "";
+    if (canL2tp) {
+      profileBtns += '<a class="btn btn-emerald" href="' + esc(buildMobileconfigHref(srv)) + '"> Install Apple L2TP (.mobileconfig)</a>';
+    } else if (srv.l2tp) {
+      profileBtns += '<span class="btn btn-lock">Locked · Apple L2TP</span>';
+    }
+    if (canUdp) {
+      profileBtns += '<a class="btn btn-primary" href="' + esc(buildOvpnHref(srv, "udp")) + '">Export OpenVPN UDP (.ovpn)</a>';
+    } else if (srv.openvpn && srv.udp_port > 0) {
+      profileBtns += '<span class="btn btn-lock">Locked · OpenVPN UDP</span>';
+    }
+    if (canTcp) {
+      profileBtns += '<a class="btn" href="' + esc(buildOvpnHref(srv, "tcp")) + '">Export OpenVPN TCP (.ovpn)</a>';
+    } else if (srv.openvpn && srv.tcp_port > 0) {
+      profileBtns += '<span class="btn btn-lock">Locked · OpenVPN TCP</span>';
+    }
+    if (!profileBtns) {
+      profileBtns = '<span class="btn btn-lock">No profile until a live handshake exists</span>';
+    }
+
+    var html = '<div class="' + heroClass + '">' +
       '<div class="relay-top">' +
-        '<div>' +
+        "<div>" +
           '<div class="relay-country">' + flagEmoji(srv.country_short) + " " + esc(srv.country_long) +
             ' <span style="color:var(--muted);font-size:12px;font-family:var(--mono)">[' + (state.selectedIndex + 1) + "/" + candidates.length + "]</span></div>" +
-          '<div class="relay-host">' + esc(srv.hostname) + ".opengw.net · " + esc(srv.ip) + "</div>" +
-        '</div>' +
+          '<div class="relay-host">' + esc(hostLabel(srv)) + " · " + esc(srv.ip) + "</div>" +
+        "</div>" +
         '<div class="badges">' + renderBadges(srv) + "</div>" +
-      '</div>' +
+      "</div>" +
       '<div class="stats-strip">' +
         '<div class="stat-box"><div class="stat-k">Throughput</div><div class="stat-v">' + fmtMbps(srv.speed_bps) + "</div></div>" +
-        '<div class="stat-box"><div class="stat-k">Ping RTT</div><div class="stat-v">' + (srv.ping_ms >= 9999 ? "—" : srv.ping_ms + " ms") + "</div></div>" +
-        '<div class="stat-box"><div class="stat-k">Quality Score</div><div class="stat-v">' + fmtScore(srv.score) + "</div></div>" +
+        '<div class="stat-box"><div class="stat-k">Listed ping</div><div class="stat-v">' + (srv.ping_ms >= 9999 ? "—" : srv.ping_ms + " ms") + "</div></div>" +
+        '<div class="stat-box"><div class="stat-k">Handshake</div><div class="stat-v">' + handshakeMs + "</div></div>" +
         '<div class="stat-box"><div class="stat-k">Sessions</div><div class="stat-v">' + srv.sessions + "</div></div>" +
-      '</div>' +
-      '<div class="btn-row">' +
-        (srv.l2tp
-          ? '<a class="btn btn-emerald" href="' + esc(buildMobileconfigHref(srv)) + '"> Install Apple L2TP (.mobileconfig)</a>'
-          : '<span class="btn disabled" title="Selected relay does not advertise L2TP/IPsec"> L2TP Unavailable on Relay</span>') +
-        (canUdp
-          ? '<a class="btn btn-primary" href="' + esc(buildOvpnHref(srv, "udp")) + '">⬇ Export OpenVPN UDP (.ovpn)</a>'
-          : "") +
-        (canTcp
-          ? '<a class="btn" href="' + esc(buildOvpnHref(srv, "tcp")) + '">⬇ Export OpenVPN TCP (.ovpn)</a>'
-          : "") +
-      '</div>' +
+      "</div>" +
+      lockHtml +
+      '<div class="btn-row">' + profileBtns + "</div>" +
       '<div class="btn-row" style="margin-top:8px">' +
-        '<button type="button" class="btn btn-sm" id="btn-next-relay">↻ Next Best Candidate (' + candidates.length + ')</button>' +
-        '<button type="button" class="btn btn-sm" data-probe-ip="' + esc(srv.ip) + '" data-probe-port="' + probePort + '">⚡ Edge TCP Probe (' + esc(srv.ip) + ':' + probePort + ')</button>' +
-      '</div>' +
-    '</div>';
+        '<button type="button" class="btn btn-sm" id="btn-verify-now">' + (state.verifying ? "Verifying…" : "Verify live path") + "</button>" +
+        '<button type="button" class="btn btn-sm" id="btn-next-live">Find next live relay</button>' +
+        '<button type="button" class="btn btn-sm" id="btn-skip-listed">Skip listed candidate</button>' +
+      "</div>" +
+    "</div>";
 
     wrap.innerHTML = html;
-    var nextBtn = document.getElementById("btn-next-relay");
-    if (nextBtn) {
-      nextBtn.addEventListener("click", function () {
+    var vBtn = document.getElementById("btn-verify-now");
+    if (vBtn) {
+      vBtn.disabled = state.verifying;
+      vBtn.addEventListener("click", function () {
+        runRecursiveVerify({ ip: srv.ip, force: true });
+      });
+    }
+    var nBtn = document.getElementById("btn-next-live");
+    if (nBtn) {
+      nBtn.disabled = state.verifying;
+      nBtn.addEventListener("click", function () {
+        var exclude = [];
+        if (state.verified && state.verified.ip) exclude.push(state.verified.ip);
+        for (var a = 0; a < state.attempts.length; a++) {
+          if (state.attempts[a].ip) exclude.push(state.attempts[a].ip);
+        }
+        state.verified = null;
+        runRecursiveVerify({ exclude: exclude });
+      });
+    }
+    var sBtn = document.getElementById("btn-skip-listed");
+    if (sBtn) {
+      sBtn.addEventListener("click", function () {
+        state.verified = null;
         state.selectedIndex = (state.selectedIndex + 1) % candidates.length;
         renderConnectHero();
       });
@@ -1651,7 +2228,9 @@ const PORTAL_JS = String.raw`
       return matchCountry(s, state.relaySearch) && matchProto(s, state.relayProto);
     });
     var sorted = sortList(filtered, state.relaySort, state.relayProto);
-    metaEl.textContent = "Showing " + Math.min(sorted.length, state.relayLimit) + " of " + sorted.length + " matching relays";
+    var liveN = sorted.filter(function (s) { return s.verify_state === "live"; }).length;
+    metaEl.textContent = "Showing " + Math.min(sorted.length, state.relayLimit) + " of " + sorted.length +
+      " matching relays · " + liveN + " handshake-verified";
 
     if (sorted.length === 0) {
       listEl.innerHTML = '<div class="card-subtitle">No relays matched your filter criteria.</div>';
@@ -1662,27 +2241,39 @@ const PORTAL_JS = String.raw`
     var out = "";
     for (var i = 0; i < slice.length; i++) {
       var s = slice[i];
-      var canUdp = s.openvpn && (s.udp_port > 0 || (s.has_ovpn_cert && s.tcp_port === 0));
-      var canTcp = s.openvpn && (s.tcp_port > 0 || (s.has_ovpn_cert && s.udp_port === 0));
-      var pPort = s.tcp_port || 443;
-      out += '<div class="relay-item">' +
+      var unlocked = unlockedFor(s);
+      var canL2tp = unlocked.indexOf("l2tp") !== -1;
+      var canUdp = unlocked.indexOf("udp") !== -1;
+      var canTcp = unlocked.indexOf("tcp") !== -1;
+      var itemCls = "relay-item";
+      if (s.verify_state === "live") itemCls += " live";
+      if (s.verify_state === "dead") itemCls += " dead";
+      out += '<div class="' + itemCls + '">' +
         '<div class="relay-top">' +
-          '<div>' +
-            '<div style="font-weight:700;color:#F8FAFC">' + flagEmoji(s.country_short) + " " + esc(s.country_long) + ' <span style="color:var(--muted);font-family:var(--mono);font-size:11.5px">(' + esc(s.country_short) + ')</span></div>' +
-            '<div class="relay-host">' + esc(s.hostname) + " · " + esc(s.ip) + " · " + fmtMbps(s.speed_bps) + " · " + (s.ping_ms >= 9999 ? "—" : s.ping_ms + " ms") + " · Score " + fmtScore(s.score) + "</div>" +
-          '</div>' +
+          "<div>" +
+            '<div style="font-weight:700;color:#F8FAFC">' + flagEmoji(s.country_short) + " " + esc(s.country_long) +
+              ' <span style="color:var(--muted);font-family:var(--mono);font-size:11.5px">(' + esc(s.country_short) + ")</span></div>" +
+            '<div class="relay-host">' + esc(hostLabel(s)) + " · " + esc(s.ip) + " · " + fmtMbps(s.speed_bps) + " · " +
+              (s.ping_ms >= 9999 ? "—" : s.ping_ms + " ms") + " · Score " + fmtScore(s.score) + "</div>" +
+          "</div>" +
           '<div class="badges">' + renderBadges(s) + "</div>" +
-        '</div>' +
+        "</div>" +
         '<div class="btn-row" style="margin-top:9px">' +
-          (s.l2tp ? '<a class="btn btn-sm" style="border-color:rgba(16,185,129,0.5);color:var(--emerald)" href="' + esc(buildMobileconfigHref(s)) + '"> .mobileconfig</a>' : "") +
-          (canUdp ? '<a class="btn btn-sm" style="border-color:rgba(56,189,248,0.5);color:var(--cyan)" href="' + esc(buildOvpnHref(s, "udp")) + '">⬇ OVPN UDP</a>' : "") +
-          (canTcp ? '<a class="btn btn-sm" href="' + esc(buildOvpnHref(s, "tcp")) + '">⬇ OVPN TCP</a>' : "") +
-          '<button type="button" class="btn btn-sm" data-probe-ip="' + esc(s.ip) + '" data-probe-port="' + pPort + '">⚡ Probe :' + pPort + '</button>' +
-        '</div>' +
-      '</div>';
+          (canL2tp
+            ? '<a class="btn btn-sm" style="border-color:rgba(52,211,153,0.5);color:var(--emerald)" href="' + esc(buildMobileconfigHref(s)) + '">.mobileconfig</a>'
+            : (s.l2tp ? '<span class="btn btn-sm btn-lock">L2TP locked</span>' : "")) +
+          (canUdp
+            ? '<a class="btn btn-sm" style="border-color:rgba(56,189,248,0.5);color:var(--cyan)" href="' + esc(buildOvpnHref(s, "udp")) + '">OVPN UDP</a>'
+            : (s.openvpn && s.udp_port > 0 ? '<span class="btn btn-sm btn-lock">UDP locked</span>' : "")) +
+          (canTcp
+            ? '<a class="btn btn-sm" href="' + esc(buildOvpnHref(s, "tcp")) + '">OVPN TCP</a>'
+            : (s.openvpn && s.tcp_port > 0 ? '<span class="btn btn-sm btn-lock">TCP locked</span>' : "")) +
+          '<button type="button" class="btn btn-sm" data-verify-ip="' + esc(s.ip) + '">Verify</button>' +
+        "</div>" +
+      "</div>";
     }
     if (sorted.length > state.relayLimit) {
-      out += '<button type="button" class="btn" id="btn-more-relays">Show More Relays (' + (sorted.length - state.relayLimit) + ' remaining)</button>';
+      out += '<button type="button" class="btn" id="btn-more-relays">Show more relays (' + (sorted.length - state.relayLimit) + " remaining)</button>";
     }
     listEl.innerHTML = out;
     var moreBtn = document.getElementById("btn-more-relays");
@@ -1708,7 +2299,7 @@ const PORTAL_JS = String.raw`
       var m = state.mirrors[i];
       var statusBadge = "";
       if (m.reachable === true) {
-        statusBadge = '<span class="badge badge-l2tp">ONLINE · ' + (m.rtt_ms || 1) + " ms · " + (m.servers_count || 0) + " relays</span>";
+        statusBadge = '<span class="badge badge-live">ONLINE · ' + (m.rtt_ms || 1) + " ms · " + (m.servers_count || 0) + " relays</span>";
       } else if (m.reachable === false) {
         statusBadge = '<span class="badge badge-err">OFFLINE</span>';
       } else {
@@ -1716,24 +2307,25 @@ const PORTAL_JS = String.raw`
       }
       out += '<div class="relay-item">' +
         '<div class="relay-top">' +
-          '<div>' +
+          "<div>" +
             '<div style="font-weight:700;color:#F8FAFC">🪞 ' + esc(m.location || "Official Mirror") + "</div>" +
             '<div class="relay-host">' + esc(m.portal_url) + "</div>" +
-          '</div>' +
+          "</div>" +
           '<div class="badges">' + statusBadge + "</div>" +
-        '</div>' +
+        "</div>" +
         '<div class="btn-row" style="margin-top:8px">' +
-          '<button type="button" class="btn btn-sm" data-use-mirror="' + esc(m.portal_url) + '">Sync Relay Pool via This Mirror</button>' +
-          '<a class="btn btn-sm" href="' + esc(m.portal_url) + '" target="_blank" rel="noopener noreferrer">Open Portal ↗</a>' +
-        '</div>' +
-      '</div>';
+          '<button type="button" class="btn btn-sm" data-use-mirror="' + esc(m.portal_url) + '">Sync pool via this mirror</button>' +
+          '<a class="btn btn-sm" href="' + esc(m.portal_url) + '" target="_blank" rel="noopener noreferrer">Open portal</a>' +
+        "</div>" +
+      "</div>";
     }
     listEl.innerHTML = out;
   }
 
   async function loadPool(forceRefresh, customMirror) {
-    setStatusPill("syncing", "SYNCING...");
-    appendLog("info", forceRefresh ? "Refreshing live VPN Gate relay pool from Cloudflare edge ..." : "Loading VPN Gate relay pool ...");
+    setStatusPill("syncing", "SYNCING");
+    setStepper("pool");
+    appendLog("info", forceRefresh ? "Refreshing live VPN Gate relay pool from Cloudflare edge…" : "Loading VPN Gate relay pool…");
     try {
       var qs = new URLSearchParams();
       if (forceRefresh) qs.set("refresh", "1");
@@ -1747,27 +2339,88 @@ const PORTAL_JS = String.raw`
       state.mirrors = data.mirrors || [];
       state.counts = data.counts || state.counts;
       state.selectedIndex = 0;
+      state.verified = null;
+      state.attempts = [];
 
       if (Array.isArray(data.logs)) {
         for (var i = 0; i < data.logs.length; i++) {
           appendLog(data.logs[i].level || "info", data.logs[i].msg);
         }
       }
-      setStatusPill("", "ONLINE · " + state.counts.total + " Relays");
+      setStatusPill("", "POOL · " + state.counts.total + " listed");
       renderCountryControls();
       renderConnectHero();
       renderRelaysTab();
       renderMirrorsTab();
+      await runRecursiveVerify({});
     } catch (err) {
       setStatusPill("error", "DISCOVERY ISSUE");
+      setStepper("fail");
       appendLog("err", "Failed to load relay pool: " + (err && err.message ? err.message : String(err)));
+    }
+  }
+
+  async function runRecursiveVerify(opts) {
+    opts = opts || {};
+    var gen = ++verifyGen;
+    state.verifying = true;
+    state.verifyLabel = opts.ip
+      ? ("Handshake on " + opts.ip + "…")
+      : "Recursively testing candidates until one handshake succeeds…";
+    setStepper("probe");
+    setStatusPill("syncing", "VERIFYING");
+    renderConnectHero();
+    appendLog("info", state.verifyLabel);
+    try {
+      var qs = new URLSearchParams();
+      qs.set("proto", state.proto);
+      qs.set("country", state.country);
+      if (opts.ip) qs.set("ip", opts.ip);
+      if (opts.force) qs.set("force", "1");
+      if (opts.exclude && opts.exclude.length) qs.set("exclude", opts.exclude.join(","));
+      var resp = await fetch("/api/verify?" + qs.toString());
+      var data = await resp.json();
+      if (gen !== verifyGen) return;
+      state.attempts = (data && data.attempts) || [];
+      if (Array.isArray(state.attempts)) {
+        for (var i = 0; i < state.attempts.length; i++) {
+          var a = state.attempts[i];
+          if (a.ok) appendLog("ok", "LIVE " + a.ip + ":" + a.port + " handshake " + a.rtt_ms + " ms (" + (a.engine || "openvpn-tcp-v2") + ")");
+          else appendLog("warn", "Fail " + a.ip + ":" + (a.port || "?") + (a.error ? " · " + a.error : ""));
+        }
+      }
+      applyVerifiedToServers(data && data.verified, state.attempts);
+      if (data && data.verified && data.verified.ip) {
+        state.verified = data.verified;
+        setStepper("handshake");
+        setStepper("profile");
+        setStatusPill("", "LIVE · " + data.verified.ip);
+        appendLog("ok", "Profiles unlocked for " + data.verified.ip + " after recursive testing (" + (data.scanned || 0) + " probed).");
+        if (data.widened) appendLog("warn", "No live path in the selected country — widened to all countries.");
+      } else {
+        state.verified = null;
+        setStepper("fail");
+        setStatusPill("error", "NO LIVE PATH");
+        appendLog("err", (data && data.error) || "No candidate completed a live OpenVPN handshake. Profiles remain withheld.");
+      }
+    } catch (e) {
+      if (gen !== verifyGen) return;
+      state.verified = null;
+      setStepper("fail");
+      setStatusPill("error", "VERIFY ERROR");
+      appendLog("err", "Recursive verify failed: " + (e && e.message ? e.message : String(e)));
+    } finally {
+      if (gen !== verifyGen) return;
+      state.verifying = false;
+      renderConnectHero();
+      renderRelaysTab();
     }
   }
 
   async function runProbeMirrors() {
     var btn = document.getElementById("btn-probe-mirrors");
     if (btn) btn.disabled = true;
-    appendLog("info", "Probing Official VPNGate Mirror Sites from Cloudflare edge ...");
+    appendLog("info", "Probing Official VPNGate Mirror Sites from Cloudflare edge…");
     try {
       var resp = await fetch("/api/mirrors?probe=1");
       var data = await resp.json();
@@ -1787,8 +2440,8 @@ const PORTAL_JS = String.raw`
     var box = document.getElementById("doctor-results");
     var btn = document.getElementById("btn-run-doctor");
     if (btn) btn.disabled = true;
-    if (box) box.innerHTML = '<div class="card-subtitle">Running edge, DoH, TCP socket & profile self-tests ...</div>';
-    appendLog("info", "Running edge & profile readiness diagnostics (/api/doctor) ...");
+    if (box) box.innerHTML = '<div class="card-subtitle">Running edge, DoH, handshake & profile self-tests…</div>';
+    appendLog("info", "Running edge & handshake diagnostics (/api/doctor)…");
     try {
       var resp = await fetch("/api/doctor");
       var data = await resp.json();
@@ -1796,14 +2449,14 @@ const PORTAL_JS = String.raw`
       var html = "";
       for (var i = 0; i < checks.length; i++) {
         var c = checks[i];
-        var bCls = c.status === "READY" ? "badge-l2tp" : (c.status === "WARN" ? "badge-tcp" : "badge-err");
+        var bCls = c.status === "READY" ? "badge-live" : (c.status === "WARN" ? "badge-tcp" : "badge-err");
         html += '<div class="relay-item">' +
           '<div class="relay-top">' +
             '<div style="font-weight:700;color:#F8FAFC">' + esc(c.name) + "</div>" +
             '<span class="badge ' + bCls + '">' + esc(c.status) + "</span>" +
-          '</div>' +
+          "</div>" +
           '<div class="card-subtitle" style="margin-top:4px;font-family:var(--mono)">' + esc(c.detail) + "</div>" +
-        '</div>';
+        "</div>";
       }
       if (box) box.innerHTML = html;
       appendLog("ok", "Doctor diagnostics completed (" + checks.length + " checks evaluated).");
@@ -1825,9 +2478,18 @@ const PORTAL_JS = String.raw`
     for (var j = 0; j < navs.length; j++) {
       navs[j].classList.toggle("active", navs[j].getAttribute("data-tab") === tabId);
     }
-    if (tabId === "doctor" && !document.getElementById("doctor-results").hasChildNodes()) {
-      runDoctor();
+    if (tabId === "doctor") {
+      var box = document.getElementById("doctor-results");
+      if (box && !box.hasChildNodes()) runDoctor();
     }
+  }
+
+  function onFilterChange() {
+    state.selectedIndex = 0;
+    state.verified = null;
+    renderCountryControls();
+    renderConnectHero();
+    runRecursiveVerify({});
   }
 
   document.addEventListener("DOMContentLoaded", function () {
@@ -1849,24 +2511,19 @@ const PORTAL_JS = String.raw`
 
     document.getElementById("connect-country").addEventListener("change", function (e) {
       state.country = e.target.value;
-      state.selectedIndex = 0;
-      renderCountryControls();
-      renderConnectHero();
+      onFilterChange();
     });
 
     document.getElementById("quick-country-pills").addEventListener("click", function (e) {
       var btn = e.target.closest("[data-cc]");
       if (!btn) return;
       state.country = btn.getAttribute("data-cc");
-      state.selectedIndex = 0;
-      renderCountryControls();
-      renderConnectHero();
+      onFilterChange();
     });
 
     document.getElementById("connect-proto").addEventListener("change", function (e) {
       state.proto = e.target.value;
-      state.selectedIndex = 0;
-      renderConnectHero();
+      onFilterChange();
     });
 
     document.getElementById("connect-compat").addEventListener("change", function (e) {
@@ -1921,37 +2578,14 @@ const PORTAL_JS = String.raw`
       appendLog("info", "Console log cleared.");
     });
 
-    document.body.addEventListener("click", async function (e) {
-      var probeBtn = e.target.closest("[data-probe-ip]");
-      if (probeBtn) {
-        var ip = probeBtn.getAttribute("data-probe-ip");
-        var port = probeBtn.getAttribute("data-probe-port");
-        var origText = probeBtn.textContent;
-        probeBtn.disabled = true;
-        probeBtn.textContent = "Probing...";
-        appendLog("info", "Opening edge TCP socket to " + ip + ":" + port + " ...");
-        try {
-          var r = await fetch("/api/probe?ip=" + encodeURIComponent(ip) + "&port=" + encodeURIComponent(port));
-          var d = await r.json();
-          if (d && d.reachable) {
-            probeBtn.textContent = "✓ " + d.rtt_ms + " ms";
-            appendLog("ok", "TCP handshake succeeded on " + ip + ":" + port + " (" + d.rtt_ms + " ms via " + d.engine + ").");
-          } else {
-            probeBtn.textContent = "✗ Offline";
-            appendLog("warn", "TCP probe did not connect to " + ip + ":" + port + (d && d.error ? " (" + d.error + ")" : ""));
-          }
-        } catch (err) {
-          probeBtn.textContent = "✗ Error";
-          appendLog("err", "Probe request failed: " + (err && err.message ? err.message : String(err)));
-        } finally {
-          setTimeout(function () {
-            probeBtn.disabled = false;
-            probeBtn.textContent = origText;
-          }, 3000);
-        }
+    document.body.addEventListener("click", function (e) {
+      var vBtn = e.target.closest("[data-verify-ip]");
+      if (vBtn) {
+        var vip = vBtn.getAttribute("data-verify-ip");
+        switchTab("connect");
+        runRecursiveVerify({ ip: vip, force: true });
         return;
       }
-
       var mirBtn = e.target.closest("[data-use-mirror]");
       if (mirBtn) {
         var mUrl = mirBtn.getAttribute("data-use-mirror");
@@ -1963,6 +2597,7 @@ const PORTAL_JS = String.raw`
     });
 
     appendLog("info", "Initialized VPN Gate Web Profile Console · Device: " + state.device.label);
+    appendLog("info", "Profiles stay locked until a live OpenVPN TCP handshake is proven.");
     loadPool(false, "");
   });
 })();
@@ -1974,10 +2609,11 @@ function renderPortalHtml() {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#0A0F1A">
+  <meta name="theme-color" content="#070B14">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <title>VPN Gate Connect — Profile &amp; Relay Console</title>
+  <meta name="color-scheme" content="dark">
+  <title>VPN Gate Connect — Live Profile Console</title>
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="icon" type="image/svg+xml" href="/icon.svg">
   <style>${PORTAL_CSS}</style>
@@ -1997,138 +2633,153 @@ function renderPortalHtml() {
           <span class="dot"></span>
           <span id="status-text">BOOTING</span>
         </div>
-        <button type="button" class="btn btn-sm" id="btn-refresh" title="Refresh live server pool">↻ Sync</button>
+        <button type="button" class="btn btn-sm" id="btn-refresh" title="Refresh live server pool">Sync</button>
       </div>
     </header>
 
-    <!-- TAB 1: CONNECT -->
     <section class="tab-panel active" id="tab-connect">
+      <div class="stepper" aria-label="Connection pipeline">
+        <div class="step on" data-step="pool"><b>1. Pool</b>Discover</div>
+        <div class="step" data-step="probe"><b>2. Probe</b>TCP path</div>
+        <div class="step" data-step="handshake"><b>3. Handshake</b>OpenVPN</div>
+        <div class="step" data-step="profile"><b>4. Profile</b>Unlock</div>
+      </div>
+
       <div class="card">
         <div class="card-header">
           <div>
-            <div class="card-title">Provisioning &amp; Filter Profile</div>
-            <div class="card-subtitle">One-tap Apple L2TP/IPsec (<code>.mobileconfig</code>) &amp; zero-prompt patched OpenVPN (<code>.ovpn</code>)</div>
+            <div class="card-title">Target &amp; protocol</div>
+            <div class="card-subtitle">Profiles are issued only after a live OpenVPN handshake succeeds on the chosen relay.</div>
           </div>
         </div>
         <div class="grid-2">
           <div>
-            <label class="field-label" for="connect-country">Target Country</label>
+            <label class="field-label" for="connect-country">Target country</label>
             <select id="connect-country"><option value="ALL">Loading countries...</option></select>
           </div>
           <div>
-            <label class="field-label" for="connect-proto">Protocol Priority</label>
+            <label class="field-label" for="connect-proto">Protocol priority</label>
             <select id="connect-proto">
-              <option value="auto">Auto (L2TP/IPsec → OVPN UDP → OVPN TCP)</option>
-              <option value="l2tp">Apple Native L2TP/IPsec (.mobileconfig)</option>
-              <option value="udp">OpenVPN UDP (.ovpn)</option>
-              <option value="tcp">OpenVPN TCP (.ovpn)</option>
-            </select>
-          </div>
-          <div>
-            <label class="field-label" for="connect-compat">OpenVPN Cipher Profile</label>
-            <select id="connect-compat">
-              <option value="mobile3">MobileCore3 (iOS / Android OpenVPN Connect &amp; Partout)</option>
-              <option value="ovpn26">OpenVPN 2.6 Desktop (data-ciphers + disable-dco)</option>
-              <option value="ovpn25">OpenVPN 2.5 (data-ciphers)</option>
-              <option value="ovpn24">OpenVPN 2.4 Legacy (ncp-ciphers)</option>
-            </select>
-          </div>
-          <div>
-            <label class="field-label" for="connect-dns">Tunnel DNS Enforcement</label>
-            <select id="connect-dns">
-              <option value="1.1.1.1,1.0.0.1">Cloudflare DNS (1.1.1.1, 1.0.0.1)</option>
-              <option value="9.9.9.9,149.112.112.112">Quad9 Malware-Blocking (9.9.9.9)</option>
-              <option value="94.140.14.14,94.140.15.15">AdGuard DNS (94.140.14.14)</option>
+              <option value="auto">Auto (L2TP → OVPN UDP → OVPN TCP)</option>
+              <option value="l2tp">Apple native L2TP/IPsec</option>
+              <option value="udp">OpenVPN UDP</option>
+              <option value="tcp">OpenVPN TCP</option>
             </select>
           </div>
         </div>
         <div class="pill-row" id="quick-country-pills"></div>
+        <details class="adv">
+          <summary>Advanced · cipher profile &amp; tunnel DNS</summary>
+          <div class="grid-2" style="margin-top:10px">
+            <div>
+              <label class="field-label" for="connect-compat">OpenVPN cipher profile</label>
+              <select id="connect-compat">
+                <option value="mobile3">MobileCore3 (iOS / Android OpenVPN Connect)</option>
+                <option value="ovpn26">OpenVPN 2.6 desktop</option>
+                <option value="ovpn25">OpenVPN 2.5</option>
+                <option value="ovpn24">OpenVPN 2.4 legacy</option>
+              </select>
+            </div>
+            <div>
+              <label class="field-label" for="connect-dns">Tunnel DNS</label>
+              <select id="connect-dns">
+                <option value="1.1.1.1,1.0.0.1">Cloudflare DNS (1.1.1.1, 1.0.0.1)</option>
+                <option value="9.9.9.9,149.112.112.112">Quad9 (9.9.9.9)</option>
+                <option value="94.140.14.14,94.140.15.15">AdGuard DNS (94.140.14.14)</option>
+              </select>
+            </div>
+          </div>
+        </details>
       </div>
 
-      <div id="hero-container"></div>
+      <div id="hero-container">
+        <div class="hero-relay testing">
+          <div class="skeleton" style="width:55%;height:18px"></div>
+          <div class="skeleton" style="width:72%;height:12px"></div>
+          <div class="progress-track"><div class="progress-fill"></div></div>
+          <div class="progress-label">Discovering volunteer relays…</div>
+        </div>
+      </div>
 
       <div class="card">
         <div class="card-header">
-          <div class="card-title">Quick Device Setup</div>
+          <div class="card-title">Device setup</div>
         </div>
         <div class="card-subtitle">
-          <strong>iPhone / iPad (Zero App Store Install):</strong> Open this portal in <strong>Safari</strong>, tap <strong>Install Apple L2TP (.mobileconfig)</strong> → tap <em>Allow</em> → open <strong>Settings → Profile Downloaded → Install</strong>, then toggle VPN on.<br>
-          <strong>Android / iOS OpenVPN:</strong> Install <em>OpenVPN Connect</em> (or <em>OpenVPN for Android</em>), tap <strong>Export OpenVPN UDP (.ovpn)</strong>, and import with zero username/password prompts.<br>
-          <strong>Linux, Windows 11 &amp; macOS Native Desktop Client:</strong>
+          <strong>iPhone / iPad:</strong> Safari only. Wait until the relay shows <em>LIVE HANDSHAKE</em>, tap <strong>Install Apple L2TP</strong> → Allow → Settings → Profile Downloaded → Install.<br>
+          <strong>Android / OpenVPN:</strong> After handshake, export <code>.ovpn</code> into OpenVPN Connect / OpenVPN for Android (no username prompt).<br>
+          <strong>Linux, Windows 11 &amp; macOS desktop client:</strong>
         </div>
         <div class="code-copy">curl -fsSL https://raw.githubusercontent.com/warmaster726/vpngate-connect/main/install-vpngate.sh | sh</div>
       </div>
 
       <div class="card">
         <div class="card-header">
-          <div class="card-title">Live Edge Telemetry Console</div>
+          <div class="card-title">Live edge console</div>
           <button type="button" class="btn btn-sm" id="btn-clear-log">Clear</button>
         </div>
         <div class="console-box" id="console-log"></div>
       </div>
     </section>
 
-    <!-- TAB 2: RELAYS -->
     <section class="tab-panel" id="tab-relays">
       <div class="card">
         <div class="card-header">
           <div>
-            <div class="card-title">Live Volunteer Relay Matrix</div>
+            <div class="card-title">Live volunteer relay matrix</div>
             <div class="card-subtitle" id="relays-meta">Loading relays...</div>
           </div>
         </div>
-        <input type="text" id="relay-search" placeholder="Filter by 2-letter ISO (JP, KR, US, GB) or country / hostname / IP ...">
+        <input type="text" id="relay-search" placeholder="Filter by ISO (JP, KR, US) or country / hostname / IP" autocomplete="off" spellcheck="false">
         <div class="pill-row" id="relay-proto-pills">
-          <button type="button" class="chip active" data-rproto="all">All Protocols</button>
+          <button type="button" class="chip active" data-rproto="all">All protocols</button>
           <button type="button" class="chip" data-rproto="l2tp">L2TP/IPsec</button>
           <button type="button" class="chip" data-rproto="udp">OVPN UDP</button>
           <button type="button" class="chip" data-rproto="tcp">OVPN TCP</button>
         </div>
         <div class="pill-row" id="relay-sort-pills">
-          <button type="button" class="chip active" data-rsort="recommended">Sort: Recommended</button>
-          <button type="button" class="chip" data-rsort="speed">Sort: Speed</button>
-          <button type="button" class="chip" data-rsort="ping">Sort: Lowest Ping</button>
-          <button type="button" class="chip" data-rsort="score">Sort: Score</button>
+          <button type="button" class="chip active" data-rsort="recommended">Recommended</button>
+          <button type="button" class="chip" data-rsort="speed">Speed</button>
+          <button type="button" class="chip" data-rsort="ping">Lowest ping</button>
+          <button type="button" class="chip" data-rsort="score">Score</button>
         </div>
       </div>
       <div class="relay-list" id="relays-list"></div>
     </section>
 
-    <!-- TAB 3: MIRRORS -->
     <section class="tab-panel" id="tab-mirrors">
       <div class="card">
         <div class="card-header">
           <div>
-            <div class="card-title">Official VPNGate Mirror Portals</div>
+            <div class="card-title">Official VPNGate mirror portals</div>
             <div class="card-subtitle" id="mirrors-count">Discovering mirrors...</div>
           </div>
-          <button type="button" class="btn btn-sm" id="btn-probe-mirrors">⚡ Probe Official Mirrors</button>
+          <button type="button" class="btn btn-sm" id="btn-probe-mirrors">Probe official mirrors</button>
         </div>
-        <label class="field-label" for="custom-mirror-input">Custom Daily Mirror Portal (Optional)</label>
+        <label class="field-label" for="custom-mirror-input">Custom daily mirror portal</label>
         <div style="display:flex;gap:8px">
-          <input type="text" id="custom-mirror-input" placeholder="http://host:port/en/">
+          <input type="text" id="custom-mirror-input" placeholder="http://host:port/en/" autocomplete="off" spellcheck="false">
           <button type="button" class="btn btn-sm" id="btn-apply-mirror">Apply</button>
         </div>
       </div>
       <div class="relay-list" id="mirrors-list"></div>
     </section>
 
-    <!-- TAB 4: DOCTOR -->
     <section class="tab-panel" id="tab-doctor">
       <div class="card">
         <div class="card-header">
           <div>
-            <div class="card-title">System, DoH &amp; Edge Readiness Diagnostics</div>
-            <div class="card-subtitle">Verifies client egress, Cloudflare DoH, upstream feeds, outbound TCP sockets &amp; profile generators</div>
+            <div class="card-title">System, DoH &amp; handshake diagnostics</div>
+            <div class="card-subtitle">Verifies egress, Cloudflare DoH, relay pool, live OpenVPN HARD_RESET, and gated profile builders</div>
           </div>
-          <button type="button" class="btn btn-sm" id="btn-run-doctor">↻ Re-run Checks</button>
+          <button type="button" class="btn btn-sm" id="btn-run-doctor">Re-run checks</button>
         </div>
         <div class="relay-list" id="doctor-results"></div>
       </div>
     </section>
   </div>
 
-  <nav class="bottom-nav" aria-label="Primary Console Navigation">
+  <nav class="bottom-nav" aria-label="Primary console navigation">
     <div class="bottom-nav-inner">
       <button type="button" class="nav-tab active" data-tab="connect"><span class="nav-ico">⚡</span><span>1. Connect</span></button>
       <button type="button" class="nav-tab" data-tab="relays"><span class="nav-ico">🛰️</span><span>2. Relays</span></button>
@@ -2141,10 +2792,6 @@ function renderPortalHtml() {
 </body>
 </html>`;
 }
-
-// =============================================================================
-// 6. Request Router & HTTP Security / Profile MIME Headers
-// =============================================================================
 
 function jsonResponse(payload, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(payload), {
@@ -2209,6 +2856,40 @@ async function handleMirrorsEndpoint(url, ctx) {
   });
 }
 
+async function handleVerifyEndpoint(url, ctx) {
+  const snap = await getPoolSnapshot(ctx, { forceRefresh: false });
+  const servers = decorateServersWithVerification(snap.public_payload.servers || []);
+  const ip = validPublicIpv4(url.searchParams.get("ip") || "");
+  const proto = (url.searchParams.get("proto") || "auto").toLowerCase();
+  const country = url.searchParams.get("country") || "ALL";
+  const force = url.searchParams.get("force") === "1";
+  const exclude = (url.searchParams.get("exclude") || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => Boolean(validPublicIpv4(s)));
+
+  const result = await recursiveVerifyRelays({
+    servers,
+    country,
+    proto,
+    exclude,
+    ip: ip || "",
+    force,
+  });
+  if (!result.verified) {
+    return jsonResponse({
+      ok: true,
+      verified: null,
+      attempts: result.attempts,
+      scanned: result.scanned,
+      widened: result.widened,
+      remaining: result.remaining,
+      error: "No candidate completed a live OpenVPN TCP handshake.",
+    });
+  }
+  return jsonResponse({ ok: true, ...result });
+}
+
 async function handleDoctorEndpoint(request, ctx) {
   const cf = request.cf || {};
   const visitorIp = request.headers.get("CF-Connecting-IP") || "client";
@@ -2220,7 +2901,6 @@ async function handleDoctorEndpoint(request, ctx) {
     detail: `Client ${visitorIp} · Edge PoP ${cf.colo || "LOCAL"} (${cf.country || "XX"}) · ${cf.httpProtocol || "HTTP/2"} ${cf.tlsVersion || "TLSv1.3"}`,
   });
 
-  // 1. Cloudflare DoH check
   const dohStart = Date.now();
   try {
     const dohRes = await fetchTextTimeout(
@@ -2248,29 +2928,32 @@ async function handleDoctorEndpoint(request, ctx) {
     checks.push({ name: "Cloudflare DoH (1.1.1.1) Unpoisoned DNS", status: "WARN", detail: String(e) });
   }
 
-  // 2. Relay pool & failover status
   const snap = await getPoolSnapshot(ctx, { forceRefresh: false });
   const counts = snap.public_payload.counts;
   checks.push({
     name: "Multi-Source Relay & Mirror Pool",
     status: counts.total > 0 ? "READY" : "ISSUE",
-    detail: `${counts.total} active relays (${counts.l2tp} L2TP/IPsec, ${counts.openvpn} OpenVPN) · ${counts.mirrors} Official Mirrors`,
+    detail: `${counts.total} listed relays (${counts.l2tp} L2TP/IPsec, ${counts.openvpn} OpenVPN) · ${counts.mirrors} Official Mirrors`,
   });
 
-  // 3. Outbound TCP Socket probe on top TCP-capable relay
   const tcpCandidate = snap.public_payload.servers.find((s) => s.tcp_port > 0);
   if (tcpCandidate) {
-    const pRes = await probeTcpEdge(tcpCandidate.ip, tcpCandidate.tcp_port, 2000);
+    const pRes = await probeOpenVpnHandshake(tcpCandidate.ip, tcpCandidate.tcp_port, 2400);
     checks.push({
-      name: "Cloudflare Outbound TCP Socket Prober",
-      status: pRes.reachable ? "READY" : "WARN",
-      detail: pRes.reachable
-        ? `Connected to ${tcpCandidate.ip}:${tcpCandidate.tcp_port} in ${pRes.rtt_ms} ms (${pRes.engine})`
-        : `${pRes.engine}: ${pRes.error || "relay port closed"}`,
+      name: "Live OpenVPN TCP Handshake",
+      status: pRes.handshake ? "READY" : "WARN",
+      detail: pRes.handshake
+        ? `HARD_RESET_SERVER_V2 from ${tcpCandidate.ip}:${tcpCandidate.tcp_port} in ${pRes.rtt_ms} ms`
+        : `${pRes.engine}: ${pRes.error || "relay did not complete OpenVPN handshake"}`,
+    });
+  } else {
+    checks.push({
+      name: "Live OpenVPN TCP Handshake",
+      status: "WARN",
+      detail: "No TCP-advertised relay currently in the pool",
     });
   }
 
-  // 4. Apple .mobileconfig + Patched .ovpn Self-Test
   const dummySrv = {
     ip: "219.100.37.10",
     country_long: "Japan",
@@ -2294,8 +2977,14 @@ async function handleDoctorEndpoint(request, ctx) {
     name: "Profile Engine (.mobileconfig & .ovpn Patcher)",
     status: profileOk ? "READY" : "ISSUE",
     detail: profileOk
-      ? "Verified Apple L2TP plist (application/x-apple-aspen-config, PSK='vpn') + zero-prompt MobileCore3/OpenVPN26 patcher"
+      ? "Generators healthy — delivery remains gated on a live OpenVPN HARD_RESET for the target relay"
       : "Profile self-test mismatch",
+  });
+
+  checks.push({
+    name: "Profile Gate (handshake required)",
+    status: "READY",
+    detail: "GET /profiles/*.mobileconfig and GET /profiles/*.ovpn refuse issuance unless the relay answers OpenVPN TCP HARD_RESET_SERVER_V2",
   });
 
   return jsonResponse({ ok: true, checks });
@@ -2310,7 +2999,6 @@ export default {
       return jsonResponse({ ok: false, error: "Method Not Allowed" }, 405);
     }
 
-    // 1. PWA Manifest & Inline SVG Icon
     if (path === "/manifest.webmanifest") {
       return jsonResponse(
         {
@@ -2318,8 +3006,8 @@ export default {
           short_name: "VPNGate",
           start_url: "/",
           display: "standalone",
-          background_color: "#0A0F1A",
-          theme_color: "#0A0F1A",
+          background_color: "#070B14",
+          theme_color: "#070B14",
           icons: [{ src: "/icon.svg", sizes: "any", type: "image/svg+xml" }],
         },
         200,
@@ -2329,10 +3017,10 @@ export default {
 
     if (path === "/icon.svg") {
       const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
-        <rect width="128" height="128" rx="28" fill="#0A0F1A"/>
-        <rect x="8" y="8" width="112" height="112" rx="22" fill="#131C2E" stroke="#38BDF8" stroke-width="4"/>
-        <path d="M64 24L96 38V62C96 84 82 100 64 106C46 100 32 84 32 62V38L64 24Z" fill="rgba(56,189,248,0.16)" stroke="#10B981" stroke-width="5"/>
-        <text x="64" y="73" text-anchor="middle" font-family="monospace" font-weight="bold" font-size="30" fill="#E2E8F0">VG</text>
+        <rect width="128" height="128" rx="28" fill="#070B14"/>
+        <rect x="8" y="8" width="112" height="112" rx="22" fill="#101827" stroke="#38BDF8" stroke-width="4"/>
+        <path d="M64 24L96 38V62C96 84 82 100 64 106C46 100 32 84 32 62V38L64 24Z" fill="rgba(56,189,248,0.16)" stroke="#34D399" stroke-width="5"/>
+        <text x="64" y="73" text-anchor="middle" font-family="monospace" font-weight="bold" font-size="30" fill="#E8EEF7">VG</text>
       </svg>`;
       return new Response(svg, {
         headers: {
@@ -2342,22 +3030,25 @@ export default {
       });
     }
 
-    // 2. Apple Native L2TP/IPsec `.mobileconfig` Route
-    //    NOTE: Deliberately omits `Content-Disposition: attachment` and uses a `.mobileconfig`
-    //    URL suffix + `Content-Type: application/x-apple-aspen-config` so iOS Safari launches
-    //    native Settings -> Profile Downloaded -> Install directly instead of saving to Files!
     if ((path.startsWith("/profiles/") && path.endsWith(".mobileconfig")) || path === "/api/profile/mobileconfig") {
       const ip = validPublicIpv4(url.searchParams.get("ip") || "");
       if (!ip) {
         return jsonResponse({ ok: false, error: "Valid public IPv4 'ip' parameter is required." }, 400);
       }
-      const [countryLong, countryShort] = normalizeCountryPair(
-        url.searchParams.get("country") || "",
-        url.searchParams.get("cc") || ""
-      );
+      const gate = await assertVerifiedForProfile(ctx, ip, "l2tp");
+      if (gate.error) {
+        return jsonResponse(
+          { ok: false, error: gate.error, ip, handshake: gate.verified || null },
+          gate.status || 409
+        );
+      }
       const dnsList = sanitizeDnsList(url.searchParams.get("dns"));
       const xml = buildAppleL2tpMobileconfig(
-        { ip, country_long: countryLong, country_short: countryShort },
+        {
+          ip,
+          country_long: gate.found.country_long,
+          country_short: gate.found.country_short,
+        },
         dnsList
       );
       return new Response(xml, {
@@ -2369,7 +3060,6 @@ export default {
       });
     }
 
-    // 3. Patched Zero-Prompt OpenVPN `.ovpn` Route
     if ((path.startsWith("/profiles/") && path.endsWith(".ovpn")) || path === "/api/profile/ovpn") {
       const ip = validPublicIpv4(url.searchParams.get("ip") || "");
       if (!ip) {
@@ -2380,20 +3070,20 @@ export default {
       const compat = ["mobile3", "ovpn26", "ovpn25", "ovpn24"].includes(compatRaw) ? compatRaw : "mobile3";
       const dnsServers = sanitizeDnsList(url.searchParams.get("dns"));
       const winDrv = url.searchParams.get("windows_driver") || "";
+      const gate = await assertVerifiedForProfile(ctx, ip, transport);
+      if (gate.error) {
+        return jsonResponse(
+          { ok: false, error: gate.error, ip, handshake: gate.verified || null },
+          gate.status || 409
+        );
+      }
 
-      const snap = await getPoolSnapshot(ctx, { forceRefresh: false });
-      const found = snap.public_payload.servers.find((s) => s.ip === ip);
-      const srv = found
-        ? { ...found, ovpn_b64: snap.ovpn_by_ip[ip] || "" }
-        : {
-            ip,
-            country_short: (url.searchParams.get("cc") || "XX").toUpperCase(),
-            udp_port: Number(url.searchParams.get("udp")) || 0,
-            tcp_port: Number(url.searchParams.get("tcp")) || 0,
-            ovpn_b64: snap.ovpn_by_ip[ip] || "",
-          };
-
-      const patched = buildPatchedOvpn(srv, snap.donor_ovpn_b64, {
+      const srv = {
+        ...gate.found,
+        ovpn_b64: gate.snap.ovpn_by_ip[ip] || "",
+        tcp_port: gate.verified.port || gate.found.tcp_port,
+      };
+      const patched = buildPatchedOvpn(srv, gate.snap.donor_ovpn_b64, {
         transport,
         compat,
         dnsServers,
@@ -2415,16 +3105,26 @@ export default {
       });
     }
 
-    // 4. JSON API Endpoints (`/api/servers`, `/api/mirrors`, `/api/probe`, `/api/doctor`)
     if (path === "/api/servers") {
       const forceRefresh = url.searchParams.get("refresh") === "1";
       const customMirror = (url.searchParams.get("mirror") || "").trim();
       const snap = await getPoolSnapshot(ctx, { forceRefresh, customMirror });
-      return jsonResponse({ ...snap.public_payload, cached: snap.cached });
+      const servers = decorateServersWithVerification(snap.public_payload.servers || []);
+      const live = servers.filter((s) => s.verify_state === "live").length;
+      return jsonResponse({
+        ...snap.public_payload,
+        servers,
+        counts: { ...snap.public_payload.counts, live },
+        cached: snap.cached,
+      });
     }
 
     if (path === "/api/mirrors") {
       return handleMirrorsEndpoint(url, ctx);
+    }
+
+    if (path === "/api/verify") {
+      return handleVerifyEndpoint(url, ctx);
     }
 
     if (path === "/api/probe") {
@@ -2433,16 +3133,13 @@ export default {
       if (!ip || !Number.isInteger(port) || port < 1 || port > 65535) {
         return jsonResponse({ ok: false, error: "Valid public IPv4 'ip' and TCP 'port' are required." }, 400);
       }
-      // SSRF / scanner guardrail: allow probing only relays in the active VPN Gate pool or standard VPN ports on pool IPs
       const snap = await getPoolSnapshot(ctx, { forceRefresh: false });
       const inPool = snap.public_payload.servers.find((s) => s.ip === ip);
-      if (!inPool && !SAFE_PROBE_PORTS.has(port)) {
-        return jsonResponse({ ok: false, error: "Target IP/port is outside verified VPN Gate relay pool." }, 403);
-      }
       if (!inPool) {
         return jsonResponse({ ok: false, error: "Target IP is not an active VPN Gate relay." }, 403);
       }
-      const res = await probeTcpEdge(ip, port, 2200);
+      const res = await probeOpenVpnHandshake(ip, port, 2400);
+      if (res.handshake) rememberVerify(ip, { ok: true, port, rtt_ms: res.rtt_ms, engine: res.engine });
       return jsonResponse({ ok: true, ip, port, ...res });
     }
 
@@ -2450,7 +3147,6 @@ export default {
       return handleDoctorEndpoint(request, ctx);
     }
 
-    // 5. Default SPA Dark Console UI
     if (path === "/" || path === "/index.html") {
       return new Response(renderPortalHtml(), {
         status: 200,
@@ -2468,3 +3164,4 @@ export default {
     return jsonResponse({ ok: false, error: "Not Found" }, 404);
   },
 };
+
