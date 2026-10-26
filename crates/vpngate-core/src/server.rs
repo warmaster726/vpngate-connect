@@ -71,6 +71,10 @@ impl VpnServer {
                     Vec::new()
                 }
             }
+            ProtocolFilter::OpenVpnAny => [VpnProtocol::OpenVpnUdp, VpnProtocol::OpenVpnTcp]
+                .into_iter()
+                .filter(|p| self.supports_protocol(*p))
+                .collect(),
             ProtocolFilter::Auto => VpnProtocol::AUTO_ORDER
                 .into_iter()
                 .filter(|p| self.supports_protocol(*p))
@@ -109,6 +113,7 @@ pub fn filter_by_protocol(servers: &[VpnServer], filter: ProtocolFilter) -> Vec<
         .iter()
         .filter(|s| match filter {
             ProtocolFilter::Auto => s.has_any_protocol(),
+            ProtocolFilter::OpenVpnAny => s.openvpn,
             ProtocolFilter::Only(p) => s.supports_protocol(p),
         })
         .cloned()
@@ -120,6 +125,11 @@ pub fn sort_servers(servers: &mut [VpnServer], sort_by: SortBy, filter: Protocol
     servers.sort_by(|a, b| {
         let tier_cmp = match filter {
             ProtocolFilter::Auto => a.auto_priority_tier().cmp(&b.auto_priority_tier()),
+            ProtocolFilter::OpenVpnAny => {
+                let ta = u8::from(!a.supports_openvpn_udp());
+                let tb = u8::from(!b.supports_openvpn_udp());
+                ta.cmp(&tb)
+            }
             ProtocolFilter::Only(_) => std::cmp::Ordering::Equal,
         };
 

@@ -1,6 +1,6 @@
 [package]
 name = "vpngate-cli"
-description = "Cross-platform CLI + interactive TUI for VPN Gate Connect (Windows, macOS, Linux)"
+description = "Cross-platform CLI + interactive console for VPN Gate Connect (Windows, macOS, Linux)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,6 +14,9 @@ path = "src/main.rs"
 [dependencies]
 tokio.workspace = true
 vpngate-core = { path = "../vpngate-core" }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [lints]
 workspace = true

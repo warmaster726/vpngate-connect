@@ -39,13 +39,34 @@ impl VpnProtocol {
     }
 }
 
-/// Server pool filter mode (`Auto` includes all supported protocols).
+/// Server pool filter mode (`Auto` includes all supported protocols; `OpenVpnAny` includes UDP + TCP).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProtocolFilter {
     #[default]
     Auto,
+    OpenVpnAny,
     Only(VpnProtocol),
+}
+
+impl ProtocolFilter {
+    pub fn from_cli_str(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "all" | "auto" => Some(Self::Auto),
+            "openvpn" | "ovpn" => Some(Self::OpenVpnAny),
+            other => VpnProtocol::from_cli_str(other).map(Self::Only),
+        }
+    }
+
+    pub const fn as_cli_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::OpenVpnAny => "openvpn",
+            Self::Only(VpnProtocol::L2tpIpsec) => "l2tp",
+            Self::Only(VpnProtocol::OpenVpnUdp) => "openvpn-udp",
+            Self::Only(VpnProtocol::OpenVpnTcp) => "openvpn-tcp",
+        }
+    }
 }
 
 /// Server ranking strategy.
@@ -57,6 +78,27 @@ pub enum SortBy {
     Speed,
     Ping,
     Score,
+}
+
+impl SortBy {
+    pub fn from_cli_str(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "recommended" | "rec" => Some(Self::Recommended),
+            "score" => Some(Self::Score),
+            "speed" | "mbps" => Some(Self::Speed),
+            "ping" | "latency" => Some(Self::Ping),
+            _ => None,
+        }
+    }
+
+    pub const fn as_cli_str(self) -> &'static str {
+        match self {
+            Self::Recommended => "recommended",
+            Self::Speed => "speed",
+            Self::Ping => "ping",
+            Self::Score => "score",
+        }
+    }
 }
 
 /// Target operating system family for profile generation & tunnel runtime.

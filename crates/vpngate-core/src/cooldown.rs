@@ -54,6 +54,20 @@ impl CooldownStore {
         self.entries.retain(|k, _| !k.starts_with(&prefix));
     }
 
+    pub fn clear_all(&mut self) -> usize {
+        let count = self.entries.len();
+        self.entries.clear();
+        count
+    }
+
+    pub fn active_count(&self) -> usize {
+        let now = now_unix_secs();
+        self.entries
+            .values()
+            .filter(|&&ts| now.saturating_sub(ts) < self.ttl_secs)
+            .count()
+    }
+
     pub fn is_on_cooldown(&self, ip: &str, proto: VpnProtocol) -> bool {
         self.is_on_cooldown_at(ip, proto, now_unix_secs())
     }
