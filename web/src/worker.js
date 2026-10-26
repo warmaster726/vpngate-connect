@@ -14,7 +14,7 @@ import { connect } from "cloudflare:sockets";
  *  - Completely isolated from root `Cargo.toml`, `Cargo.lock`, and desktop installer scripts.
  */
 
-const APP_VERSION = "0.2.2";
+const APP_VERSION = "0.2.3";
 const POOL_CACHE_TTL_MS = 180_000;
 const POOL_CACHE_KEY_URL = "https://vpngate-edge-cache.internal/v1/pool-snapshot";
 const USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) VPNGate-WebWorker/0.2";
@@ -990,10 +990,6 @@ function effectivePing(s) {
 /** Desktop `sort_servers` parity (`Recommended` / `Speed` / `Ping` / `Score`). */
 function sortServersDesktop(list, sortKey, protoFilter) {
   return list.slice().sort((a, b) => {
-    const liveA = a.verify_state === "live" ? 0 : a.verify_state === "dead" ? 2 : 1;
-    const liveB = b.verify_state === "live" ? 0 : b.verify_state === "dead" ? 2 : 1;
-    if (liveA !== liveB) return liveA - liveB;
-
     let tierDiff = 0;
     if (protoFilter === "auto" || protoFilter === "all" || !protoFilter) {
       tierDiff = autoPriorityTier(a) - autoPriorityTier(b);
@@ -2004,6 +2000,7 @@ const PORTAL_JS = String.raw`
     customMirror: "",
     device: detectDevice(),
     verifying: false,
+    testingIp: "",
     verifyLabel: "",
     verified: null,
     attempts: [],
@@ -2138,9 +2135,6 @@ const PORTAL_JS = String.raw`
 
   function sortList(list, sortKey, protoFilter) {
     return list.slice().sort(function (a, b) {
-      var liveA = a.verify_state === "live" ? 0 : a.verify_state === "dead" ? 2 : 1;
-      var liveB = b.verify_state === "live" ? 0 : b.verify_state === "dead" ? 2 : 1;
-      if (liveA !== liveB) return liveA - liveB;
       var tierA = a.l2tp ? 0 : (supportsUdp(a) ? 1 : 2);
       var tierB = b.l2tp ? 0 : (supportsUdp(b) ? 1 : 2);
       var tierDiff = 0;
@@ -2182,8 +2176,13 @@ const PORTAL_JS = String.raw`
 
   function renderBadges(srv) {
     var out = "";
-    if (srv.verify_state === "live") out += '<span class="badge badge-live">LIVE HANDSHAKE</span>';
-    else if (srv.verify_state === "dead") out += '<span class="badge badge-err">DEAD</span>';
+    if (state.verifying && state.testingIp === srv.ip) {
+      out += '<span class="badge badge-wait">TESTING</span>';
+    } else if (srv.verify_state === "live") {
+      out += '<span class="badge badge-live">LIVE HANDSHAKE</span>';
+    } else if (srv.verify_state === "dead") {
+      out += '<span class="badge badge-err">DEAD</span>';
+    }
     if (srv.l2tp) out += '<span class="badge badge-l2tp">L2TP PSK=vpn</span>';
     if (srv.openvpn && srv.udp_port > 0) {
       out += '<span class="badge badge-udp">OVPN UDP:' + srv.udp_port + "</span>";
@@ -2269,20 +2268,9 @@ const PORTAL_JS = String.raw`
       return;
     }
 
-    var srv = null;
-    if (state.verified) {
-      for (var i = 0; i < candidates.length; i++) {
-        if (candidates[i].ip === state.verified.ip) {
-          srv = candidates[i];
-          state.selectedIndex = i;
-          break;
-        }
-      }
-    }
-    if (!srv) {
-      if (state.selectedIndex >= candidates.length) state.selectedIndex = 0;
-      srv = candidates[state.selectedIndex];
-    }
+    if (state.selectedIndex < 0) state.selectedIndex = 0;
+    if (state.selectedIndex >= candidates.length) state.selectedIndex = candidates.length - 1;
+    var srv = candidates[state.selectedIndex];
 
     var unlocked = unlockedFor(srv);
     var canL2tp = unlocked.indexOf("l2tp") !== -1;
@@ -2364,18 +2352,18 @@ const PORTAL_JS = String.raw`
     if (nBtn) {
       nBtn.disabled = state.verifying;
       nBtn.addEventListener("click", function () {
-        var exclude = [];
-        if (state.verified && state.verified.ip) exclude.push(state.verified.ip);
-        for (var a = 0; a < state.attempts.length; a++) {
-          if (state.attempts[a].ip) exclude.push(state.attempts[a].ip);
-        }
-        state.verified = null;
-        runRecursiveVerify({ exclude: exclude });
+        runRecursiveVerify({
+          fromIndex: state.selectedIndex + 1,
+          wrap: true,
+          skipIp: srv.ip
+        });
       });
     }
     var sBtn = document.getElementById("btn-skip-listed");
     if (sBtn) {
+      sBtn.disabled = state.verifying;
       sBtn.addEventListener("click", function () {
+        if (state.verifying) return;
         state.verified = null;
         state.selectedIndex = (state.selectedIndex + 1) % candidates.length;
         renderConnectHero();
@@ -2524,62 +2512,172 @@ const PORTAL_JS = String.raw`
     }
   }
 
+  function markServerState(ip, rec) {
+    for (var j = 0; j < state.servers.length; j++) {
+      if (state.servers[j].ip !== ip) continue;
+      if (rec && rec.ok) {
+        state.servers[j].verify_state = "live";
+        state.servers[j].verified_port = rec.port;
+        state.servers[j].verified_rtt_ms = rec.rtt_ms;
+      } else {
+        state.servers[j].verify_state = "dead";
+      }
+      break;
+    }
+  }
+
+  async function handshakeOne(srv, force) {
+    var qs = new URLSearchParams();
+    qs.set("ip", srv.ip);
+    if (force) qs.set("force", "1");
+    var resp = await fetch("/api/verify?" + qs.toString());
+    return resp.json();
+  }
+
+  function indexOfCandidate(candidates, ip) {
+    for (var i = 0; i < candidates.length; i++) {
+      if (candidates[i].ip === ip) return i;
+    }
+    return -1;
+  }
+
+  function revealIpInConnectList(ip) {
+    var candidates = getConnectCandidates();
+    var idx = indexOfCandidate(candidates, ip);
+    if (idx >= 0) return { candidates: candidates, index: idx };
+    var raw = null;
+    for (var j = 0; j < state.servers.length; j++) {
+      if (state.servers[j].ip === ip) { raw = state.servers[j]; break; }
+    }
+    if (!raw) return { candidates: candidates, index: -1 };
+    var changed = false;
+    if (!matchCountry(raw, state.country)) { state.country = "ALL"; changed = true; }
+    if (!matchProto(raw, state.proto)) { state.proto = "auto"; changed = true; }
+    if (changed) renderCountryControls();
+    candidates = getConnectCandidates();
+    return { candidates: candidates, index: indexOfCandidate(candidates, ip) };
+  }
+
   async function runRecursiveVerify(opts) {
     opts = opts || {};
     var gen = ++verifyGen;
-    state.verifying = true;
-    state.verifyLabel = opts.ip
-      ? ("Handshake on " + opts.ip + "…")
-      : "Recursively testing candidates until one handshake succeeds…";
-    setStepper("probe");
-    setStatusPill("syncing", "VERIFYING");
-    renderConnectHero();
-    appendLog("info", state.verifyLabel);
-    try {
-      var qs = new URLSearchParams();
-      qs.set("proto", state.proto);
-      qs.set("country", state.country);
-      qs.set("sort", state.connectSort);
-      if (opts.ip) qs.set("ip", opts.ip);
-      if (opts.force) qs.set("force", "1");
-      if (opts.exclude && opts.exclude.length) qs.set("exclude", opts.exclude.join(","));
-      var resp = await fetch("/api/verify?" + qs.toString());
-      var data = await resp.json();
-      if (gen !== verifyGen) return;
-      state.attempts = (data && data.attempts) || [];
-      if (Array.isArray(state.attempts)) {
-        for (var i = 0; i < state.attempts.length; i++) {
-          var a = state.attempts[i];
-          if (a.ok) appendLog("ok", "LIVE " + a.ip + ":" + a.port + " handshake " + a.rtt_ms + " ms (" + (a.engine || "openvpn-tcp-v2") + ")");
-          else appendLog("warn", "Fail " + a.ip + ":" + (a.port || "?") + (a.error ? " · " + a.error : ""));
-        }
-      }
-      applyVerifiedToServers(data && data.verified, state.attempts);
-      if (data && data.verified && data.verified.ip) {
-        state.verified = data.verified;
-        setStepper("handshake");
-        setStepper("profile");
-        setStatusPill("", "LIVE · " + data.verified.ip);
-        appendLog("ok", "Profiles unlocked for " + data.verified.ip + " after recursive testing (" + (data.scanned || 0) + " probed).");
-        if (data.widened) appendLog("warn", "No live path in the selected country — widened to all countries.");
-      } else {
-        state.verified = null;
-        setStepper("fail");
-        setStatusPill("error", "NO LIVE PATH");
-        appendLog("err", (data && data.error) || "No candidate completed a live OpenVPN handshake. Profiles remain withheld.");
-      }
-    } catch (e) {
-      if (gen !== verifyGen) return;
+    var WALK_CAP = 24;
+    var revealed = opts.ip ? revealIpInConnectList(opts.ip) : { candidates: getConnectCandidates(), index: -1 };
+    var candidates = revealed.candidates;
+    if (candidates.length === 0) {
+      state.verifying = false;
+      state.testingIp = "";
       state.verified = null;
       setStepper("fail");
-      setStatusPill("error", "VERIFY ERROR");
-      appendLog("err", "Recursive verify failed: " + (e && e.message ? e.message : String(e)));
-    } finally {
-      if (gen !== verifyGen) return;
-      state.verifying = false;
+      setStatusPill("error", "NO RELAYS");
       renderConnectHero();
-      renderRelaysTab();
+      return;
     }
+
+    var single = Boolean(opts.ip && !opts.walk && typeof opts.fromIndex !== "number");
+    var start = 0;
+    if (typeof opts.fromIndex === "number") {
+      start = opts.fromIndex;
+      if (start < 0) start = 0;
+      if (start >= candidates.length) start = 0;
+    } else if (opts.ip) {
+      start = revealed.index >= 0 ? revealed.index : 0;
+    } else {
+      start = state.selectedIndex || 0;
+      if (start < 0 || start >= candidates.length) start = 0;
+    }
+
+    var order = [];
+    if (single) {
+      order.push(start);
+    } else {
+      for (var k = start; k < candidates.length; k++) order.push(k);
+      if (opts.wrap) {
+        for (var k2 = 0; k2 < start; k2++) order.push(k2);
+      }
+    }
+
+    state.verifying = true;
+    state.verified = null;
+    state.attempts = [];
+    state.selectedIndex = start;
+    state.testingIp = candidates[start] ? candidates[start].ip : "";
+    state.verifyLabel = "Testing [" + (start + 1) + "/" + candidates.length + "]";
+    setStepper("probe");
+    setStatusPill("syncing", (start + 1) + "/" + candidates.length);
+    renderConnectHero();
+    appendLog("info", single
+      ? ("Handshake on sort slot [" + (start + 1) + "/" + candidates.length + "]")
+      : ("Walking sort order from [" + (start + 1) + "/" + candidates.length + "] until a live handshake."));
+
+    var winner = null;
+    var probed = 0;
+    var lastIdx = start;
+    for (var oi = 0; oi < order.length; oi++) {
+      if (gen !== verifyGen) return;
+      var i = order[oi];
+      var cand = candidates[i];
+      if (opts.skipIp && cand.ip === opts.skipIp) continue;
+      if (!opts.force && cand.verify_state === "dead") continue;
+      if (probed >= WALK_CAP) {
+        appendLog("warn", "Walk cap (" + WALK_CAP + ") reached — remaining slots keep their listed numbers.");
+        break;
+      }
+
+      lastIdx = i;
+      state.selectedIndex = i;
+      state.testingIp = cand.ip;
+      state.verifyLabel = "Testing [" + (i + 1) + "/" + candidates.length + "] " + cand.ip;
+      setStatusPill("syncing", (i + 1) + "/" + candidates.length);
+      setStepper("handshake");
+      renderConnectHero();
+      appendLog("info", "Handshake [" + (i + 1) + "/" + candidates.length + "] " + hostLabel(cand) + " · " + cand.ip);
+
+      var data;
+      try {
+        data = await handshakeOne(cand, Boolean(opts.force));
+      } catch (e) {
+        if (gen !== verifyGen) return;
+        markServerState(cand.ip, { ok: false });
+        state.attempts.push({ ip: cand.ip, ok: false, error: e && e.message ? e.message : String(e) });
+        appendLog("err", "Probe error [" + (i + 1) + "/" + candidates.length + "] " + cand.ip + " · " + (e && e.message ? e.message : String(e)));
+        probed += 1;
+        continue;
+      }
+      if (gen !== verifyGen) return;
+      probed += 1;
+
+      var attempt = data && Array.isArray(data.attempts) && data.attempts[0] ? data.attempts[0] : null;
+      if (attempt) state.attempts.push(attempt);
+      var ok = Boolean(data && data.verified && data.verified.ip === cand.ip);
+      if (ok) {
+        markServerState(cand.ip, { ok: true, port: data.verified.port, rtt_ms: data.verified.rtt_ms });
+        appendLog("ok", "LIVE [" + (i + 1) + "/" + candidates.length + "] " + cand.ip + ":" + data.verified.port + " · " + data.verified.rtt_ms + " ms");
+        winner = { index: i, payload: data.verified };
+        break;
+      }
+      markServerState(cand.ip, { ok: false });
+      appendLog("warn", "Dead [" + (i + 1) + "/" + candidates.length + "] " + cand.ip + (attempt && attempt.error ? " · " + attempt.error : ""));
+    }
+
+    if (gen !== verifyGen) return;
+    state.verifying = false;
+    state.testingIp = "";
+    if (winner) {
+      state.selectedIndex = winner.index;
+      state.verified = winner.payload;
+      setStepper("profile");
+      setStatusPill("", "LIVE · #" + (winner.index + 1));
+      appendLog("ok", "Profiles unlocked for sort slot [" + (winner.index + 1) + "/" + candidates.length + "] " + winner.payload.ip + " after " + probed + " handshake(s).");
+    } else {
+      state.selectedIndex = lastIdx;
+      state.verified = null;
+      setStepper("fail");
+      setStatusPill("error", "NO LIVE PATH");
+      appendLog("err", "No live handshake along the current sort order. Dead relays stay in place — numbering is unchanged. Profiles remain withheld.");
+    }
+    renderConnectHero();
+    renderRelaysTab();
   }
 
   async function runProbeMirrors() {
@@ -2664,8 +2762,7 @@ const PORTAL_JS = String.raw`
     renderRelaysTab();
     var top = getConnectCandidates()[0];
     if (top && state.verified && state.verified.ip === top.ip) return;
-    if (top) runRecursiveVerify({ ip: top.ip });
-    else runRecursiveVerify({});
+    runRecursiveVerify({});
   }
 
   document.addEventListener("DOMContentLoaded", function () {
