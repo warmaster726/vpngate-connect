@@ -14,9 +14,14 @@ import { connect } from "cloudflare:sockets";
  *  - Completely isolated from root `Cargo.toml`, `Cargo.lock`, and desktop installer scripts.
  */
 
-const APP_VERSION = "0.2.3";
+const APP_VERSION = "0.2.4";
 const POOL_CACHE_TTL_MS = 180_000;
 const POOL_CACHE_KEY_URL = "https://vpngate-edge-cache.internal/v1/pool-snapshot";
+const VERIFY_MEM_CACHE_URL = "https://vpngate-edge-cache.internal/v1/verify-memory";
+const VERIFY_IP_CACHE_PREFIX = "https://vpngate-edge-cache.internal/v1/verify-ip/";
+/** Desktop tunnel wait is 15–22s; web probes fail faster so the walk can advance. */
+const HANDSHAKE_TIMEOUT_MS = 1200;
+const DEAD_PENALTY_MS = 15 * 60 * 1000;
 const USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) VPNGate-WebWorker/0.2";
 const OFFICIAL_CSV_URLS = [
   "https://www.vpngate.net/api/iphone/",
@@ -1286,7 +1291,7 @@ async function getPoolSnapshot(ctx, { forceRefresh = false, customMirror = "" } 
 }
 
 const VERIFY_OK_TTL_MS = 180_000;
-const VERIFY_FAIL_TTL_MS = 45_000;
+const VERIFY_FAIL_TTL_MS = DEAD_PENALTY_MS;
 const OPENVPN_HARD_RESET_CLIENT_V2 = 0x38;
 const OPENVPN_HARD_RESET_SERVER_V2 = 0x40;
 
@@ -1319,19 +1324,98 @@ function matchProtoServer(srv, proto) {
   return Boolean(srv.l2tp || srv.openvpn);
 }
 
-function rememberVerify(ip, rec) {
-  if (!globalThis.__VG_VERIFIED) globalThis.__VG_VERIFIED = new Map();
-  globalThis.__VG_VERIFIED.set(ip, { ...rec, ts: Date.now() });
+function verifyRecordTtl(rec) {
+  return rec && rec.ok ? VERIFY_OK_TTL_MS : VERIFY_FAIL_TTL_MS;
 }
 
-function recallVerify(ip) {
+function waitUntilOrIgnore(ctx, promise) {
+  if (!promise) return;
+  if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(promise);
+}
+
+function persistVerifyIp(ip, rec, ctx) {
+  if (typeof caches === "undefined" || !caches.default) return;
+  const ttl = verifyRecordTtl(rec);
+  const resp = new Response(JSON.stringify(rec), {
+    headers: {
+      "Content-Type": "application/json",
+      "Cache-Control": `public, max-age=${Math.max(1, Math.floor(ttl / 1000))}`,
+    },
+  });
+  waitUntilOrIgnore(ctx, caches.default.put(VERIFY_IP_CACHE_PREFIX + ip, resp).catch(() => {}));
+}
+
+function persistVerifyMemory(ctx) {
+  if (typeof caches === "undefined" || !caches.default) return;
+  const mem = globalThis.__VG_VERIFIED;
+  if (!mem) return;
+  const now = Date.now();
+  const entries = {};
+  for (const [ip, rec] of mem.entries()) {
+    if (rec && now - rec.ts <= verifyRecordTtl(rec)) entries[ip] = rec;
+  }
+  const resp = new Response(JSON.stringify({ entries, saved_at: now }), {
+    headers: {
+      "Content-Type": "application/json",
+      "Cache-Control": `public, max-age=${Math.floor(DEAD_PENALTY_MS / 1000)}`,
+    },
+  });
+  waitUntilOrIgnore(ctx, caches.default.put(VERIFY_MEM_CACHE_URL, resp).catch(() => {}));
+}
+
+function rememberVerify(ip, rec, ctx) {
+  if (!globalThis.__VG_VERIFIED) globalThis.__VG_VERIFIED = new Map();
+  const stored = { ...rec, ts: Date.now() };
+  globalThis.__VG_VERIFIED.set(ip, stored);
+  persistVerifyIp(ip, stored, ctx);
+  persistVerifyMemory(ctx);
+  return stored;
+}
+
+function recallVerifySync(ip) {
   const mem = globalThis.__VG_VERIFIED;
   if (!mem) return null;
   const rec = mem.get(ip);
   if (!rec) return null;
-  const ttl = rec.ok ? VERIFY_OK_TTL_MS : VERIFY_FAIL_TTL_MS;
-  if (Date.now() - rec.ts > ttl) return null;
+  if (Date.now() - rec.ts > verifyRecordTtl(rec)) {
+    mem.delete(ip);
+    return null;
+  }
   return rec;
+}
+
+async function recallVerify(ip) {
+  const hit = recallVerifySync(ip);
+  if (hit) return hit;
+  try {
+    if (typeof caches === "undefined" || !caches.default) return null;
+    const cached = await caches.default.match(VERIFY_IP_CACHE_PREFIX + ip);
+    if (!cached) return null;
+    const rec = await cached.json();
+    if (!rec || Date.now() - rec.ts > verifyRecordTtl(rec)) return null;
+    if (!globalThis.__VG_VERIFIED) globalThis.__VG_VERIFIED = new Map();
+    globalThis.__VG_VERIFIED.set(ip, rec);
+    return rec;
+  } catch {
+    return null;
+  }
+}
+
+async function ensureVerifyMemory(ctx) {
+  if (globalThis.__VG_VERIFIED) return;
+  globalThis.__VG_VERIFIED = new Map();
+  try {
+    if (typeof caches === "undefined" || !caches.default) return;
+    const hit = await caches.default.match(VERIFY_MEM_CACHE_URL);
+    if (!hit) return;
+    const parsed = await hit.json();
+    const now = Date.now();
+    for (const [ip, rec] of Object.entries(parsed.entries || {})) {
+      if (rec && now - rec.ts <= verifyRecordTtl(rec)) globalThis.__VG_VERIFIED.set(ip, rec);
+    }
+  } catch {
+    // isolate starts empty; per-IP cache still consulted on probe
+  }
 }
 
 function decorateServersWithVerification(servers) {
@@ -1339,14 +1423,15 @@ function decorateServersWithVerification(servers) {
   const mem = globalThis.__VG_VERIFIED;
   return (servers || []).map((s) => {
     const rec = mem ? mem.get(s.ip) : null;
-    if (!rec) return { ...s, verify_state: "untested" };
-    const ttl = rec.ok ? VERIFY_OK_TTL_MS : VERIFY_FAIL_TTL_MS;
-    if (now - rec.ts > ttl) return { ...s, verify_state: "untested" };
+    if (!rec) return { ...s, verify_state: "untested", dead_until: 0 };
+    const ttl = verifyRecordTtl(rec);
+    if (now - rec.ts > ttl) return { ...s, verify_state: "untested", dead_until: 0 };
     return {
       ...s,
       verify_state: rec.ok ? "live" : "dead",
       verified_port: rec.port || 0,
       verified_rtt_ms: rec.rtt_ms || null,
+      dead_until: rec.ok ? 0 : rec.ts + DEAD_PENALTY_MS,
     };
   });
 }
@@ -1413,7 +1498,7 @@ async function readSocketBytes(reader, minBytes, deadline) {
   return out;
 }
 
-async function probeOpenVpnHandshake(ip, port, timeoutMs = 2400) {
+async function probeOpenVpnHandshake(ip, port, timeoutMs = HANDSHAKE_TIMEOUT_MS) {
   const t0 = Date.now();
   const deadline = t0 + timeoutMs;
   let socket;
@@ -1453,7 +1538,7 @@ async function probeOpenVpnHandshake(ip, port, timeoutMs = 2400) {
   }
 }
 
-async function probeTcpEdge(ip, port, timeoutMs = 2200) {
+async function probeTcpEdge(ip, port, timeoutMs = HANDSHAKE_TIMEOUT_MS) {
   const handshake = await probeOpenVpnHandshake(ip, port, timeoutMs);
   if (handshake.handshake) return handshake;
   const t0 = Date.now();
@@ -1506,7 +1591,7 @@ async function verifyRelay(server) {
     error: "no probe ports",
   };
   for (const port of ports) {
-    const r = await probeOpenVpnHandshake(server.ip, port, 2400);
+    const r = await probeOpenVpnHandshake(server.ip, port, HANDSHAKE_TIMEOUT_MS);
     if (r.handshake) {
       return { ok: true, port, rtt_ms: r.rtt_ms, engine: r.engine };
     }
@@ -1521,14 +1606,13 @@ async function verifyRelay(server) {
   return last;
 }
 
-async function verifyRelayCached(server, { force = false } = {}) {
+async function verifyRelayCached(server, { force = false, ctx = null } = {}) {
   if (!force) {
-    const hit = recallVerify(server.ip);
+    const hit = await recallVerify(server.ip);
     if (hit) return hit;
   }
   const res = await verifyRelay(server);
-  rememberVerify(server.ip, res);
-  return res;
+  return rememberVerify(server.ip, res, ctx);
 }
 
 function unlockedProfiles(server, result) {
@@ -1552,6 +1636,7 @@ async function recursiveVerifyRelays({
   exclude = [],
   ip = "",
   force = false,
+  ctx = null,
 } = {}) {
   const excludeSet = new Set(exclude);
   let widened = false;
@@ -1583,7 +1668,7 @@ async function recursiveVerifyRelays({
 
   for (let i = 0; i < slice.length && !winner; i += batchSize) {
     const batch = slice.slice(i, i + batchSize);
-    const results = await Promise.all(batch.map((s) => verifyRelayCached(s, { force })));
+    const results = await Promise.all(batch.map((s) => verifyRelayCached(s, { force, ctx })));
     for (let j = 0; j < batch.length; j++) {
       const srv = batch[j];
       const res = results[j];
@@ -1596,6 +1681,8 @@ async function recursiveVerifyRelays({
         rtt_ms: res.rtt_ms || null,
         error: res.ok ? undefined : res.error,
         engine: res.engine,
+        dead_until: res.ok ? 0 : (res.ts || Date.now()) + DEAD_PENALTY_MS,
+        cached: Boolean(res.ts && Date.now() - res.ts > 250 && !force),
       });
       if (res.ok && !winner) winner = { server: srv, result: res };
     }
@@ -1656,7 +1743,7 @@ async function assertVerifiedForProfile(ctx, ip, kind) {
   if (kind === "udp" && !(found.openvpn && found.udp_port > 0)) {
     return { error: "Relay does not advertise OpenVPN UDP.", status: 409, found };
   }
-  const verified = await verifyRelayCached(found);
+  const verified = await verifyRelayCached(found, { ctx });
   if (!verified.ok) {
     return {
       error: "Live handshake failed — profile withheld until the relay answers OpenVPN HARD_RESET.",
@@ -1876,6 +1963,9 @@ button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible
 }
 @keyframes load-slide { 0% { width: 8%; margin-left: 0; } 50% { width: 55%; } 100% { width: 8%; margin-left: 92%; } }
 .progress-label { font-family: var(--mono); font-size: 11.5px; color: var(--cyan); }
+#verify-elapsed, #hero-hop-elapsed {
+  color: var(--amber); font-variant-numeric: tabular-nums; font-weight: 700;
+}
 
 .btn-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 .btn {
@@ -2004,7 +2094,12 @@ const PORTAL_JS = String.raw`
     verifyLabel: "",
     verified: null,
     attempts: [],
-    step: "pool"
+    step: "pool",
+    elapsedTimer: 0,
+    walkStartedAt: 0,
+    hopStartedAt: 0,
+    walkSlot: 0,
+    walkTotal: 0
   };
 
   function detectDevice() {
@@ -2174,12 +2269,79 @@ const PORTAL_JS = String.raw`
     return "/profiles/vpngate-" + encodeURIComponent(cc) + "-" + encodeURIComponent(srv.ip) + "-" + transport + ".ovpn?" + q.toString();
   }
 
+  var DEAD_PENALTY_MS = 15 * 60 * 1000;
+
+  function prunePenalties() {
+    var now = Date.now();
+    for (var i = 0; i < state.servers.length; i++) {
+      var s = state.servers[i];
+      if (s.verify_state === "dead" && s.dead_until && now >= s.dead_until) {
+        s.verify_state = "untested";
+        s.dead_until = 0;
+      }
+    }
+  }
+
+  function isPenalized(srv) {
+    if (!srv || srv.verify_state !== "dead") return false;
+    if (srv.dead_until && Date.now() >= srv.dead_until) {
+      srv.verify_state = "untested";
+      srv.dead_until = 0;
+      return false;
+    }
+    return true;
+  }
+
+  function fmtPenaltyLeft(srv) {
+    var left = Math.max(0, (srv.dead_until || 0) - Date.now());
+    if (left <= 0) return "";
+    var mins = Math.ceil(left / 60000);
+    return mins <= 1 ? "<1m" : mins + "m";
+  }
+
+  function fmtElapsed(ms) {
+    var s = Math.max(0, ms) / 1000;
+    if (s < 60) return s.toFixed(1) + "s";
+    var m = Math.floor(s / 60);
+    var r = Math.floor(s % 60);
+    return m + "m " + (r < 10 ? "0" : "") + r + "s";
+  }
+
+  function paintElapsed() {
+    var hop = fmtElapsed(Date.now() - (state.hopStartedAt || Date.now()));
+    var total = fmtElapsed(Date.now() - (state.walkStartedAt || Date.now()));
+    var hopEl = document.getElementById("verify-elapsed");
+    var hopStat = document.getElementById("hero-hop-elapsed");
+    var txt = document.getElementById("status-text");
+    if (hopEl) hopEl.textContent = hop + " this hop · " + total + " total";
+    if (hopStat) hopStat.textContent = hop;
+    if (txt && state.verifying && state.walkTotal) {
+      txt.textContent = state.walkSlot + "/" + state.walkTotal + " · " + hop;
+    }
+  }
+
+  function startElapsedTicker() {
+    if (state.elapsedTimer) clearInterval(state.elapsedTimer);
+    paintElapsed();
+    state.elapsedTimer = setInterval(paintElapsed, 100);
+  }
+
+  function stopElapsedTicker() {
+    if (state.elapsedTimer) {
+      clearInterval(state.elapsedTimer);
+      state.elapsedTimer = 0;
+    }
+  }
+
   function renderBadges(srv) {
     var out = "";
     if (state.verifying && state.testingIp === srv.ip) {
       out += '<span class="badge badge-wait">TESTING</span>';
     } else if (srv.verify_state === "live") {
       out += '<span class="badge badge-live">LIVE HANDSHAKE</span>';
+    } else if (isPenalized(srv)) {
+      var left = fmtPenaltyLeft(srv);
+      out += '<span class="badge badge-err">DEAD' + (left ? " · " + left : "") + "</span>";
     } else if (srv.verify_state === "dead") {
       out += '<span class="badge badge-err">DEAD</span>';
     }
@@ -2227,6 +2389,7 @@ const PORTAL_JS = String.raw`
   }
 
   function getConnectCandidates() {
+    prunePenalties();
     var filtered = state.servers.filter(function (s) {
       return matchCountry(s, state.country) && matchProto(s, state.proto);
     });
@@ -2281,14 +2444,18 @@ const PORTAL_JS = String.raw`
     else if (canL2tp || canUdp || canTcp) heroClass += " live";
     else if (srv.verify_state === "dead") heroClass += " dead";
 
-    var handshakeMs = (state.verified && state.verified.ip === srv.ip && state.verified.rtt_ms)
-      ? (state.verified.rtt_ms + " ms")
-      : (srv.verified_rtt_ms ? srv.verified_rtt_ms + " ms" : "—");
+    var handshakeMs;
+    if (state.verifying) handshakeMs = '<span id="hero-hop-elapsed">0.0s</span>';
+    else if (state.verified && state.verified.ip === srv.ip && state.verified.rtt_ms)
+      handshakeMs = state.verified.rtt_ms + " ms";
+    else if (srv.verified_rtt_ms) handshakeMs = srv.verified_rtt_ms + " ms";
+    else handshakeMs = "—";
 
     var lockHtml;
     if (state.verifying) {
       lockHtml = '<div class="progress-track"><div class="progress-fill"></div></div>' +
-        '<div class="progress-label">' + esc(state.verifyLabel || "Recursively probing live paths…") + "</div>";
+        '<div class="progress-label">' + esc(state.verifyLabel || "Testing live path") +
+        ' · <span id="verify-elapsed">0.0s this hop · 0.0s total</span></div>';
     } else if (canL2tp || canUdp || canTcp) {
       lockHtml = '<div class="lock-note ok">Live OpenVPN HARD_RESET completed on ' +
         esc(srv.ip) + ":" + esc(state.verified.port) + " · profiles unlocked for this relay only.</div>";
@@ -2345,7 +2512,7 @@ const PORTAL_JS = String.raw`
     if (vBtn) {
       vBtn.disabled = state.verifying;
       vBtn.addEventListener("click", function () {
-        runRecursiveVerify({ ip: srv.ip, force: true });
+        runRecursiveVerify({ ip: srv.ip, walk: true, wrap: true, forceIp: srv.ip });
       });
     }
     var nBtn = document.getElementById("btn-next-live");
@@ -2375,6 +2542,7 @@ const PORTAL_JS = String.raw`
     var listEl = document.getElementById("relays-list");
     var metaEl = document.getElementById("relays-meta");
     if (!listEl || !metaEl) return;
+    prunePenalties();
 
     var filtered = state.servers.filter(function (s) {
       return matchRelayQuery(s, state.relaySearch) && matchProto(s, state.relayProto);
@@ -2519,8 +2687,10 @@ const PORTAL_JS = String.raw`
         state.servers[j].verify_state = "live";
         state.servers[j].verified_port = rec.port;
         state.servers[j].verified_rtt_ms = rec.rtt_ms;
+        state.servers[j].dead_until = 0;
       } else {
         state.servers[j].verify_state = "dead";
+        state.servers[j].dead_until = (rec && rec.dead_until) ? rec.dead_until : (Date.now() + DEAD_PENALTY_MS);
       }
       break;
     }
@@ -2530,8 +2700,14 @@ const PORTAL_JS = String.raw`
     var qs = new URLSearchParams();
     qs.set("ip", srv.ip);
     if (force) qs.set("force", "1");
-    var resp = await fetch("/api/verify?" + qs.toString());
-    return resp.json();
+    var ctrl = new AbortController();
+    var timer = setTimeout(function () { ctrl.abort(); }, 2500);
+    try {
+      var resp = await fetch("/api/verify?" + qs.toString(), { signal: ctrl.signal });
+      return await resp.json();
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   function indexOfCandidate(candidates, ip) {
@@ -2568,6 +2744,7 @@ const PORTAL_JS = String.raw`
       state.verifying = false;
       state.testingIp = "";
       state.verified = null;
+      stopElapsedTicker();
       setStepper("fail");
       setStatusPill("error", "NO RELAYS");
       renderConnectHero();
@@ -2602,13 +2779,18 @@ const PORTAL_JS = String.raw`
     state.attempts = [];
     state.selectedIndex = start;
     state.testingIp = candidates[start] ? candidates[start].ip : "";
+    state.walkSlot = start + 1;
+    state.walkTotal = candidates.length;
+    state.walkStartedAt = Date.now();
+    state.hopStartedAt = Date.now();
     state.verifyLabel = "Testing [" + (start + 1) + "/" + candidates.length + "]";
     setStepper("probe");
     setStatusPill("syncing", (start + 1) + "/" + candidates.length);
     renderConnectHero();
+    startElapsedTicker();
     appendLog("info", single
       ? ("Handshake on sort slot [" + (start + 1) + "/" + candidates.length + "]")
-      : ("Walking sort order from [" + (start + 1) + "/" + candidates.length + "] until a live handshake."));
+      : ("Walking sort order from [" + (start + 1) + "/" + candidates.length + "] — dead hops skip in 1.2s and stay numbered."));
 
     var winner = null;
     var probed = 0;
@@ -2617,8 +2799,9 @@ const PORTAL_JS = String.raw`
       if (gen !== verifyGen) return;
       var i = order[oi];
       var cand = candidates[i];
+      var forceThis = Boolean(opts.force) || (opts.forceIp && cand.ip === opts.forceIp);
       if (opts.skipIp && cand.ip === opts.skipIp) continue;
-      if (!opts.force && cand.verify_state === "dead") continue;
+      if (!forceThis && isPenalized(cand)) continue;
       if (probed >= WALK_CAP) {
         appendLog("warn", "Walk cap (" + WALK_CAP + ") reached — remaining slots keep their listed numbers.");
         break;
@@ -2627,20 +2810,24 @@ const PORTAL_JS = String.raw`
       lastIdx = i;
       state.selectedIndex = i;
       state.testingIp = cand.ip;
+      state.walkSlot = i + 1;
+      state.walkTotal = candidates.length;
+      state.hopStartedAt = Date.now();
       state.verifyLabel = "Testing [" + (i + 1) + "/" + candidates.length + "] " + cand.ip;
       setStatusPill("syncing", (i + 1) + "/" + candidates.length);
       setStepper("handshake");
       renderConnectHero();
+      paintElapsed();
       appendLog("info", "Handshake [" + (i + 1) + "/" + candidates.length + "] " + hostLabel(cand) + " · " + cand.ip);
 
       var data;
       try {
-        data = await handshakeOne(cand, Boolean(opts.force));
+        data = await handshakeOne(cand, forceThis);
       } catch (e) {
         if (gen !== verifyGen) return;
         markServerState(cand.ip, { ok: false });
         state.attempts.push({ ip: cand.ip, ok: false, error: e && e.message ? e.message : String(e) });
-        appendLog("err", "Probe error [" + (i + 1) + "/" + candidates.length + "] " + cand.ip + " · " + (e && e.message ? e.message : String(e)));
+        appendLog("err", "Probe error [" + (i + 1) + "/" + candidates.length + "] " + cand.ip + " · " + (e && e.message ? e.message : String(e)) + " — 15m penalty, advancing.");
         probed += 1;
         continue;
       }
@@ -2652,29 +2839,32 @@ const PORTAL_JS = String.raw`
       var ok = Boolean(data && data.verified && data.verified.ip === cand.ip);
       if (ok) {
         markServerState(cand.ip, { ok: true, port: data.verified.port, rtt_ms: data.verified.rtt_ms });
-        appendLog("ok", "LIVE [" + (i + 1) + "/" + candidates.length + "] " + cand.ip + ":" + data.verified.port + " · " + data.verified.rtt_ms + " ms");
+        appendLog("ok", "LIVE [" + (i + 1) + "/" + candidates.length + "] " + cand.ip + ":" + data.verified.port + " · " + data.verified.rtt_ms + " ms · " + fmtElapsed(Date.now() - state.hopStartedAt));
         winner = { index: i, payload: data.verified };
         break;
       }
-      markServerState(cand.ip, { ok: false });
-      appendLog("warn", "Dead [" + (i + 1) + "/" + candidates.length + "] " + cand.ip + (attempt && attempt.error ? " · " + attempt.error : ""));
+      markServerState(cand.ip, { ok: false, dead_until: attempt && attempt.dead_until });
+      appendLog("warn", "Dead [" + (i + 1) + "/" + candidates.length + "] " + cand.ip +
+        (attempt && attempt.error ? " · " + attempt.error : "") +
+        " · 15m pool penalty · next slot");
     }
 
     if (gen !== verifyGen) return;
     state.verifying = false;
     state.testingIp = "";
+    stopElapsedTicker();
     if (winner) {
       state.selectedIndex = winner.index;
       state.verified = winner.payload;
       setStepper("profile");
       setStatusPill("", "LIVE · #" + (winner.index + 1));
-      appendLog("ok", "Profiles unlocked for sort slot [" + (winner.index + 1) + "/" + candidates.length + "] " + winner.payload.ip + " after " + probed + " handshake(s).");
+      appendLog("ok", "Profiles unlocked for sort slot [" + (winner.index + 1) + "/" + candidates.length + "] " + winner.payload.ip + " after " + probed + " handshake(s) in " + fmtElapsed(Date.now() - state.walkStartedAt) + ".");
     } else {
       state.selectedIndex = lastIdx;
       state.verified = null;
       setStepper("fail");
       setStatusPill("error", "NO LIVE PATH");
-      appendLog("err", "No live handshake along the current sort order. Dead relays stay in place — numbering is unchanged. Profiles remain withheld.");
+      appendLog("err", "No live handshake along the current sort order. Dead relays stay numbered and sit out 15 minutes. Profiles remain withheld.");
     }
     renderConnectHero();
     renderRelaysTab();
@@ -2882,7 +3072,7 @@ const PORTAL_JS = String.raw`
       if (vBtn) {
         var vip = vBtn.getAttribute("data-verify-ip");
         switchTab("connect");
-        runRecursiveVerify({ ip: vip, force: true });
+        runRecursiveVerify({ ip: vip, walk: true, wrap: true, forceIp: vip });
         return;
       }
       var mirBtn = e.target.closest("[data-use-mirror]");
@@ -3186,6 +3376,7 @@ async function handleVerifyEndpoint(url, ctx) {
     exclude,
     ip: ip || "",
     force,
+    ctx,
   });
   if (!result.verified) {
     return jsonResponse({
@@ -3249,7 +3440,7 @@ async function handleDoctorEndpoint(request, ctx) {
 
   const tcpCandidate = snap.public_payload.servers.find((s) => s.tcp_port > 0);
   if (tcpCandidate) {
-    const pRes = await probeOpenVpnHandshake(tcpCandidate.ip, tcpCandidate.tcp_port, 2400);
+    const pRes = await probeOpenVpnHandshake(tcpCandidate.ip, tcpCandidate.tcp_port, HANDSHAKE_TIMEOUT_MS);
     checks.push({
       name: "Live OpenVPN TCP Handshake",
       status: pRes.handshake ? "READY" : "WARN",
@@ -3303,6 +3494,7 @@ async function handleDoctorEndpoint(request, ctx) {
 
 export default {
   async fetch(request, _env, ctx) {
+    await ensureVerifyMemory(ctx);
     const url = new URL(request.url);
     const path = url.pathname;
 
@@ -3449,8 +3641,9 @@ export default {
       if (!inPool) {
         return jsonResponse({ ok: false, error: "Target IP is not an active VPN Gate relay." }, 403);
       }
-      const res = await probeOpenVpnHandshake(ip, port, 2400);
-      if (res.handshake) rememberVerify(ip, { ok: true, port, rtt_ms: res.rtt_ms, engine: res.engine });
+      const res = await probeOpenVpnHandshake(ip, port, HANDSHAKE_TIMEOUT_MS);
+      if (res.handshake) rememberVerify(ip, { ok: true, port, rtt_ms: res.rtt_ms, engine: res.engine }, ctx);
+      else rememberVerify(ip, { ok: false, port, rtt_ms: res.rtt_ms, engine: res.engine, error: res.error }, ctx);
       return jsonResponse({ ok: true, ip, port, ...res });
     }
 
