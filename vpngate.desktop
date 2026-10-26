@@ -1,0 +1,41 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=VPN Gate
+GenericName=VPN Gate Client & Region Connector
+Comment=Dynamic-resizing SoftEther VPN Gate Client (Auto: L2TP/IPsec -> OVPN UDP -> OVPN TCP)
+Exec=/usr/local/bin/vpngate-launcher
+Icon=network-vpn
+Terminal=false
+Categories=System;Security;
+Keywords=vpn;vpngate;l2tp;ipsec;xfrm;openvpn;kali;rust;
+StartupNotify=true
+Actions=ConnectJPAuto;ConnectJPL2TP;ConnectJPOVPNUDP;Countries;Status;Doctor;Disconnect;
+
+[Desktop Action ConnectJPAuto]
+Name=Quick Connect — Japan (Auto: L2TP -> OVPN UDP -> OVPN TCP)
+Exec=/usr/local/bin/vpngate-launcher --hold connect -c JP -p auto
+
+[Desktop Action ConnectJPL2TP]
+Name=Quick Connect — Japan (Encrypted L2TP / Built-In Rust XFRM)
+Exec=/usr/local/bin/vpngate-launcher --hold connect -c JP -p l2tp
+
+[Desktop Action ConnectJPOVPNUDP]
+Name=Quick Connect — Japan (OpenVPN UDP)
+Exec=/usr/local/bin/vpngate-launcher --hold connect -c JP -p openvpn-udp
+
+[Desktop Action Countries]
+Name=View Unified Countries & Regions Table
+Exec=/usr/local/bin/vpngate-launcher --hold countries
+
+[Desktop Action Status]
+Name=Check Active VPN & Public Egress IP
+Exec=/usr/local/bin/vpngate-launcher --hold status
+
+[Desktop Action Doctor]
+Name=Run System Readiness & Crypto Check
+Exec=/usr/local/bin/vpngate-launcher --hold doctor
+
+[Desktop Action Disconnect]
+Name=Disconnect Active VPN & Clean Up
+Exec=/usr/local/bin/vpngate-launcher --hold disconnect

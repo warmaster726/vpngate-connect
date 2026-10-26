@@ -12,6 +12,7 @@ name = "vpngate"
 path = "src/main.rs"
 
 [dependencies]
+serde_json.workspace = true
 tokio.workspace = true
 vpngate-core = { path = "../vpngate-core" }
 

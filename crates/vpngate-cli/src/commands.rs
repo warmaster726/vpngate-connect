@@ -833,7 +833,45 @@ pub fn cmd_doctor(paths: &AppPaths) -> io::Result<i32> {
         )));
     }
 
-    // 4. Physical default gateway
+    // 4. Desktop Window / Console UI
+    if cfg!(target_os = "windows") {
+        let wt_note = if which_bin("wt").is_some() {
+            "Windows Terminal (`wt.exe`) + PowerShell UTF-8/VT"
+        } else {
+            "PowerShell Console UTF-8/VT"
+        };
+        lines.push(Some(format!(
+            "Console UI   : {GREEN}READY{RESET} — {wt_note}"
+        )));
+    } else if cfg!(target_os = "linux") {
+        let self_dir = env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
+        let launcher_ok = which_bin("vpngate-launcher").is_some()
+            || which_bin("vpngate-launcher.py").is_some()
+            || std::path::Path::new("/usr/local/bin/vpngate-launcher").is_file()
+            || self_dir.as_ref().is_some_and(|d| {
+                d.join("vpngate-launcher.py").is_file()
+                    || d.parent()
+                        .and_then(|p| p.parent())
+                        .is_some_and(|r| r.join("vpngate-launcher.py").is_file())
+            });
+        if launcher_ok {
+            lines.push(Some(format!(
+                "GNOME Window : {GREEN}READY{RESET} — `vpngate-launcher` dynamic GTK/VTE dark window"
+            )));
+        } else {
+            lines.push(Some(format!(
+                "GNOME Window : {YELLOW}CLI ONLY{RESET} — Run `sh ./install-vpngate.sh` to install GNOME launcher"
+            )));
+        }
+    } else {
+        lines.push(Some(format!(
+            "Console UI   : {GREEN}READY{RESET} — macOS Terminal UTF-8"
+        )));
+    }
+
+    // 5. Physical default gateway
     let gw = get_default_gateway();
     if !gw.dev.is_empty() {
         let gw_desc = if gw.gw.is_empty() {

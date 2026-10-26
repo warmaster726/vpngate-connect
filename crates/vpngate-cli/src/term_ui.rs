@@ -214,6 +214,34 @@ pub fn get_live_terminal_size(fallback_cols: usize, fallback_rows: usize) -> (us
     (cols, rows)
 }
 
+#[cfg(unix)]
+fn discover_launcher_resize_sock() -> Option<std::path::PathBuf> {
+    if let Ok(sock) = env::var("VPNGATE_RESIZE_SOCK") {
+        let p = std::path::PathBuf::from(sock.trim());
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    // Fallback across `sudo`: inspect controlling TTY marker in `<user_home>/.cache/vpngate/ui_socks/`
+    unsafe {
+        let ptr = libc::ttyname(libc::STDOUT_FILENO);
+        if ptr.is_null() {
+            return None;
+        }
+        let tty_str = std::ffi::CStr::from_ptr(ptr).to_string_lossy();
+        let key = tty_str.trim_start_matches('/').replace('/', "_");
+        let marker = vpngate_core::AppPaths::resolve()
+            .cache_dir
+            .join("ui_socks")
+            .join(format!("{key}.json"));
+        let raw = std::fs::read_to_string(marker).ok()?;
+        let val: serde_json::Value = serde_json::from_str(&raw).ok()?;
+        let sock_str = val.get("sock")?.as_str()?;
+        let p = std::path::PathBuf::from(sock_str);
+        p.exists().then_some(p)
+    }
+}
+
 pub fn request_window_resize(needed_cols: usize, needed_rows: usize) {
     if !dynamic_resize_enabled() || !is_stdout_tty() {
         return;
@@ -221,6 +249,15 @@ pub fn request_window_resize(needed_cols: usize, needed_rows: usize) {
     let (cur_c, cur_r) = get_live_terminal_size(100, 30);
     let target_c = cur_c.max(needed_cols).min(170);
     let target_r = cur_r.max(needed_rows).min(50);
+
+    #[cfg(unix)]
+    if let Some(sock_path) = discover_launcher_resize_sock()
+        && let Ok(dgram) = std::os::unix::net::UnixDatagram::unbound()
+    {
+        let payload = format!(r#"{{"cols":{target_c},"rows":{target_r}}}"#);
+        let _ = dgram.send_to(payload.as_bytes(), sock_path);
+    }
+
     if target_c > cur_c || target_r > cur_r {
         let _ = write!(io::stdout(), "\x1b[8;{target_r};{target_c}t");
         let _ = io::stdout().flush();

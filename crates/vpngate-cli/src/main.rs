@@ -49,6 +49,7 @@ fn help_reference() -> String {
            -S, --status          Show active VPN status & public IP\n\
            -D, --doctor          Run system & crypto diagnostics\n\
            -d, --disconnect      Disconnect active VPN Gate tunnel\n\
+           -w, --window          Launch inside dedicated GNOME GTK/VTE or Windows Terminal window\n\
                --no-resize       Disable dynamic terminal window resize sequences\n\
            -h, --help            Print this help reference\n\
            -V, --version         Print version",
@@ -143,6 +144,68 @@ fn parse_flags(args: &[String]) -> Result<ParsedFlags, String> {
     Ok(out)
 }
 
+fn delegate_to_window_launcher(raw_args: &[String]) -> i32 {
+    let filtered: Vec<String> = raw_args
+        .iter()
+        .filter(|a| a.as_str() != "-w" && a.as_str() != "--window")
+        .cloned()
+        .collect();
+
+    if cfg!(target_os = "windows") {
+        let Ok(self_exe) = env::current_exe() else {
+            err("Could not determine vpngate executable path.");
+            return 1;
+        };
+        if let Some(wt) = vpngate_core::which_bin("wt") {
+            let mut cmd = std::process::Command::new(wt);
+            cmd.args(["--title", "VPN Gate"])
+                .arg(self_exe)
+                .args(&filtered);
+            return i32::from(cmd.spawn().is_err());
+        }
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/c", "start", "VPN Gate"])
+            .arg(self_exe)
+            .args(&filtered);
+        return i32::from(cmd.spawn().is_err());
+    }
+
+    let self_dir = env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
+    let mut cands = Vec::new();
+    if let Some(d) = self_dir {
+        cands.push(d.join("vpngate-launcher"));
+        cands.push(d.join("vpngate-launcher.py"));
+        // Also support running from target/{debug,release}/vpngate inside repo root
+        if let Some(repo_root) = d.parent().and_then(|p| p.parent()) {
+            cands.push(repo_root.join("vpngate-launcher.py"));
+        }
+    }
+    cands.push(std::path::PathBuf::from("/usr/local/bin/vpngate-launcher"));
+    cands.push(std::path::PathBuf::from(
+        "/usr/local/bin/vpngate-launcher.py",
+    ));
+    if let Some(w) = vpngate_core::which_bin("vpngate-launcher")
+        .or_else(|| vpngate_core::which_bin("vpngate-launcher.py"))
+    {
+        cands.push(w);
+    }
+
+    let Some(launcher) = cands.into_iter().find(|p| p.is_file()) else {
+        err("Could not find 'vpngate-launcher'. Run `sh ./install-vpngate.sh` first.");
+        return 1;
+    };
+
+    let mut cmd = std::process::Command::new("python3");
+    cmd.arg(launcher);
+    if !filtered.is_empty() {
+        cmd.arg("--hold");
+    }
+    cmd.args(&filtered);
+    cmd.status().ok().and_then(|s| s.code()).unwrap_or(1)
+}
+
 async fn dispatch() -> io::Result<i32> {
     let raw_args: Vec<String> = env::args().skip(1).collect();
     let paths = AppPaths::resolve();
@@ -153,6 +216,9 @@ async fn dispatch() -> io::Result<i32> {
     }
     if raw_args.len() >= 3 && raw_args[0] == "_ikev1" {
         return Ok(run_ikev1_daemon(&raw_args[1], Path::new(&raw_args[2])).await);
+    }
+    if raw_args.iter().any(|a| a == "-w" || a == "--window") {
+        return Ok(delegate_to_window_launcher(&raw_args));
     }
 
     let help_txt = help_reference();
