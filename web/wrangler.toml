@@ -1,0 +1,20 @@
+# ==============================================================================
+# VPN Gate Connect — Isolated Cloudflare Workers Web Profile Portal (Option A)
+# ==============================================================================
+# Zero-dependency ES Module Worker (`no_bundle = true`):
+# - Requires NO `package.json`, `node_modules`, or build command.
+# - Completely isolated from root `Cargo.toml`, `Cargo.lock`, and desktop
+#   installers (`install-vpngate.sh`, `install-vpngate.ps1`, `install-vpngate.cmd`).
+# - Deploy via Cloudflare Workers Builds (Root directory: `web`, Build command: empty,
+#   Deploy command: `npx wrangler deploy`, Watch paths: `web/**`) or locally via:
+#     cd web && npx wrangler deploy
+# ==============================================================================
+
+name = "vpngate-connect"
+main = "src/worker.js"
+compatibility_date = "2026-10-26"
+no_bundle = true
+workers_dev = true
+
+[observability]
+enabled = true

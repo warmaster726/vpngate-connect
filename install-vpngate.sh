@@ -15,8 +15,12 @@ fi
 MODE="install"
 PURGE_PACKAGES=0
 SKIP_DEPS=0
+KEEP_TOOLCHAIN=0
 REPO_SLUG="${VPNGATE_REPO:-warmaster726/vpngate-connect}"
 HOST_UNAME="$(uname -s 2>/dev/null || echo Linux)"
+CALLER_CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-}"
+CALLER_CARGO_HOME="${CARGO_HOME:-}"
+CALLER_RUSTUP_HOME="${RUSTUP_HOME:-}"
 
 show_help() {
   cat <<'EOF'
@@ -25,14 +29,15 @@ Usage: sh ./install-vpngate.sh [OPTIONS]
 
 Installs, upgrades, or removes the single-binary Rust VPN Gate Desktop Suite
 on Linux (Kali, Debian, Ubuntu, Mint, Pop!_OS, Fedora, Arch) and macOS,
-automatically cleaning residues from previous Python or Rust installations.
+automatically cleaning legacy residues and temporary build/staging artifacts.
 
 Options:
-  (no arguments)       Clean legacy residues, install OS packages, build/install `vpngate`, and run `doctor`
+  (no arguments)       Clean legacy residues, install OS packages, build/install `vpngate`, wipe temp build cache, and run `doctor`
   --uninstall, -u      Disconnect active VPNs, remove binaries/launchers/caches, and verify zero residues
   --purge-packages     With --uninstall on Linux, also purge dedicated L2TP helper package (xl2tpd)
   --skip-apt           Skip system package installation step (alias: --skip-deps)
-  --repo <owner/repo>  GitHub repository slug when downloading release artifacts outside a local checkout
+  --keep-toolchain     If Rust (`cargo`) must be bootstrapped on a clean machine, keep `~/.rustup` & `~/.cargo` instead of auto-removing
+  --repo <owner/repo>  GitHub repository slug when downloading source archive outside a local checkout
   --help, -h           Show this help message and exit
 EOF
 }
@@ -49,6 +54,9 @@ while [ "$#" -gt 0 ]; do
       ;;
     --skip-apt|--skip-deps)
       SKIP_DEPS=1
+      ;;
+    --keep-toolchain)
+      KEEP_TOOLCHAIN=1
       ;;
     --repo)
       [ "$#" -gt 0 ] || { echo "[!] Missing value for --repo" >&2; exit 2; }
@@ -95,6 +103,7 @@ if [ -z "${TARGET_HOME}" ] || [ ! -d "${TARGET_HOME}" ]; then
   fi
 fi
 TARGET_UID="$(id -u "${TARGET_USER}" 2>/dev/null || echo "")"
+TARGET_GID="$(id -g "${TARGET_USER}" 2>/dev/null || echo "")"
 
 if [ "${HOST_UNAME}" = "Darwin" ]; then
   USER_CACHE_DIR="${TARGET_HOME}/Library/Caches/vpngate"
@@ -106,6 +115,7 @@ NL='
 '
 CLEANED_COUNT=0
 CLEANED_LIST=""
+INSTALL_TMP_ROOT=""
 
 record_cleaned() {
   CLEANED_COUNT=$((CLEANED_COUNT + 1))
@@ -120,7 +130,11 @@ install_lf_file() {
   src_file="$1"
   dst_file="$2"
   file_mode="$3"
-  tmp_stage="$(mktemp "/tmp/vpngate-install.XXXXXX")"
+  stage_parent="/tmp"
+  if [ -n "${INSTALL_TMP_ROOT}" ] && [ -d "${INSTALL_TMP_ROOT}" ]; then
+    stage_parent="${INSTALL_TMP_ROOT}"
+  fi
+  tmp_stage="$(mktemp "${stage_parent}/vpngate-stage.XXXXXX")"
   tr -d '\r' < "${src_file}" > "${tmp_stage}"
   sudo install -m "${file_mode}" "${tmp_stage}" "${dst_file}"
   rm -f "${tmp_stage}"
@@ -148,7 +162,7 @@ cleanup_previous_residues() {
 
   # 2. Terminate orphaned background daemons (_monitor, _ikev1, vpngate-launcher, openvpn, xl2tpd, pppd) on Linux
   if [ -d /proc ] && command -v python3 >/dev/null 2>&1; then
-    vg_killed_procs="$(sudo python3 - "$$" "${PPID:-0}" <<'PY' || true
+    vg_killed_procs="$(sudo env PYTHONDONTWRITEBYTECODE=1 python3 -B - "$$" "${PPID:-0}" <<'PY' || true
 import os, signal, sys, time
 
 ignore = {os.getpid(), os.getppid()}
@@ -386,13 +400,19 @@ fi
 # ==============================================================================
 # INSTALL / UPGRADE MODE (`sh ./install-vpngate.sh`)
 # ==============================================================================
-BOOTSTRAP_TMP_DIR=""
-cleanup_bootstrap_tmp() {
-  if [ -n "${BOOTSTRAP_TMP_DIR}" ] && [ -d "${BOOTSTRAP_TMP_DIR}" ]; then
-    rm -rf "${BOOTSTRAP_TMP_DIR}"
+TMP_PARENT="/var/tmp"
+[ -d "${TMP_PARENT}" ] && [ -w "${TMP_PARENT}" ] || TMP_PARENT="/tmp"
+INSTALL_TMP_ROOT="$(mktemp -d "${TMP_PARENT}/vpngate-install.XXXXXX")"
+if [ "$(id -u)" -eq 0 ] && [ -n "${TARGET_UID}" ]; then
+  chown "${TARGET_UID}:${TARGET_GID:-${TARGET_UID}}" "${INSTALL_TMP_ROOT}" 2>/dev/null || chown "${TARGET_USER}" "${INSTALL_TMP_ROOT}" 2>/dev/null || true
+fi
+
+cleanup_install_tmp() {
+  if [ -n "${INSTALL_TMP_ROOT}" ] && [ -e "${INSTALL_TMP_ROOT}" ]; then
+    rm -rf "${INSTALL_TMP_ROOT}" 2>/dev/null || sudo rm -rf "${INSTALL_TMP_ROOT}" 2>/dev/null || true
   fi
 }
-trap cleanup_bootstrap_tmp EXIT INT TERM
+trap cleanup_install_tmp EXIT INT TERM HUP
 
 cleanup_previous_residues
 if [ "${CLEANED_COUNT}" -gt 0 ]; then
@@ -416,7 +436,7 @@ if [ "${SKIP_DEPS}" -eq 0 ]; then
   elif command -v apt-get >/dev/null 2>&1; then
     info "Installing required OpenVPN, L2TP/PPP & C linker packages via apt-get ..."
     sudo apt-get update -qq </dev/null
-    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -o APT::Keep-Downloaded-Packages=false \
       openvpn \
       xl2tpd \
       ppp \
@@ -426,7 +446,7 @@ if [ "${SKIP_DEPS}" -eq 0 ]; then
       tar \
       gcc \
       libc6-dev </dev/null
-    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -o APT::Keep-Downloaded-Packages=false --no-install-recommends \
       python3 \
       python3-gi \
       gir1.2-gtk-3.0 \
@@ -448,49 +468,85 @@ fi
 # 2. Locate local workspace / prebuilt binary, or fetch `main` source archive from GitHub (Release-free!)
 WORK_SRC_DIR="${SCRIPT_DIR}"
 BIN_SRC=""
+HAD_LOCAL_TARGET=0
+if [ -e "${WORK_SRC_DIR}/target" ]; then
+  HAD_LOCAL_TARGET=1
+fi
+HAD_EXISTING_CARGO=0
+USED_EPHEMERAL_RUSTUP=0
 
 if [ ! -f "${WORK_SRC_DIR}/Cargo.toml" ] && [ ! -x "${WORK_SRC_DIR}/vpngate" ]; then
   BRANCH_NAME="${VPNGATE_BRANCH:-main}"
-  TMP_PARENT="/var/tmp"
-  [ -d "${TMP_PARENT}" ] && [ -w "${TMP_PARENT}" ] || TMP_PARENT="/tmp"
-  BOOTSTRAP_TMP_DIR="$(mktemp -d "${TMP_PARENT}/vpngate-src.XXXXXX")"
-  if [ "$(id -u)" -eq 0 ] && [ -n "${TARGET_UID}" ]; then
-    chown "${TARGET_USER}" "${BOOTSTRAP_TMP_DIR}" 2>/dev/null || true
-  fi
+  SRC_STAGE_DIR="${INSTALL_TMP_ROOT}/src"
+  mkdir -p "${SRC_STAGE_DIR}"
   ARCHIVE_URL="https://codeload.github.com/${REPO_SLUG}/tar.gz/refs/heads/${BRANCH_NAME}"
   info "Fetching source archive from ${ARCHIVE_URL} ..."
-  curl -fsSL "${ARCHIVE_URL}" -o "${BOOTSTRAP_TMP_DIR}/src.tar.gz" </dev/null
-  tar -xzf "${BOOTSTRAP_TMP_DIR}/src.tar.gz" -C "${BOOTSTRAP_TMP_DIR}"
-  EXTRACTED_DIR="$(find "${BOOTSTRAP_TMP_DIR}" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+  curl -fsSL "${ARCHIVE_URL}" -o "${SRC_STAGE_DIR}/src.tar.gz" </dev/null
+  tar -xzf "${SRC_STAGE_DIR}/src.tar.gz" -C "${SRC_STAGE_DIR}"
+  rm -f "${SRC_STAGE_DIR}/src.tar.gz"
+  EXTRACTED_DIR="$(find "${SRC_STAGE_DIR}" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
   if [ -z "${EXTRACTED_DIR}" ] || [ ! -f "${EXTRACTED_DIR}/Cargo.toml" ]; then
     warn "Downloaded source archive did not contain Cargo.toml."
     exit 1
   fi
   if [ "$(id -u)" -eq 0 ] && [ -n "${TARGET_UID}" ]; then
-    chown -R "${TARGET_USER}" "${EXTRACTED_DIR}" 2>/dev/null || true
+    chown -R "${TARGET_UID}:${TARGET_GID:-${TARGET_UID}}" "${EXTRACTED_DIR}" 2>/dev/null || chown -R "${TARGET_USER}" "${EXTRACTED_DIR}" 2>/dev/null || true
   fi
   WORK_SRC_DIR="${EXTRACTED_DIR}"
 fi
 
 if [ -f "${WORK_SRC_DIR}/Cargo.toml" ]; then
   CARGO_BIN=""
-  if [ -x "${TARGET_HOME}/.cargo/bin/cargo" ]; then
+  BUILD_RUSTUP_HOME="${CALLER_RUSTUP_HOME}"
+  BUILD_CARGO_HOME="${CALLER_CARGO_HOME}"
+
+  if [ -n "${CALLER_CARGO_HOME}" ] && [ -x "${CALLER_CARGO_HOME}/bin/cargo" ]; then
+    CARGO_BIN="${CALLER_CARGO_HOME}/bin/cargo"
+    HAD_EXISTING_CARGO=1
+  elif [ -x "${TARGET_HOME}/.cargo/bin/cargo" ]; then
     CARGO_BIN="${TARGET_HOME}/.cargo/bin/cargo"
+    HAD_EXISTING_CARGO=1
   elif command -v cargo >/dev/null 2>&1; then
     CARGO_BIN="$(command -v cargo)"
+    HAD_EXISTING_CARGO=1
   fi
 
   if [ -z "${CARGO_BIN}" ]; then
-    info "Rust toolchain ('cargo') not found — installing minimal stable rustup toolchain for ${TARGET_USER} ..."
-    if [ "$(id -u)" -eq 0 ] && [ "${TARGET_USER}" != "root" ]; then
-      sudo -u "${TARGET_USER}" sh -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal' </dev/null
+    if [ "${KEEP_TOOLCHAIN}" -eq 1 ]; then
+      info "Rust toolchain ('cargo') not found — installing minimal stable rustup toolchain for ${TARGET_USER} (--keep-toolchain) ..."
+      if [ "$(id -u)" -eq 0 ] && [ "${TARGET_USER}" != "root" ]; then
+        sudo -u "${TARGET_USER}" sh -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal' </dev/null
+      else
+        sh -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal' </dev/null
+      fi
+      if [ -x "${TARGET_HOME}/.cargo/bin/cargo" ]; then
+        CARGO_BIN="${TARGET_HOME}/.cargo/bin/cargo"
+      elif command -v cargo >/dev/null 2>&1; then
+        CARGO_BIN="$(command -v cargo)"
+      fi
     else
-      sh -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal' </dev/null
-    fi
-    if [ -x "${TARGET_HOME}/.cargo/bin/cargo" ]; then
-      CARGO_BIN="${TARGET_HOME}/.cargo/bin/cargo"
-    elif command -v cargo >/dev/null 2>&1; then
-      CARGO_BIN="$(command -v cargo)"
+      USED_EPHEMERAL_RUSTUP=1
+      BUILD_RUSTUP_HOME="${INSTALL_TMP_ROOT}/rustup"
+      BUILD_CARGO_HOME="${INSTALL_TMP_ROOT}/cargo"
+      mkdir -p "${BUILD_RUSTUP_HOME}" "${BUILD_CARGO_HOME}"
+      if [ "$(id -u)" -eq 0 ] && [ -n "${TARGET_UID}" ]; then
+        chown -R "${TARGET_UID}:${TARGET_GID:-${TARGET_UID}}" "${BUILD_RUSTUP_HOME}" "${BUILD_CARGO_HOME}" 2>/dev/null || chown -R "${TARGET_USER}" "${BUILD_RUSTUP_HOME}" "${BUILD_CARGO_HOME}" 2>/dev/null || true
+      fi
+      info "Rust toolchain ('cargo') not found — bootstrapping ephemeral minimal toolchain (auto-removed after build) ..."
+      if [ "$(id -u)" -eq 0 ] && [ "${TARGET_USER}" != "root" ]; then
+        sudo -u "${TARGET_USER}" env \
+          RUSTUP_HOME="${BUILD_RUSTUP_HOME}" \
+          CARGO_HOME="${BUILD_CARGO_HOME}" \
+          sh -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path' </dev/null
+      else
+        env \
+          RUSTUP_HOME="${BUILD_RUSTUP_HOME}" \
+          CARGO_HOME="${BUILD_CARGO_HOME}" \
+          sh -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path' </dev/null
+      fi
+      if [ -x "${BUILD_CARGO_HOME}/bin/cargo" ]; then
+        CARGO_BIN="${BUILD_CARGO_HOME}/bin/cargo"
+      fi
     fi
   fi
 
@@ -499,15 +555,40 @@ if [ -f "${WORK_SRC_DIR}/Cargo.toml" ]; then
     if [ -f "${WORK_SRC_DIR}/Cargo.lock" ]; then
       LOCKED_FLAG="--locked"
     fi
+    if [ -n "${CALLER_CARGO_TARGET_DIR}" ]; then
+      EFFECTIVE_TARGET_DIR="${CALLER_CARGO_TARGET_DIR}"
+    else
+      EFFECTIVE_TARGET_DIR="${INSTALL_TMP_ROOT}/target"
+      mkdir -p "${EFFECTIVE_TARGET_DIR}"
+      if [ "$(id -u)" -eq 0 ] && [ -n "${TARGET_UID}" ]; then
+        chown -R "${TARGET_UID}:${TARGET_GID:-${TARGET_UID}}" "${EFFECTIVE_TARGET_DIR}" 2>/dev/null || chown -R "${TARGET_USER}" "${EFFECTIVE_TARGET_DIR}" 2>/dev/null || true
+      fi
+    fi
+
+    CARGO_DIR_BIN="$(dirname "${CARGO_BIN}")"
     info "Building optimized single-binary 'vpngate' from Rust workspace (${WORK_SRC_DIR}) ..."
     if [ "$(id -u)" -eq 0 ] && [ "${TARGET_USER}" != "root" ]; then
       # shellcheck disable=SC2086
-      sudo -u "${TARGET_USER}" env PATH="${TARGET_HOME}/.cargo/bin:${PATH}" "${CARGO_BIN}" build --release ${LOCKED_FLAG} -p vpngate-cli --manifest-path "${WORK_SRC_DIR}/Cargo.toml"
+      sudo -u "${TARGET_USER}" env \
+        PATH="${CARGO_DIR_BIN}:${TARGET_HOME}/.cargo/bin:${PATH}" \
+        ${BUILD_RUSTUP_HOME:+RUSTUP_HOME="${BUILD_RUSTUP_HOME}"} \
+        ${BUILD_CARGO_HOME:+CARGO_HOME="${BUILD_CARGO_HOME}"} \
+        "${CARGO_BIN}" build --release ${LOCKED_FLAG} \
+        -p vpngate-cli \
+        --manifest-path "${WORK_SRC_DIR}/Cargo.toml" \
+        --target-dir "${EFFECTIVE_TARGET_DIR}"
     else
       # shellcheck disable=SC2086
-      "${CARGO_BIN}" build --release ${LOCKED_FLAG} -p vpngate-cli --manifest-path "${WORK_SRC_DIR}/Cargo.toml"
+      env \
+        PATH="${CARGO_DIR_BIN}:${PATH}" \
+        ${BUILD_RUSTUP_HOME:+RUSTUP_HOME="${BUILD_RUSTUP_HOME}"} \
+        ${BUILD_CARGO_HOME:+CARGO_HOME="${BUILD_CARGO_HOME}"} \
+        "${CARGO_BIN}" build --release ${LOCKED_FLAG} \
+        -p vpngate-cli \
+        --manifest-path "${WORK_SRC_DIR}/Cargo.toml" \
+        --target-dir "${EFFECTIVE_TARGET_DIR}"
     fi
-    BIN_SRC="${WORK_SRC_DIR}/target/release/vpngate"
+    BIN_SRC="${EFFECTIVE_TARGET_DIR}/release/vpngate"
   elif [ -x "${WORK_SRC_DIR}/target/release/vpngate" ]; then
     BIN_SRC="${WORK_SRC_DIR}/target/release/vpngate"
   fi
@@ -549,9 +630,39 @@ if [ "${HOST_UNAME}" = "Linux" ] && [ -f "${WORK_SRC_DIR}/vpngate-launcher.py" ]
   fi
 fi
 
+# 3. Post-install cleanup & host environment cleanliness verification
+cleanup_install_tmp
+if [ "$(id -u)" -eq 0 ] && [ "${TARGET_USER}" != "root" ]; then
+  if [ -d "${USER_CACHE_DIR}" ] && [ -n "${TARGET_UID}" ]; then
+    chown -R "${TARGET_UID}:${TARGET_GID:-${TARGET_UID}}" "${USER_CACHE_DIR}" 2>/dev/null || chown -R "${TARGET_USER}" "${USER_CACHE_DIR}" 2>/dev/null || true
+  fi
+  rmdir /root/.cache/vpngate 2>/dev/null || true
+fi
+
+POST_CLEAN_ISSUES=""
+if [ -n "${INSTALL_TMP_ROOT}" ] && [ -e "${INSTALL_TMP_ROOT}" ]; then
+  POST_CLEAN_ISSUES="${POST_CLEAN_ISSUES} ${INSTALL_TMP_ROOT}"
+fi
+if [ "${HAD_LOCAL_TARGET}" -eq 0 ] && [ -z "${CALLER_CARGO_TARGET_DIR}" ] && [ -e "${SCRIPT_DIR}/target" ]; then
+  POST_CLEAN_ISSUES="${POST_CLEAN_ISSUES} ${SCRIPT_DIR}/target"
+fi
+if [ "${HAD_EXISTING_CARGO}" -eq 0 ] && [ "${USED_EPHEMERAL_RUSTUP}" -eq 1 ]; then
+  for eph_dir in "${TARGET_HOME}/.rustup" "${TARGET_HOME}/.cargo"; do
+    if [ -e "${eph_dir}" ]; then
+      POST_CLEAN_ISSUES="${POST_CLEAN_ISSUES} ${eph_dir}"
+    fi
+  done
+fi
+
+if [ -z "${POST_CLEAN_ISSUES}" ]; then
+  ok "Post-install cleanup verified: temporary build & staging artifacts removed (host environment clean)."
+else
+  warn "Post-install check noticed leftover temporary path(s):${POST_CLEAN_ISSUES}"
+fi
+
 echo ""
 ok "Installation complete! Running 'vpngate doctor' readiness check:"
-/usr/local/bin/vpngate doctor --no-resize || true
+sudo env VPNGATE_CACHE_DIR="${USER_CACHE_DIR}" /usr/local/bin/vpngate doctor --no-resize || true
 echo ""
 ok "Launch interactive console anytime with:  vpngate"
 if [ "${HOST_UNAME}" = "Linux" ]; then

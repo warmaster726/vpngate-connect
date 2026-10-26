@@ -66,3 +66,9 @@ __pycache__/
 .vscode/*
 !.vscode/extensions.json
 !.vscode/settings.json
+
+# --- 5. Cloudflare Workers Local Dev State (web/) ---
+web/.wrangler/
+web/.dev.vars
+web/.dev.vars.*
+web/node_modules/

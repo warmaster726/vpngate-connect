@@ -968,7 +968,6 @@ pub fn cmd_watchdog(paths: &AppPaths, mode_raw: &str) -> i32 {
 
 pub fn cmd_doctor(paths: &AppPaths) -> io::Result<i32> {
     clear_screen_if_tty();
-    let _ = paths.ensure_dirs();
     let os_label = detect_host_os_label();
     let mut lines: Vec<Option<String>> = vec![
         Some(format!(

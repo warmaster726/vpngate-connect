@@ -1,12 +1,13 @@
 # Normalize text files cleanly across Linux, macOS, and Windows 11 checkouts
 * text=auto
 
-# Keep Unix LF endings on Rust, Cargo, POSIX shell, Python launcher, XDG desktop entries, and docs
+# Keep Unix LF endings on Rust, Cargo, POSIX shell, Python launcher, Web Worker, XDG desktop entries, and docs
 *.rs      text eol=lf
 *.toml    text eol=lf
 *.lock    text eol=lf
 *.sh      text eol=lf
 *.py      text eol=lf
+*.js      text eol=lf
 *.desktop text eol=lf
 *.md      text eol=lf
 LICENSE   text eol=lf

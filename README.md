@@ -116,8 +116,11 @@ vpngate-connect/
 ├── vpngate.desktop        # XDG Desktop Entry + GNOME Dash Quick Actions
 ├── install-vpngate.sh     # POSIX /bin/sh Linux & macOS installer, residue cleaner & uninstaller
 ├── install-vpngate.ps1    # Windows 11 PowerShell installer, NAT-T & Zero-Prompt OpenVPN configurator
-└── install-vpngate.cmd    # Windows 11 UAC auto-elevating Batch wrapper
+├── install-vpngate.cmd    # Windows 11 UAC auto-elevating Batch wrapper
+└── web/                   # Isolated Cloudflare Workers Web Profile Portal (.mobileconfig & .ovpn export)
 ```
+
+> **Isolation Note:** `web/` is a standalone zero-dependency Cloudflare Worker (`wrangler.toml` + `src/worker.js`) for browser-based iOS/Android `.mobileconfig` and `.ovpn` profile provisioning. Desktop installers (`install-vpngate.sh`, `install-vpngate.ps1`, `install-vpngate.cmd`) compile strictly `-p vpngate-cli` inside a temporary build root and never build, run, or copy `web/`.
 
 ---
 

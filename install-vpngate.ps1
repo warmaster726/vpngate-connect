@@ -4,10 +4,11 @@
 .DESCRIPTION
     - Install / Upgrade (default):
         Cleans legacy Python/Rust residues, builds or installs native `vpngate.exe` into
-        `%LOCALAPPDATA%\Programs\VPNGate\vpngate.exe`, updates User PATH, configures Windows 11
-        L2TP/IPsec NAT-T (`AssumeUDPEncapsulationContextOnSendRule = 2`), installs/hardens
-        Zero-Prompt headless OpenVPN Community (`OpenVPN.OpenVPN`), creates Start Menu shortcut,
-        and runs `vpngate doctor`.
+        `%LOCALAPPDATA%\Programs\VPNGate\vpngate.exe` using an isolated temporary build root,
+        wipes all temporary Cargo/source/toolchain staging artifacts, updates User PATH,
+        configures Windows 11 L2TP/IPsec NAT-T (`AssumeUDPEncapsulationContextOnSendRule = 2`),
+        installs/hardens Zero-Prompt headless OpenVPN Community (`OpenVPN.OpenVPN`), creates
+        Start Menu shortcut, verifies host environment cleanliness, and runs `vpngate doctor`.
     - Uninstall (`--uninstall` or `-Uninstall`):
         Disconnects active VPNs, restores NAT-T/Firewall/PATH settings, removes binaries & caches,
         and verifies zero remaining residues.
@@ -20,6 +21,8 @@ param(
     [switch]$InstallOpenVPN,
 
     [switch]$SkipOpenVPN,
+
+    [switch]$KeepToolchain,
 
     [string]$Repo = 'warmaster726/vpngate-connect',
 
@@ -50,16 +53,18 @@ function Show-Usage {
 Usage: .\install-vpngate.ps1 [OPTIONS]
 
 Installs, upgrades, or removes single-binary Rust `vpngate.exe` on Windows 11
-(zero Python dependency), configuring L2TP/IPsec NAT-T and headless OpenVPN Community.
+(zero Python dependency), configuring L2TP/IPsec NAT-T and headless OpenVPN Community
+while keeping the host environment free of temporary build caches.
 
 Options:
-  (no arguments)               Clean legacy residues, build/install vpngate.exe & configure headless OpenVPN
+  (no arguments)               Clean legacy residues, build/install vpngate.exe, wipe temp build cache & configure OpenVPN
   --uninstall, -Uninstall, -u  Disconnect active VPNs and completely remove vpngate.exe & caches
   --restore-natt               With --uninstall, restore previous NAT-T registry value
   --user-only                  Install/uninstall without Administrator (skips HKLM/Service/MSI steps)
   --skip-openvpn               Skip automatic OpenVPN Community winget installation if missing
   --install-openvpn            Explicitly install/repair OpenVPN Community via winget
-  --repo <owner/repo>          GitHub repository slug when downloading release binary outside a checkout
+  --keep-toolchain             If Rust (`cargo.exe`) must be bootstrapped on a clean PC, keep `.rustup` & `.cargo`
+  --repo <owner/repo>          GitHub repository slug when downloading source archive outside a checkout
   --help, -Help, -h            Show this help message and exit
 "@
 }
@@ -77,6 +82,7 @@ if ($RemainingArgs) {
             '--user-only'       { $UserOnly = $true }
             '--install-openvpn' { $InstallOpenVPN = $true }
             '--skip-openvpn'    { $SkipOpenVPN = $true }
+            '--keep-toolchain'  { $KeepToolchain = $true }
             '--repo'            { if ($idx + 1 -lt $RemainingArgs.Count) { $idx++; $Repo = $RemainingArgs[$idx] } }
             '--help'            { $Help = $true }
             '-h'                { $Help = $true }
@@ -196,9 +202,19 @@ if ($Uninstall) {
 $SourceDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 Invoke-VPNGateResidueCleanup -Mode 'Install'
 
-# 1. Resolve or build `vpngate.exe` (Release-free: local checkout, prebuilt exe, or GitHub `main` zip archive)
+# 1. Resolve or build `vpngate.exe` inside an isolated temporary root so zero build bloat remains
 $BinSource = $null
-$TempBuildRoot = $null
+$TargetExe = Join-Path $InstallDir 'vpngate.exe'
+$TempInstallRoot = Join-Path ([System.IO.Path]::GetTempPath()) "vpngate-install-$PID"
+$HadLocalTarget = Test-Path -LiteralPath (Join-Path $SourceDir 'target')
+$CallerCargoTargetDir = $env:CARGO_TARGET_DIR
+$OrigRustupHome = $env:RUSTUP_HOME
+$OrigCargoHome = $env:CARGO_HOME
+$HadExistingCargo = $false
+$UsedEphemeralRustup = $false
+
+New-Item -ItemType Directory -Path $TempInstallRoot -Force | Out-Null
+
 try {
     $WorkDir = $SourceDir
     $CargoToml = Join-Path $WorkDir 'Cargo.toml'
@@ -207,22 +223,23 @@ try {
     if (-not (Test-Path -LiteralPath $CargoToml) -and -not (Test-Path -LiteralPath $LocalPrebuilt)) {
         $BranchName = if ($env:VPNGATE_BRANCH) { $env:VPNGATE_BRANCH } else { 'main' }
         $ZipUrl = "https://codeload.github.com/$Repo/zip/refs/heads/$BranchName"
-        $TempBuildRoot = Join-Path ([System.IO.Path]::GetTempPath()) "vpngate-src-$PID"
-        New-Item -ItemType Directory -Path $TempBuildRoot -Force | Out-Null
-        $ZipPath = Join-Path $TempBuildRoot 'src.zip'
+        $SrcStageDir = Join-Path $TempInstallRoot 'src'
+        New-Item -ItemType Directory -Path $SrcStageDir -Force | Out-Null
+        $ZipPath = Join-Path $SrcStageDir 'src.zip'
         Write-Info "Downloading source archive from $ZipUrl ..."
         Invoke-WebRequest -Uri $ZipUrl -UseBasicParsing -OutFile $ZipPath
-        Expand-Archive -LiteralPath $ZipPath -DestinationPath $TempBuildRoot -Force
-        $SubDir = Get-ChildItem -LiteralPath $TempBuildRoot -Directory | Select-Object -First 1
+        Expand-Archive -LiteralPath $ZipPath -DestinationPath $SrcStageDir -Force
+        Remove-Item -LiteralPath $ZipPath -Force -ErrorAction SilentlyContinue
+        $SubDir = Get-ChildItem -LiteralPath $SrcStageDir -Directory | Select-Object -First 1
         if (-not $SubDir) { throw "Downloaded source archive was empty." }
         $WorkDir = $SubDir.FullName
         $CargoToml = Join-Path $WorkDir 'Cargo.toml'
     }
 
     if (Test-Path -LiteralPath $CargoToml) {
-        $CargoBinDir = Join-Path $HOME '.cargo\bin'
-        if ((Test-Path -LiteralPath $CargoBinDir) -and ($env:Path -notlike "*$CargoBinDir*")) {
-            $env:Path = "$CargoBinDir;$env:Path"
+        $DefaultCargoBinDir = Join-Path $HOME '.cargo\bin'
+        if ((Test-Path -LiteralPath (Join-Path $DefaultCargoBinDir 'cargo.exe')) -and ($env:Path -notlike "*$DefaultCargoBinDir*")) {
+            $env:Path = "$DefaultCargoBinDir;$env:Path"
         }
 
         # Detect whether Visual Studio C++ Build Tools (MSVC cl.exe/link.exe) are present;
@@ -239,31 +256,56 @@ try {
         }
 
         $CargoCmd = Get-Command 'cargo.exe' -ErrorAction SilentlyContinue
-        if (-not $CargoCmd) {
-            $RustupInit = Join-Path ([System.IO.Path]::GetTempPath()) "rustup-init-$PID.exe"
+        if ($CargoCmd) {
+            $HadExistingCargo = $true
+        } else {
+            $RustupInit = Join-Path $TempInstallRoot 'rustup-init.exe'
             $DefaultHost = if ($HasMsvc) { 'x86_64-pc-windows-msvc' } else { 'x86_64-pc-windows-gnu' }
-            Write-Info "Rust toolchain not found — bootstrapping minimal Rust ($DefaultHost) via rustup.rs ..."
             Invoke-WebRequest -Uri 'https://win.rustup.rs/x86_64' -UseBasicParsing -OutFile $RustupInit
-            & $RustupInit -y --profile minimal --default-host $DefaultHost
+
+            if ($KeepToolchain) {
+                Write-Info "Rust toolchain not found — installing minimal Rust ($DefaultHost) via rustup.rs (--keep-toolchain) ..."
+                & $RustupInit -y --profile minimal --default-host $DefaultHost
+                $ActiveCargoBinDir = $DefaultCargoBinDir
+            } else {
+                $UsedEphemeralRustup = $true
+                $env:RUSTUP_HOME = Join-Path $TempInstallRoot 'rustup'
+                $env:CARGO_HOME  = Join-Path $TempInstallRoot 'cargo'
+                New-Item -ItemType Directory -Path $env:RUSTUP_HOME -Force | Out-Null
+                New-Item -ItemType Directory -Path $env:CARGO_HOME -Force | Out-Null
+                Write-Info "Rust toolchain not found — bootstrapping ephemeral minimal Rust ($DefaultHost, auto-removed after build) ..."
+                & $RustupInit -y --profile minimal --no-modify-path --default-host $DefaultHost
+                $ActiveCargoBinDir = Join-Path $env:CARGO_HOME 'bin'
+            }
+
             Remove-Item -LiteralPath $RustupInit -Force -ErrorAction SilentlyContinue
-            $env:Path = "$CargoBinDir;$env:Path"
+            if ($env:Path -notlike "*$ActiveCargoBinDir*") {
+                $env:Path = "$ActiveCargoBinDir;$env:Path"
+            }
             $CargoCmd = Get-Command 'cargo.exe' -ErrorAction SilentlyContinue
         }
+
         if (-not $CargoCmd) {
             throw "Rust ('cargo.exe') is required to build vpngate.exe from source. Install from https://rustup.rs and re-run."
+        }
+
+        $EffectiveTargetDir = if ($CallerCargoTargetDir -and $CallerCargoTargetDir.Trim()) {
+            $CallerCargoTargetDir.Trim()
+        } else {
+            Join-Path $TempInstallRoot 'target'
         }
 
         $BuildArgs = @('build', '--release')
         if (Test-Path -LiteralPath (Join-Path $WorkDir 'Cargo.lock')) {
             $BuildArgs += '--locked'
         }
-        $BuildArgs += @('-p', 'vpngate-cli', '--manifest-path', $CargoToml)
+        $BuildArgs += @('-p', 'vpngate-cli', '--manifest-path', $CargoToml, '--target-dir', $EffectiveTargetDir)
 
         if ($HasMsvc) {
             Write-Info "Building optimized native 'vpngate.exe' via Cargo (MSVC toolchain) ..."
             & $CargoCmd.Source @BuildArgs
             if ($LASTEXITCODE -ne 0) { throw "Cargo release build failed." }
-            $BinSource = Join-Path $WorkDir 'target\release\vpngate.exe'
+            $BinSource = Join-Path $EffectiveTargetDir 'release\vpngate.exe'
         } else {
             # Ensure gcc.exe / MinGW-w64 is present for `x86_64-pc-windows-gnu` (`ring` C objects + linking)
             if (-not (Get-Command 'gcc.exe' -ErrorAction SilentlyContinue)) {
@@ -290,7 +332,8 @@ try {
                     $env:Path = "$($foundGcc.DirectoryName);$env:Path"
                 }
             }
-            $RustupExe = Join-Path $CargoBinDir 'rustup.exe'
+            $RustupDir = Split-Path -Parent $CargoCmd.Source
+            $RustupExe = Join-Path $RustupDir 'rustup.exe'
             if (Test-Path -LiteralPath $RustupExe) {
                 & $RustupExe toolchain install stable-x86_64-pc-windows-gnu --profile minimal --no-self-update
             }
@@ -298,7 +341,7 @@ try {
             $GnuArgs = @('+stable-x86_64-pc-windows-gnu') + $BuildArgs + @('--target', 'x86_64-pc-windows-gnu')
             & $CargoCmd.Source @GnuArgs
             if ($LASTEXITCODE -ne 0) { throw "Cargo GNU release build failed." }
-            $BinSource = Join-Path $WorkDir 'target\x86_64-pc-windows-gnu\release\vpngate.exe'
+            $BinSource = Join-Path $EffectiveTargetDir 'x86_64-pc-windows-gnu\release\vpngate.exe'
         }
     } elseif (Test-Path -LiteralPath $LocalPrebuilt) {
         $BinSource = $LocalPrebuilt
@@ -309,14 +352,38 @@ try {
     }
 
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-    $TargetExe = Join-Path $InstallDir 'vpngate.exe'
     Copy-Item -LiteralPath $BinSource -Destination $TargetExe -Force
     try { Unblock-File -LiteralPath $TargetExe -ErrorAction SilentlyContinue } catch {}
     Write-Ok "Installed native single-binary '$TargetExe'"
 } finally {
-    if ($TempBuildRoot -and (Test-Path -LiteralPath $TempBuildRoot)) {
-        Remove-Item -LiteralPath $TempBuildRoot -Recurse -Force -ErrorAction SilentlyContinue
+    $env:RUSTUP_HOME = $OrigRustupHome
+    $env:CARGO_HOME  = $OrigCargoHome
+    if ($UsedEphemeralRustup) {
+        $EphBin = Join-Path (Join-Path $TempInstallRoot 'cargo') 'bin'
+        $env:Path = (($env:Path -split ';') | Where-Object { $_ -and ($_.TrimEnd('\') -ine $EphBin.TrimEnd('\')) }) -join ';'
     }
+    if ($TempInstallRoot -and (Test-Path -LiteralPath $TempInstallRoot)) {
+        Remove-Item -LiteralPath $TempInstallRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Verify post-build host environment cleanliness
+$PostCleanIssues = New-Object System.Collections.Generic.List[string]
+if ($TempInstallRoot -and (Test-Path -LiteralPath $TempInstallRoot)) {
+    $PostCleanIssues.Add($TempInstallRoot)
+}
+if ((-not $HadLocalTarget) -and (-not $CallerCargoTargetDir) -and (Test-Path -LiteralPath (Join-Path $SourceDir 'target'))) {
+    $PostCleanIssues.Add((Join-Path $SourceDir 'target'))
+}
+if ((-not $HadExistingCargo) -and $UsedEphemeralRustup) {
+    foreach ($ephUserDir in @((Join-Path $HOME '.rustup'), (Join-Path $HOME '.cargo'))) {
+        if (Test-Path -LiteralPath $ephUserDir) { $PostCleanIssues.Add($ephUserDir) }
+    }
+}
+if ($PostCleanIssues.Count -eq 0) {
+    Write-Ok "Post-install cleanup verified: temporary build & staging artifacts removed (Windows environment clean)."
+} else {
+    Write-Warn "Post-install check noticed leftover temporary path(s): $($PostCleanIssues -join ', ')"
 }
 
 # 2. Ensure %LOCALAPPDATA%\Programs\VPNGate is in User PATH
@@ -338,7 +405,9 @@ if (-not $Seen) {
     [Environment]::SetEnvironmentVariable('Path', ($Entries -join ';'), 'User')
     Write-Ok "Added '$InstallDir' to User PATH."
 }
-$env:Path = "$InstallDir;$env:Path"
+if ($env:Path -notlike "*$NormInstall*") {
+    $env:Path = "$InstallDir;$env:Path"
+}
 
 # 3. Configure Windows 11 NAT-T L2TP/IPsec registry rule (AssumeUDPEncapsulationContextOnSendRule = 2)
 if ($IsAdmin -and -not $UserOnly) {
@@ -371,6 +440,8 @@ Get-Process -Name 'openvpn-gui' -ErrorAction SilentlyContinue | Stop-Process -Fo
 Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'OPENVPN-GUI' -ErrorAction SilentlyContinue
 
 # 5. Create Start Menu shortcut
+$WshShell = $null
+$Shortcut = $null
 try {
     $WshShell = New-Object -ComObject WScript.Shell
     $Shortcut = $WshShell.CreateShortcut($StartMenuLnk)
@@ -379,7 +450,10 @@ try {
     $Shortcut.Description = 'VPN Gate Connect Console'
     $Shortcut.Save()
     Write-Ok "Created Start Menu shortcut: $StartMenuLnk"
-} catch {}
+} catch {} finally {
+    if ($Shortcut) { try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($Shortcut) | Out-Null } catch {} }
+    if ($WshShell) { try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($WshShell) | Out-Null } catch {} }
+}
 
 Write-Host ""
 Write-Ok "Installation complete! Running 'vpngate doctor' readiness check:"
