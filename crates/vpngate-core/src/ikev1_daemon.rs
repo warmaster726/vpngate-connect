@@ -432,23 +432,12 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
-struct QuickModeKeys {
-    spi_in: u32,
-    spi_out: u32,
-    esp_cipher: IkeCipher,
-    esp_alg_label: &'static str,
-    xfrm_enc_alg: &'static str,
-    enc_out: Vec<u8>,
-    auth_out: Vec<u8>,
-    enc_in: Vec<u8>,
-    auth_in: Vec<u8>,
-}
-
-fn negotiate_quick_mode_keys(
+fn negotiate_quick_mode_and_install_xfrm(
     s4500: &UdpSocket,
     p1: &Phase1Session,
     am3_pkt: Option<&[u8]>,
-) -> std::result::Result<QuickModeKeys, String> {
+    update_policies: bool,
+) -> std::result::Result<(u32, u32, String), String> {
     let mut rng = rand::thread_rng();
     let mut mid_b = [0u8; 4];
     let mut spi_b = [0u8; 4];
@@ -627,12 +616,12 @@ fn negotiate_quick_mode_keys(
     let esp_kbits = *p2_r_attrs
         .get(&6)
         .unwrap_or(&(if esp_trans_id == 3 { 192 } else { 256 }));
-    let (esp_cipher, esp_alg, esp_klen, xfrm_enc_alg) = if esp_trans_id == 12 && esp_kbits == 256 {
-        (IkeCipher::Aes256, "aes256", 32usize, "cbc(aes)")
+    let (esp_alg, esp_klen, xfrm_enc_alg) = if esp_trans_id == 12 && esp_kbits == 256 {
+        ("aes256", 32usize, "cbc(aes)")
     } else if esp_trans_id == 12 {
-        (IkeCipher::Aes128, "aes128", 16usize, "cbc(aes)")
+        ("aes128", 16usize, "cbc(aes)")
     } else {
-        (IkeCipher::Des3, "3des", 24usize, "cbc(des3_ede)")
+        ("3des", 24usize, "cbc(des3_ede)")
     };
 
     // Send QM3 [HASH(3)]
@@ -686,34 +675,6 @@ fn negotiate_quick_mode_keys(
     );
     let (enc_out, auth_out) = (&km_out[..esp_klen], &km_out[esp_klen..esp_klen + 20]);
     let (enc_in, auth_in) = (&km_in[..esp_klen], &km_in[esp_klen..esp_klen + 20]);
-
-    Ok(QuickModeKeys {
-        spi_in,
-        spi_out,
-        esp_cipher,
-        esp_alg_label: esp_alg,
-        xfrm_enc_alg,
-        enc_out: enc_out.to_vec(),
-        auth_out: auth_out.to_vec(),
-        enc_in: enc_in.to_vec(),
-        auth_in: auth_in.to_vec(),
-    })
-}
-
-fn negotiate_quick_mode_and_install_xfrm(
-    s4500: &UdpSocket,
-    p1: &Phase1Session,
-    am3_pkt: Option<&[u8]>,
-    update_policies: bool,
-) -> std::result::Result<(u32, u32, String), String> {
-    let qm = negotiate_quick_mode_keys(s4500, p1, am3_pkt)?;
-    let spi_in = qm.spi_in;
-    let spi_out = qm.spi_out;
-    let xfrm_enc_alg = qm.xfrm_enc_alg;
-    let enc_out = &qm.enc_out;
-    let auth_out = &qm.auth_out;
-    let enc_in = &qm.enc_in;
-    let auth_in = &qm.auth_in;
 
     let state_verb = if update_policies { "replace" } else { "add" };
     let loc_s = p1.local_ip.to_string();
@@ -881,7 +842,7 @@ fn negotiate_quick_mode_and_install_xfrm(
         }
     }
 
-    Ok((spi_in, spi_out, qm.esp_alg_label.to_string()))
+    Ok((spi_in, spi_out, esp_alg.to_string()))
 }
 
 /// Entry point for `vpngate _ikev1 <server_ip> <state_file>` on Linux.
@@ -1313,389 +1274,6 @@ fn ikev1_daemon_blocking(
     let _ = send_informational(&s4500, &p1, 12, &del_ike);
 
     Ok(())
-}
-
-/// User-space negotiated IKEv1 + ESP-in-UDP (RFC 3948) session for Android `VpnService` / Mobile `TUN`
-/// where kernel `XFRM` is unavailable to unprivileged mobile applications.
-pub struct UserspaceIkeEspSession {
-    pub s4500: UdpSocket,
-    pub local_ip: Ipv4Addr,
-    pub local_port: u16,
-    pub server_ip: Ipv4Addr,
-    pub spi_in: u32,
-    pub spi_out: u32,
-    pub esp_cipher: IkeCipher,
-    pub esp_alg_label: String,
-    pub enc_out: Vec<u8>,
-    pub auth_out: Vec<u8>,
-    pub enc_in: Vec<u8>,
-    pub auth_in: Vec<u8>,
-    p1: Phase1Session,
-}
-
-impl UserspaceIkeEspSession {
-    /// Responds to incoming non-ESP (`[0, 0, 0, 0]` prefix) IKEv1 Informational DPD requests.
-    pub fn handle_non_esp_ike_packet(&self, raw: &[u8]) {
-        if raw.len() < 32 || raw[0..4] != [0, 0, 0, 0] {
-            return;
-        }
-        let ike = &raw[4..];
-        let blen = self.p1.alg.block_len();
-        if ike[18] == 5
-            && (ike[19] & 1) != 0
-            && ike[0..8] == self.p1.ck_i
-            && ike[8..16] == self.p1.ck_r
-        {
-            let rx_mid = u32::from_be_bytes([ike[20], ike[21], ike[22], ike[23]]);
-            let enc_body = &ike[28..];
-            if !enc_body.is_empty() && enc_body.len().is_multiple_of(blen) {
-                let mut iv_in = self.p1.iv.clone();
-                iv_in.extend_from_slice(&rx_mid.to_be_bytes());
-                let rx_iv = &self.p1.hash.digest(&iv_in)[..blen];
-                if let Ok(dec) = ike_cbc_crypt(self.p1.alg, &self.p1.key, rx_iv, enc_body, false) {
-                    for (pt, b) in ike_parse_payloads(&dec, ike[16]) {
-                        if pt == 11 && b.len() >= 8 {
-                            let spisz = b[5] as usize;
-                            let mtype = u16::from_be_bytes([b[6], b[7]]);
-                            if mtype == 36136 && b.len() >= 8 + spisz + 4 {
-                                let seq = &b[8 + spisz..8 + spisz + 4];
-                                let mut ack = Vec::with_capacity(28);
-                                ack.extend_from_slice(&1u32.to_be_bytes());
-                                ack.push(1);
-                                ack.push(16);
-                                ack.extend_from_slice(&36137u16.to_be_bytes());
-                                ack.extend_from_slice(&self.p1.ck_i);
-                                ack.extend_from_slice(&self.p1.ck_r);
-                                ack.extend_from_slice(seq);
-                                let _ = send_informational(&self.s4500, &self.p1, 11, &ack);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Sends clean RFC 2408 ESP & ISAKMP Delete-SA notifications on tunnel disconnect.
-    pub fn send_delete_sa(&self) {
-        let mut del_esp = Vec::with_capacity(12);
-        del_esp.extend_from_slice(&1u32.to_be_bytes());
-        del_esp.push(3);
-        del_esp.push(4);
-        del_esp.extend_from_slice(&1u16.to_be_bytes());
-        del_esp.extend_from_slice(&self.spi_in.to_be_bytes());
-        let _ = send_informational(&self.s4500, &self.p1, 12, &del_esp);
-
-        let mut del_ike = Vec::with_capacity(24);
-        del_ike.extend_from_slice(&1u32.to_be_bytes());
-        del_ike.push(1);
-        del_ike.push(16);
-        del_ike.extend_from_slice(&1u16.to_be_bytes());
-        del_ike.extend_from_slice(&self.p1.ck_i);
-        del_ike.extend_from_slice(&self.p1.ck_r);
-        let _ = send_informational(&self.s4500, &self.p1, 12, &del_ike);
-    }
-}
-
-#[cfg(unix)]
-fn socket_raw_fd(sock: &UdpSocket) -> i32 {
-    use std::os::fd::AsRawFd;
-    sock.as_raw_fd()
-}
-
-#[cfg(not(unix))]
-fn socket_raw_fd(_sock: &UdpSocket) -> i32 {
-    -1
-}
-
-/// Negotiates IKEv1 Aggressive Mode (`PSK == "vpn"`) + Phase 2 Quick Mode in user space
-/// (without installing kernel `XFRM` SAs or setting `UDP_ENCAP_ESPINUDP`), invoking `protect_fd`
-/// on every outbound UDP socket for Android `VpnService.protect(fd)` routing-loop immunity.
-pub fn negotiate_userspace_ikev1_esp(
-    server_ip: Ipv4Addr,
-    protect_fd: Option<&dyn Fn(i32) -> bool>,
-) -> std::result::Result<UserspaceIkeEspSession, String> {
-    let probe_sock = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
-    if let Some(protect) = protect_fd {
-        let fd = socket_raw_fd(&probe_sock);
-        if fd >= 0 && !protect(fd) {
-            return Err("Android VpnService.protect() rejected probe UDP socket".to_string());
-        }
-    }
-    probe_sock
-        .connect(SocketAddr::new(IpAddr::V4(server_ip), 4500))
-        .map_err(|e| e.to_string())?;
-    let IpAddr::V4(local_ip) = probe_sock.local_addr().map_err(|e| e.to_string())?.ip() else {
-        return Err("Failed to determine IPv4 local source address".to_string());
-    };
-    drop(probe_sock);
-
-    let s4500 = UdpSocket::bind(SocketAddr::new(IpAddr::V4(local_ip), 0))
-        .map_err(|e| format!("Failed binding UDP NAT-T socket: {e}"))?;
-    if let Some(protect) = protect_fd {
-        let fd = socket_raw_fd(&s4500);
-        if fd >= 0 && !protect(fd) {
-            return Err("Android VpnService.protect() rejected NAT-T UDP socket".to_string());
-        }
-    }
-    let local_port = s4500.local_addr().map_err(|e| e.to_string())?.port();
-    s4500
-        .connect(SocketAddr::new(IpAddr::V4(server_ip), 4500))
-        .map_err(|e| e.to_string())?;
-
-    let p = BigUint::parse_bytes(MODP_1024_HEX.as_bytes(), 16).ok_or("MODP-1024 parse error")?;
-    let mut rng = rand::thread_rng();
-    let mut ck_i = [0u8; 8];
-    let mut priv_b = [0u8; 32];
-    let mut ni = [0u8; 20];
-    rng.fill_bytes(&mut ck_i);
-    rng.fill_bytes(&mut priv_b);
-    priv_b[31] |= 1;
-    rng.fill_bytes(&mut ni);
-
-    let priv_x = BigUint::from_bytes_be(&priv_b);
-    let gxi_raw = BigUint::from(2u32).modpow(&priv_x, &p).to_bytes_be();
-    let mut gxi = vec![0u8; 128];
-    let off_gxi = 128usize.saturating_sub(gxi_raw.len());
-    gxi[off_gxi..].copy_from_slice(&gxi_raw[gxi_raw.len().saturating_sub(128)..]);
-
-    let mut idi_body = vec![1u8, 17, 0, 0];
-    idi_body.extend_from_slice(&local_ip.octets());
-
-    let p1_specs: [(u16, u16, u16, u16); 4] =
-        [(7, 256, 2, 2), (7, 128, 2, 2), (5, 0, 2, 2), (5, 0, 1, 2)];
-    let mut t_bytes = Vec::new();
-    for (idx, (enc_id, kbits, hsh_id, dh_grp)) in p1_specs.iter().enumerate() {
-        let mut at = Vec::new();
-        at.extend_from_slice(&ike_attr_tv(1, *enc_id));
-        if *kbits > 0 {
-            at.extend_from_slice(&ike_attr_tv(14, *kbits));
-        }
-        at.extend_from_slice(&ike_attr_tv(2, *hsh_id));
-        at.extend_from_slice(&ike_attr_tv(3, 1));
-        at.extend_from_slice(&ike_attr_tv(4, *dh_grp));
-        at.extend_from_slice(&ike_attr_tv(11, 1));
-        at.extend_from_slice(&ike_attr_tlv(12, &86400u32.to_be_bytes()));
-
-        let mut tbody = vec![(idx + 1) as u8, 1, 0, 0];
-        tbody.extend_from_slice(&at);
-        let npt = if idx + 1 < p1_specs.len() { 3 } else { 0 };
-        t_bytes.extend_from_slice(&ike_wrap_pl(npt, &tbody));
-    }
-
-    let mut prop_b = vec![1u8, 1, 0, p1_specs.len() as u8];
-    prop_b.extend_from_slice(&t_bytes);
-    let mut sa_i_body = Vec::new();
-    sa_i_body.extend_from_slice(&1u32.to_be_bytes());
-    sa_i_body.extend_from_slice(&1u32.to_be_bytes());
-    sa_i_body.extend_from_slice(&ike_wrap_pl(0, &prop_b));
-
-    let mut am1_items = vec![
-        (1u8, sa_i_body.clone()),
-        (4u8, gxi.clone()),
-        (10u8, ni.to_vec()),
-        (5u8, idi_body.clone()),
-    ];
-    for vid in IKEV1_NAT_T_VIDS {
-        am1_items.push((13u8, vid.to_vec()));
-    }
-    let (am1_fpt, am1_body) = ike_build_chain(&am1_items);
-    let mut am1_pkt = Vec::with_capacity(28 + am1_body.len());
-    am1_pkt.extend_from_slice(&ck_i);
-    am1_pkt.extend_from_slice(&[0u8; 8]);
-    am1_pkt.push(am1_fpt);
-    am1_pkt.push(0x10);
-    am1_pkt.push(4);
-    am1_pkt.push(0);
-    am1_pkt.extend_from_slice(&0u32.to_be_bytes());
-    am1_pkt.extend_from_slice(&((28 + am1_body.len()) as u32).to_be_bytes());
-    am1_pkt.extend_from_slice(&am1_body);
-
-    let s500 = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
-    if let Some(protect) = protect_fd {
-        let fd = socket_raw_fd(&s500);
-        if fd >= 0 && !protect(fd) {
-            return Err("Android VpnService.protect() rejected UDP 500 socket".to_string());
-        }
-    }
-    let _ = s500.set_read_timeout(Some(Duration::from_millis(1600)));
-    let mut am2: Option<Vec<u8>> = None;
-    let mut buf500 = [0u8; 4096];
-    for _ in 0..3 {
-        let _ = s500.send_to(&am1_pkt, SocketAddr::new(IpAddr::V4(server_ip), 500));
-        if let Ok((n, _)) = s500.recv_from(&mut buf500)
-            && n >= 28
-            && buf500[0..8] == ck_i
-        {
-            am2 = Some(buf500[..n].to_vec());
-            break;
-        }
-    }
-    drop(s500);
-
-    let am2 = am2.ok_or_else(|| format!("IKEv1 Phase 1 timed out on {server_ip}:500"))?;
-    if am2[18] == 5 {
-        return Err(format!(
-            "Peer {server_ip}:500 rejected Phase 1 proposal (Informational Notify)"
-        ));
-    }
-
-    let mut ck_r = [0u8; 8];
-    ck_r.copy_from_slice(&am2[8..16]);
-    let pls2_list = ike_parse_payloads(&am2[28..], am2[16]);
-    let pls2: HashMap<u8, Vec<u8>> = pls2_list.iter().cloned().collect();
-    let sa_r = pls2.get(&1).ok_or("Phase 1 missing SA")?;
-    let gxr = pls2.get(&4).ok_or("Phase 1 missing KE")?;
-    let nr = pls2.get(&10).ok_or("Phase 1 missing Nonce")?;
-    let idr = pls2.get(&5).ok_or("Phase 1 missing ID")?;
-    let hash_r = pls2.get(&8).ok_or("Phase 1 missing HASH_R")?;
-
-    let prop_pl = ike_parse_payloads(&sa_r[8..], 2)
-        .into_iter()
-        .next()
-        .ok_or("Phase 1 missing Proposal")?
-        .1;
-    let spi_sz = prop_pl[2] as usize;
-    let tr_pl = ike_parse_payloads(&prop_pl[4 + spi_sz..], 3)
-        .into_iter()
-        .next()
-        .ok_or("Phase 1 missing Transform")?
-        .1;
-    let p1_attrs = ike_parse_attrs(&tr_pl[4..]);
-    let p1_enc = *p1_attrs.get(&1).unwrap_or(&7);
-    let p1_kbits = *p1_attrs
-        .get(&14)
-        .unwrap_or(&(if p1_enc == 5 { 192 } else { 256 }));
-    let hash = if *p1_attrs.get(&2).unwrap_or(&2) == 2 {
-        IkeHash::Sha1
-    } else {
-        IkeHash::Md5
-    };
-    let alg = if p1_enc == 7 && p1_kbits == 256 {
-        IkeCipher::Aes256
-    } else if p1_enc == 7 {
-        IkeCipher::Aes128
-    } else {
-        IkeCipher::Des3
-    };
-
-    let gxy_raw = BigUint::from_bytes_be(gxr)
-        .modpow(&priv_x, &p)
-        .to_bytes_be();
-    let mut gxy = vec![0u8; 128];
-    let off_gxy = 128usize.saturating_sub(gxy_raw.len());
-    gxy[off_gxy..].copy_from_slice(&gxy_raw[gxy_raw.len().saturating_sub(128)..]);
-
-    let mut skey_in = ni.to_vec();
-    skey_in.extend_from_slice(nr);
-    let skeyid = hash.hmac(b"vpn", &skey_in);
-
-    let mut hr_in = Vec::new();
-    hr_in.extend_from_slice(gxr);
-    hr_in.extend_from_slice(&gxi);
-    hr_in.extend_from_slice(&ck_r);
-    hr_in.extend_from_slice(&ck_i);
-    hr_in.extend_from_slice(&sa_i_body);
-    hr_in.extend_from_slice(idr);
-    let exp_hr = hash.hmac(&skeyid, &hr_in);
-    if !bool::from(exp_hr.as_slice().ct_eq(hash_r)) {
-        return Err(format!("PSK mismatch on {server_ip} (PSK != 'vpn')"));
-    }
-
-    let mut d_in = gxy.clone();
-    d_in.extend_from_slice(&ck_i);
-    d_in.extend_from_slice(&ck_r);
-    d_in.push(0);
-    let skeyid_d = hash.hmac(&skeyid, &d_in);
-
-    let mut a_in = skeyid_d.clone();
-    a_in.extend_from_slice(&gxy);
-    a_in.extend_from_slice(&ck_i);
-    a_in.extend_from_slice(&ck_r);
-    a_in.push(1);
-    let skeyid_a = hash.hmac(&skeyid, &a_in);
-
-    let mut e_in = skeyid_a.clone();
-    e_in.extend_from_slice(&gxy);
-    e_in.extend_from_slice(&ck_i);
-    e_in.extend_from_slice(&ck_r);
-    e_in.push(2);
-    let skeyid_e = hash.hmac(&skeyid, &e_in);
-
-    let p1_key = ike_expand_key(hash, &skeyid_e, alg.key_len());
-    let mut iv_seed = gxi.clone();
-    iv_seed.extend_from_slice(gxr);
-    let blen = alg.block_len();
-    let p1_iv_init = hash.digest(&iv_seed)[..blen].to_vec();
-
-    let mut hi_in = gxi;
-    hi_in.extend_from_slice(gxr);
-    hi_in.extend_from_slice(&ck_i);
-    hi_in.extend_from_slice(&ck_r);
-    hi_in.extend_from_slice(&sa_i_body);
-    hi_in.extend_from_slice(&idi_body);
-    let hash_i = hash.hmac(&skeyid, &hi_in);
-
-    let natd_pt = if pls2_list.iter().any(|(pt, _)| *pt == 20) {
-        20u8
-    } else {
-        130u8
-    };
-    let mut nd1 = [0u8; 20];
-    let mut nd2 = [0u8; 20];
-    rng.fill_bytes(&mut nd1);
-    rng.fill_bytes(&mut nd2);
-    let (am3_fpt, mut am3_plain) = ike_build_chain(&[
-        (8, hash_i),
-        (natd_pt, nd1.to_vec()),
-        (natd_pt, nd2.to_vec()),
-    ]);
-    let pad_am3 = (blen - (am3_plain.len() % blen)) % blen;
-    am3_plain.resize(am3_plain.len() + pad_am3, 0);
-    let am3_enc = ike_cbc_crypt(alg, &p1_key, &p1_iv_init, &am3_plain, true)?;
-    let p1_iv = am3_enc[am3_enc.len() - blen..].to_vec();
-
-    let mut am3_pkt = Vec::with_capacity(28 + am3_enc.len());
-    am3_pkt.extend_from_slice(&ck_i);
-    am3_pkt.extend_from_slice(&ck_r);
-    am3_pkt.push(am3_fpt);
-    am3_pkt.push(0x10);
-    am3_pkt.push(4);
-    am3_pkt.push(1);
-    am3_pkt.extend_from_slice(&0u32.to_be_bytes());
-    am3_pkt.extend_from_slice(&((28 + am3_enc.len()) as u32).to_be_bytes());
-    am3_pkt.extend_from_slice(&am3_enc);
-
-    let p1 = Phase1Session {
-        local_ip,
-        local_port,
-        server_ip,
-        ck_i,
-        ck_r,
-        alg,
-        hash,
-        key: p1_key,
-        iv: p1_iv,
-        skeyid_d,
-        skeyid_a,
-    };
-
-    let qm = negotiate_quick_mode_keys(&s4500, &p1, Some(&am3_pkt))?;
-    Ok(UserspaceIkeEspSession {
-        s4500,
-        local_ip,
-        local_port,
-        server_ip,
-        spi_in: qm.spi_in,
-        spi_out: qm.spi_out,
-        esp_cipher: qm.esp_cipher,
-        esp_alg_label: qm.esp_alg_label.to_string(),
-        enc_out: qm.enc_out,
-        auth_out: qm.auth_out,
-        enc_in: qm.enc_in,
-        auth_in: qm.auth_in,
-        p1,
-    })
 }
 
 #[cfg(test)]

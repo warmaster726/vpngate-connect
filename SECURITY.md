@@ -2,7 +2,7 @@
 
 ## Supported Versions
 
-Security fixes are applied on the active **`main`** branch (Rust + Flutter Cross-Platform Edition). The **`PY`** branch is preserved for historical reference only.
+Security fixes are applied on the active **`main`** branch (Pure-Rust Cross-Platform Edition). The **`PY`** branch is preserved for historical reference only.
 
 | Branch / Version | Supported |
 | :--- | :--- |

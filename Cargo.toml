@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "crates/vpngate-core",
     "crates/vpngate-cli",
-    "crates/vpngate-bridge",
 ]
 
 [workspace.package]
@@ -40,7 +39,7 @@ unsafe_code = "allow"
 [workspace.lints.clippy]
 all = "warn"
 
-# Optimized for small static binaries on Desktop & strict <15 MB iOS PacketTunnel limits
+# Optimized for small, fast release binaries
 [profile.release]
 opt-level = "z"
 lto = "thin"

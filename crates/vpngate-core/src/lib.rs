@@ -1,6 +1,6 @@
 //! `vpngate-core` — Shared cross-platform networking, anti-censorship discovery,
 //! SoftEther IKEv1 cryptographic pre-flight verification, desktop tunnel drivers,
-//! and tunnel profile generator for Windows, macOS, Linux, Android, and iOS.
+//! and multi-platform profile generator (`.ovpn` & Apple `.mobileconfig`).
 
 pub mod cache;
 pub mod cooldown;
@@ -11,7 +11,6 @@ pub mod doh;
 pub mod error;
 pub mod ikev1;
 pub mod ikev1_daemon;
-pub mod mobile_l2tp;
 pub mod parser;
 pub mod profile;
 pub mod protocol;
@@ -42,15 +41,7 @@ pub use discovery::{
 pub use doh::{is_poisoned_ip, is_poisoned_ipv4, resolve_ipv4_via_cloudflare_doh};
 pub use error::{CoreError, Result};
 pub use ikev1::{L2tpVerifyOutcome, probe_tcp, sweep_ikev1_sa_responders, verify_l2tp_psk_vpn};
-pub use ikev1_daemon::{
-    UserspaceIkeEspSession, negotiate_userspace_ikev1_esp, run_ikev1_crypto_self_test,
-    run_ikev1_daemon,
-};
-pub use mobile_l2tp::{
-    MOBILE_L2TP_MTU, UserspaceL2tpConfig, UserspaceL2tpHandle, UserspaceL2tpStats,
-    compute_chap_md5, esp_open_l2tp_udp, esp_seal_l2tp_udp, run_userspace_l2tp_session,
-    spawn_userspace_l2tp_session,
-};
+pub use ikev1_daemon::{run_ikev1_crypto_self_test, run_ikev1_daemon};
 pub use parser::{
     OfficialMirrorSite, normalize_mirror_base_url, parse_sdise_csv_into, parse_vpngate_csv_into,
     parse_vpngate_html_into, parse_vpngate_mirror_sites_html,
