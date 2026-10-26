@@ -9,14 +9,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 JNI_LIBS_DIR="${SCRIPT_DIR}/android/app/src/main/jniLibs"
 JNI_ONLY=0
+ARM64_ONLY=0
+BUILD_AAB=0
+AUTO_INSTALL=0
 ABIS_CSV="${VPNGATE_ANDROID_ABIS:-arm64-v8a,armeabi-v7a,x86_64}"
 
 for arg in "$@"; do
     case "$arg" in
         --jni-only) JNI_ONLY=1 ;;
-        --arm64-only) ABIS_CSV="arm64-v8a" ;;
+        --arm64-only)
+            ARM64_ONLY=1
+            ABIS_CSV="arm64-v8a"
+            ;;
+        --aab) BUILD_AAB=1 ;;
+        --install) AUTO_INSTALL=1 ;;
         --help|-h)
-            echo "Usage: ./build-android.sh [--jni-only] [--arm64-only]"
+            echo "Usage: ./build-android.sh [--jni-only] [--arm64-only] [--aab] [--install]"
             exit 0
             ;;
     esac
@@ -108,7 +116,36 @@ if [[ "$JNI_ONLY" -eq 1 ]]; then
     exit 0
 fi
 
+# Bootstrap Gradle wrapper scripts on fresh clones without overwriting custom Kotlin/JNI/Gradle files
+if [[ ! -f "${SCRIPT_DIR}/android/gradlew" ]]; then
+    echo "[*] Bootstrapping Gradle wrapper scaffold via Flutter SDK ..."
+    TMP_SCAFFOLD="$(mktemp -d "${TMPDIR:-/tmp}/vpngate-flutter-scaffold.XXXXXX")"
+    flutter create --platforms=android --org org.vpngate --project-name vpngate_mobile "$TMP_SCAFFOLD" >/dev/null
+    cp -rn "${TMP_SCAFFOLD}/android/gradle" "${SCRIPT_DIR}/android/" 2>/dev/null || true
+    cp -f "${TMP_SCAFFOLD}/android/gradlew" "${SCRIPT_DIR}/android/gradlew"
+    cp -f "${TMP_SCAFFOLD}/android/gradlew.bat" "${SCRIPT_DIR}/android/gradlew.bat"
+    chmod 0755 "${SCRIPT_DIR}/android/gradlew"
+    rm -rf "$TMP_SCAFFOLD"
+fi
+
 cd "$SCRIPT_DIR"
+export VPNGATE_SKIP_GRADLE_CARGO=1
+export VPNGATE_ANDROID_ABIS="$ABIS_CSV"
 flutter pub get
-flutter build apk --release
-echo "[+] Release APK ready: ${SCRIPT_DIR}/build/app/outputs/flutter-apk/app-release.apk"
+
+FLUTTER_TARGET_ARGS=()
+if [[ "$ARM64_ONLY" -eq 1 ]]; then
+    FLUTTER_TARGET_ARGS+=(--target-platform android-arm64)
+fi
+
+if [[ "$BUILD_AAB" -eq 1 ]]; then
+    flutter build appbundle --release "${FLUTTER_TARGET_ARGS[@]}"
+    echo "[+] Release App Bundle ready: ${SCRIPT_DIR}/build/app/outputs/bundle/release/app-release.aab"
+else
+    flutter build apk --release "${FLUTTER_TARGET_ARGS[@]}"
+    echo "[+] Release APK ready: ${SCRIPT_DIR}/build/app/outputs/flutter-apk/app-release.apk"
+fi
+
+if [[ "$AUTO_INSTALL" -eq 1 ]]; then
+    flutter install --release
+fi

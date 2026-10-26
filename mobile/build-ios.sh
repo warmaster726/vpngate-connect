@@ -51,6 +51,16 @@ if [[ "$RUST_ONLY" -eq 1 ]]; then
     exit 0
 fi
 
+# Bootstrap missing Xcode Runner project scaffold on first macOS build without overwriting custom Swift/Podfile
+if [[ ! -d "${SCRIPT_DIR}/ios/Runner.xcodeproj" ]]; then
+    echo "[*] Bootstrapping Xcode Runner.xcodeproj scaffold via Flutter SDK ..."
+    TMP_SCAFFOLD="$(mktemp -d "${TMPDIR:-/tmp}/vpngate-ios-scaffold.XXXXXX")"
+    flutter create --platforms=ios --org org.vpngate --project-name vpngate_mobile "$TMP_SCAFFOLD" >/dev/null
+    cp -rn "${TMP_SCAFFOLD}/ios/"* "${SCRIPT_DIR}/ios/" 2>/dev/null || true
+    rm -rf "$TMP_SCAFFOLD"
+    echo "[!] Note: Open ios/Runner.xcworkspace in Xcode once to add the ios/PacketTunnel Network Extension target & signing team."
+fi
+
 cd "$SCRIPT_DIR"
 flutter pub get
 (cd ios && pod install)
