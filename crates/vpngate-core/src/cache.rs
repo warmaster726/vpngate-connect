@@ -6,8 +6,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::cooldown::CooldownStore;
-use crate::discovery::{DiscoveryClient, DiscoveryOptions};
+use crate::discovery::{DiscoveryClient, DiscoveryOptions, ProgressEvent};
 use crate::error::Result;
+use crate::parser::OfficialMirrorSite;
 use crate::server::VpnServer;
 
 pub const CACHE_TTL_SECONDS: u64 = 600;
@@ -81,6 +82,7 @@ pub fn fix_owner(path: &Path) {
 pub struct AppPaths {
     pub cache_dir: PathBuf,
     pub servers_cache: PathBuf,
+    pub mirrors_cache: PathBuf,
     pub failed_servers: PathBuf,
     pub active_state: PathBuf,
     pub watchdog_pref: PathBuf,
@@ -123,6 +125,7 @@ impl AppPaths {
 
         Self {
             servers_cache: cache_dir.join("servers_cache.json"),
+            mirrors_cache: cache_dir.join("mirrors_cache.json"),
             failed_servers: cache_dir.join("failed_servers.json"),
             active_state: cache_dir.join("active_state.json"),
             watchdog_pref: cache_dir.join("watchdog_pref.json"),
@@ -168,6 +171,12 @@ pub fn read_json_opt<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
 pub struct ServerCacheFile {
     pub timestamp: u64,
     pub servers: Vec<VpnServer>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MirrorCacheFile {
+    pub timestamp: u64,
+    pub mirrors: Vec<OfficialMirrorSite>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -256,12 +265,41 @@ pub fn save_cooldowns(paths: &AppPaths, store: &mut CooldownStore) {
     fix_owner(&paths.failed_servers);
 }
 
-/// Returns cached server pool when fresher than `CACHE_TTL_SECONDS` (`10m`), or fetches live and updates cache.
+pub fn load_cached_mirrors(paths: &AppPaths) -> Vec<OfficialMirrorSite> {
+    read_json_opt::<MirrorCacheFile>(&paths.mirrors_cache)
+        .map(|f| f.mirrors)
+        .unwrap_or_default()
+}
+
+pub fn save_cached_mirrors(paths: &AppPaths, mirrors: &[OfficialMirrorSite]) {
+    if mirrors.is_empty() {
+        return;
+    }
+    let payload = MirrorCacheFile {
+        timestamp: now_unix_secs(),
+        mirrors: mirrors.to_vec(),
+    };
+    let _ = atomic_write_json(&paths.mirrors_cache, &payload);
+}
+
+///Silent convenience wrapper around `get_servers_cached_with_progress`.
 pub async fn get_servers_cached(paths: &AppPaths, force_refresh: bool) -> Result<Vec<VpnServer>> {
+    get_servers_cached_with_progress(paths, force_refresh, &[], |_| {}).await
+}
+
+/// Returns cached server pool when fresher than `CACHE_TTL_SECONDS` (`10m`), or fetches live
+/// with step-by-step `ProgressEvent` reporting and persists both servers & Official Mirror Sites.
+pub async fn get_servers_cached_with_progress(
+    paths: &AppPaths,
+    force_refresh: bool,
+    extra_mirrors: &[OfficialMirrorSite],
+    mut on_progress: impl FnMut(ProgressEvent),
+) -> Result<Vec<VpnServer>> {
     paths.ensure_dirs()?;
     let now = now_unix_secs();
 
     if !force_refresh
+        && extra_mirrors.is_empty()
         && let Some(cached) = read_json_opt::<ServerCacheFile>(&paths.servers_cache)
         && !cached.servers.is_empty()
         && now.saturating_sub(cached.timestamp) < CACHE_TTL_SECONDS
@@ -269,24 +307,47 @@ pub async fn get_servers_cached(paths: &AppPaths, force_refresh: bool) -> Result
         return Ok(cached.servers);
     }
 
-    let client = DiscoveryClient::new(DiscoveryOptions::default())?;
-    match client.fetch_servers().await {
-        Ok(servers) if !servers.is_empty() => {
+    let mut seeds = extra_mirrors.to_vec();
+    for mut m in load_cached_mirrors(paths) {
+        if m.source == "sites.aspx" {
+            m.source = "cached".to_string();
+        }
+        if !seeds.iter().any(|x| x.base_url == m.base_url) {
+            seeds.push(m);
+        }
+    }
+
+    let opts = DiscoveryOptions {
+        seed_mirrors: seeds,
+        ..DiscoveryOptions::default()
+    };
+    let client = DiscoveryClient::new(opts)?;
+
+    match client.fetch_servers_with_progress(&mut on_progress).await {
+        Ok(outcome) if !outcome.servers.is_empty() => {
+            if !outcome.official_mirrors.is_empty() {
+                save_cached_mirrors(paths, &outcome.official_mirrors);
+            }
             let file_obj = ServerCacheFile {
                 timestamp: now,
-                servers: servers.clone(),
+                servers: outcome.servers.clone(),
             };
             let _ = atomic_write_json(&paths.servers_cache, &file_obj);
-            Ok(servers)
+            Ok(outcome.servers)
         }
-        Ok(_) | Err(_) => {
-            // Stale cache fallback when network is temporarily restricted
-            if let Some(stale) = read_json_opt::<ServerCacheFile>(&paths.servers_cache)
+        Ok(_) => Err(crate::error::CoreError::NoMatchingServers),
+        Err(e) => {
+            if !force_refresh
+                && let Some(stale) = read_json_opt::<ServerCacheFile>(&paths.servers_cache)
                 && !stale.servers.is_empty()
             {
+                on_progress(ProgressEvent::Warn(format!(
+                    "Live refresh failed ({e}); falling back to cached server pool ({} servers).",
+                    stale.servers.len()
+                )));
                 return Ok(stale.servers);
             }
-            Err(crate::error::CoreError::NoMatchingServers)
+            Err(e)
         }
     }
 }

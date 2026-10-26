@@ -10,7 +10,7 @@ Terminal=false
 Categories=System;Security;
 Keywords=vpn;vpngate;l2tp;ipsec;xfrm;openvpn;kali;rust;
 StartupNotify=true
-Actions=ConnectJPAuto;ConnectJPL2TP;ConnectJPOVPNUDP;Countries;Status;Doctor;Disconnect;
+Actions=ConnectJPAuto;ConnectJPL2TP;ConnectJPOVPNUDP;Countries;Mirrors;Status;Doctor;Disconnect;
 
 [Desktop Action ConnectJPAuto]
 Name=Quick Connect — Japan (Auto: L2TP -> OVPN UDP -> OVPN TCP)
@@ -27,6 +27,10 @@ Exec=/usr/local/bin/vpngate-launcher --hold connect -c JP -p openvpn-udp
 [Desktop Action Countries]
 Name=View Unified Countries & Regions Table
 Exec=/usr/local/bin/vpngate-launcher --hold countries
+
+[Desktop Action Mirrors]
+Name=Official VPNGate Mirror Sites (Live Probe)
+Exec=/usr/local/bin/vpngate-launcher --hold mirrors
 
 [Desktop Action Status]
 Name=Check Active VPN & Public Egress IP

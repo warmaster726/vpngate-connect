@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::env;
 use std::io::{self, IsTerminal, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+use vpngate_core::ProgressEvent;
 
 pub const RESET: &str = "\x1b[0m";
 pub const BOLD: &str = "\x1b[1m";
@@ -12,6 +14,8 @@ pub const YELLOW: &str = "\x1b[1;33m";
 pub const CYAN: &str = "\x1b[1;36m";
 
 static DYNAMIC_RESIZE_ENABLED: AtomicBool = AtomicBool::new(true);
+static SCREEN_CLEAR_ENABLED: AtomicBool = AtomicBool::new(true);
+static LAST_TRANSIENT_VIS_LEN: AtomicUsize = AtomicUsize::new(0);
 
 pub fn set_dynamic_resize(enabled: bool) {
     DYNAMIC_RESIZE_ENABLED.store(enabled, Ordering::Relaxed);
@@ -19,6 +23,14 @@ pub fn set_dynamic_resize(enabled: bool) {
 
 pub fn dynamic_resize_enabled() -> bool {
     DYNAMIC_RESIZE_ENABLED.load(Ordering::Relaxed)
+}
+
+pub fn set_screen_clear(enabled: bool) {
+    SCREEN_CLEAR_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub fn screen_clear_enabled() -> bool {
+    SCREEN_CLEAR_ENABLED.load(Ordering::Relaxed)
 }
 
 pub fn is_stdout_tty() -> bool {
@@ -36,20 +48,131 @@ pub fn supports_utf8() -> bool {
     true
 }
 
+pub fn clear_transient_line() {
+    let prev = LAST_TRANSIENT_VIS_LEN.swap(0, Ordering::Relaxed);
+    if prev > 0 && is_stdout_tty() {
+        let mut out = io::stdout().lock();
+        let _ = write!(out, "\r{}\r", " ".repeat(prev));
+        let _ = out.flush();
+    }
+}
+
 pub fn info(msg: &str) {
+    clear_transient_line();
     let _ = writeln!(io::stdout(), "{CYAN}[*]{RESET} {msg}");
 }
 
 pub fn ok(msg: &str) {
+    clear_transient_line();
     let _ = writeln!(io::stdout(), "{GREEN}[+]{RESET} {msg}");
 }
 
 pub fn warn(msg: &str) {
+    clear_transient_line();
     let _ = writeln!(io::stderr(), "{YELLOW}[!]{RESET} {msg}");
 }
 
 pub fn err(msg: &str) {
+    clear_transient_line();
     let _ = writeln!(io::stderr(), "{RED}[x]{RESET} {msg}");
+}
+
+pub fn format_thousands_u64(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (idx, ch) in s.chars().rev().enumerate() {
+        if idx > 0 && idx % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out.chars().rev().collect()
+}
+
+/// Renders live `ProgressEvent` items (`PY` branch style in-place counters + step logs).
+pub fn render_progress_event(ev: ProgressEvent) {
+    match ev {
+        ProgressEvent::ClearTransient => clear_transient_line(),
+        ProgressEvent::Info(m) => info(&m),
+        ProgressEvent::Ok(m) => ok(&m),
+        ProgressEvent::Warn(m) => warn(&m),
+        ProgressEvent::AttemptBanner {
+            index,
+            total,
+            hostname,
+            ip,
+            country_short,
+            country_long,
+            speed_mbps,
+            ping_ms,
+            score,
+        } => {
+            clear_transient_line();
+            let ping_tag = if ping_ms < 9999 {
+                format!("{ping_ms} ms")
+            } else {
+                "N/A".to_string()
+            };
+            let score_s = format_thousands_u64(score);
+            let _ = writeln!(
+                io::stdout(),
+                "\n{BOLD}[Attempt {index}/{total}]{RESET} Testing {CYAN}{hostname}{RESET} \
+                 ({ip}) | {country_short} ({country_long}) | {speed_mbps:.1} Mbps | Ping: {ping_tag} | Score: {score_s}"
+            );
+        }
+        ProgressEvent::Transient {
+            stage,
+            elapsed_secs,
+            max_secs,
+            tick,
+        } => {
+            if !is_stdout_tty() {
+                return;
+            }
+            const FRAMES: [&str; 4] = ["-", "\\", "|", "/"];
+            let spin = FRAMES[tick % FRAMES.len()];
+            let cnt_str = if max_secs > 0 {
+                format!("{elapsed_secs}s/{max_secs}s")
+            } else {
+                format!("{elapsed_secs}s")
+            };
+            let (cols, _) = get_live_terminal_size(100, 30);
+            let max_vis = cols.saturating_sub(2).max(42);
+
+            let plain_full =
+                format!("[*] [{spin}] {stage} [{cnt_str}] - Press Ctrl+C to interrupt");
+            let (vis_len, colored) = if plain_full.chars().count() <= max_vis {
+                (
+                    plain_full.chars().count(),
+                    format!(
+                        "{CYAN}{BOLD}[*]{RESET} {CYAN}{BOLD}[{spin}]{RESET} {stage} \
+                         {CYAN}{BOLD}[{cnt_str}]{RESET} - {YELLOW}Press Ctrl+C to interrupt{RESET}"
+                    ),
+                )
+            } else {
+                let plain_short = format!("[*] [{spin}] {stage} [{cnt_str}]");
+                if plain_short.chars().count() <= max_vis {
+                    (
+                        plain_short.chars().count(),
+                        format!(
+                            "{CYAN}{BOLD}[*]{RESET} {CYAN}{BOLD}[{spin}]{RESET} {stage} \
+                             {CYAN}{BOLD}[{cnt_str}]{RESET}"
+                        ),
+                    )
+                } else {
+                    let clipped: String = plain_short.chars().take(max_vis).collect();
+                    let l = clipped.chars().count();
+                    (l, clipped)
+                }
+            };
+
+            let prev = LAST_TRANSIENT_VIS_LEN.swap(vis_len, Ordering::Relaxed);
+            let pad = " ".repeat(prev.saturating_sub(vis_len));
+            let mut out = io::stdout().lock();
+            let _ = write!(out, "\r{colored}{pad}");
+            let _ = out.flush();
+        }
+    }
 }
 
 pub fn format_duration(secs: u64) -> String {
@@ -265,8 +388,9 @@ pub fn request_window_resize(needed_cols: usize, needed_rows: usize) {
 }
 
 pub fn clear_screen_if_tty() {
-    if is_stdout_tty() {
-        let _ = write!(io::stdout(), "\x1b[2J\x1b[H");
+    clear_transient_line();
+    if screen_clear_enabled() && is_stdout_tty() {
+        let _ = write!(io::stdout(), "\x1b[2J\x1b[3J\x1b[H");
         let _ = io::stdout().flush();
     }
 }
@@ -276,6 +400,7 @@ pub fn render_dynamic_box(
     extra_rows_below: usize,
     min_inner: usize,
 ) -> io::Result<()> {
+    clear_transient_line();
     let mut natural_inner = min_inner;
     for l in lines.iter().flatten() {
         natural_inner = natural_inner.max(visible_len(l));
@@ -322,6 +447,7 @@ pub fn render_dynamic_table(
     footer_lines: &[String],
     extra_rows_below: usize,
 ) -> io::Result<()> {
+    clear_transient_line();
     let ncols = headers.len();
     let mut widths: Vec<usize> = (0..ncols)
         .map(|c| {

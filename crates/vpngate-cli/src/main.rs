@@ -1,147 +1,61 @@
+//! `vpngate` — Single-Binary Cross-Platform Desktop CLI & Interactive Console
+//! Replicating the Python `v5.3` dual-mode CLI + `[0-9]` Console UX with 100% pure-Rust IKEv1/XFRM.
+
 mod commands;
 mod term_ui;
 
 use std::env;
 use std::io;
 use std::path::Path;
-use std::process::ExitCode;
 
-use vpngate_core::{
-    AppPaths, ProtocolFilter, SortBy, detect_host_os_label, run_ikev1_daemon, run_monitor_daemon,
+use commands::{
+    ConnectArgs, cmd_connect, cmd_countries, cmd_disconnect, cmd_doctor, cmd_list, cmd_mirrors,
+    cmd_probe, cmd_refresh, cmd_status, cmd_watchdog, interactive_menu,
 };
+use term_ui::{err, set_dynamic_resize, set_screen_clear};
+use vpngate_core::{AppPaths, ProtocolFilter, SortBy, run_ikev1_daemon, run_monitor_daemon};
 
-use crate::commands::{
-    ConnectArgs, cmd_connect, cmd_countries, cmd_disconnect, cmd_doctor, cmd_list, cmd_probe,
-    cmd_refresh, cmd_status, cmd_watchdog, interactive_menu,
-};
-use crate::term_ui::{err, set_dynamic_resize};
-
-fn help_reference() -> String {
+fn build_help_text() -> String {
     format!(
-        "vpngate v{} ({}) — Unified Cross-Platform Encrypted L2TP/IPsec (Zero IKEv2) & OpenVPN Client\n\
-         Priority Cascade: Auto -> L2TP/IPsec (PSK='vpn') -> OpenVPN UDP -> OpenVPN TCP\n\n\
+        "vpngate v{} — Cross-Platform SoftEther VPN Gate Client (Auto: L2TP/IPsec -> OVPN UDP -> OVPN TCP)\n\n\
          USAGE:\n\
-           vpngate                         Launch interactive [0-8] Console Dashboard\n\
-           vpngate countries [-p PROTO]    List available countries/regions & protocol counts\n\
-           vpngate list [-c CC] [-p PROTO] List ranked servers matching filters\n\
-           vpngate connect -c CC [OPTIONS] Recursively test & connect to best verified server\n\
-           vpngate disconnect              Disconnect active tunnel & restore host network\n\
-           vpngate status                  Show active VPN session, XFRM SA & public egress IP\n\
-           vpngate doctor                  Run system readiness & pure-Rust IKEv1 diagnostics\n\
-           vpngate watchdog [on|off|status] Inspect or toggle Auto-Reconnect Watchdog\n\
-           vpngate refresh                 Force live server pool refresh & clear cooldowns\n\
-           vpngate probe <IPV4>            Run 1-RTT IKEv1 PSK='vpn' + TCP-443 pre-flight check\n\n\
-         SHORTHAND FLAGS:\n\
-           -i, --interactive     Launch interactive [0-8] Console Dashboard\n\
-           -L, --list-countries  List available countries/regions table\n\
-           -l, --list-servers    List servers matching -c / -p / -s filters\n\
-           -c, --country <CC>    Target country ISO2 (e.g. JP, KR, US, HK, all) or name\n\
-           -p, --proto <PROTO>   auto | all | l2tp | openvpn-udp | openvpn-tcp | openvpn\n\
-           -s, --sort <SORT>     recommended | score | speed | ping\n\
-           -n, --limit <N>       Max servers to list or test (0 = all)\n\
-           -t, --timeout <SEC>   Per-server handshake timeout in seconds (default: 22)\n\
-           -e, --engine <ENG>    auto | builtin | nm | openvpn\n\
-               --dns <IPS>       Tunnel DNS servers (default: \"1.1.1.1 1.0.0.1\")\n\
-               --start <IDX>     1-based server index to start testing from (default: 1)\n\
-           -a, --autoreconnect   Enable background Auto-Reconnect Watchdog\n\
-               --no-autoreconnect Disable background Auto-Reconnect Watchdog\n\
-           -r, --refresh         Force live server pool refresh\n\
-           -S, --status          Show active VPN status & public IP\n\
+           vpngate                              Launch Interactive Console Dashboard [0-9]\n\
+           vpngate countries [-p PROTO] [-r]    List available countries & protocol counts\n\
+           vpngate list [-c CC] [-p PROTO] [-s SORT] [-n LIMIT] [-r]\n\
+           vpngate connect -c <CC|all> [-p PROTO] [-s SORT] [-n LIMIT] [--start N] [-a]\n\
+           vpngate mirrors [--mirror URL]       Discover & live-probe Official VPNGate Mirror Sites\n\
+           vpngate status                       Show active tunnel, XFRM SA, watchdog & egress IP\n\
+           vpngate refresh                      Clear 30m server cooldowns & force live pool update\n\
+           vpngate watchdog [on|off|status]     Manage 15s Auto-Reconnect Watchdog\n\
+           vpngate doctor                       Run crypto, L2TP/XFRM, OpenVPN & network diagnostics\n\
+           vpngate probe <IPv4>                 Run 1-RTT IKEv1 PSK='vpn' + TCP/443 pre-flight check\n\
+           vpngate disconnect                   Tear down active VPN & restore host DNS/routes/firewall\n\n\
+         SHORTHAND FLAGS (Python v5.3 Compatible):\n\
+           -i, --interactive     Launch Interactive Console Dashboard\n\
+           -L, --list-countries  Show unified countries & regions table\n\
+           -l, --list            List matching relay servers\n\
+           -c, --country <CC>    Target country code/name (e.g. JP, KR, US, TW, all)\n\
+           -p, --proto <PROTO>   auto (default) | l2tp | openvpn-udp | openvpn-tcp | openvpn\n\
+           -s, --sort <SORT>     score (default) | speed | ping\n\
+           -n, --limit <N>       Max servers to list or try (0 = all)\n\
+           -t, --timeout <SEC>   Per-attempt tunnel timeout in seconds (default: 22)\n\
+           -e, --engine <ENG>    auto | nm | daemon\n\
+               --dns <IPS>       Locked tunnel DNS servers (default: '1.1.1.1 1.0.0.1')\n\
+               --start <N>       1-based server index in sorted list to start connecting from\n\
+           -M, --mirrors         Discover & live-probe Official VPNGate Mirror Sites\n\
+               --mirror <URL>    Add/use an Official VPNGate Mirror URL (e.g. http://host:port/en/)\n\
+           -r, --refresh         Force live pool refresh from vpngate.net / mirrors\n\
+           -a, --autoreconnect   Enable 15s Auto-Reconnect Watchdog for this session\n\
+               --no-autoreconnect Disable Auto-Reconnect Watchdog for this session\n\
+           -S, --status          Show live VPN tunnel & public egress IP status\n\
            -D, --doctor          Run system & crypto diagnostics\n\
            -d, --disconnect      Disconnect active VPN Gate tunnel\n\
            -w, --window          Launch inside dedicated GNOME GTK/VTE or Windows Terminal window\n\
                --no-resize       Disable dynamic terminal window resize sequences\n\
-           -h, --help            Print this help reference\n\
-           -V, --version         Print version",
-        env!("CARGO_PKG_VERSION"),
-        detect_host_os_label()
+               --no-clear        Do not clear previous screen items before command execution\n\
+           -h, --help            Print this help message\n",
+        env!("CARGO_PKG_VERSION")
     )
-}
-
-#[derive(Default)]
-struct ParsedFlags {
-    interactive: bool,
-    list_countries: bool,
-    list_servers: bool,
-    status: bool,
-    doctor: bool,
-    disconnect: bool,
-    refresh: bool,
-    help: bool,
-    version: bool,
-    country: Option<String>,
-    proto: Option<String>,
-    sort: Option<String>,
-    limit: Option<usize>,
-    timeout: Option<u64>,
-    engine: Option<String>,
-    dns: Option<String>,
-    start: Option<usize>,
-    autoreconnect: Option<bool>,
-    positionals: Vec<String>,
-}
-
-fn parse_flags(args: &[String]) -> Result<ParsedFlags, String> {
-    let mut out = ParsedFlags::default();
-    let mut i = 0usize;
-    while i < args.len() {
-        let a = args[i].as_str();
-        match a {
-            "-h" | "--help" => out.help = true,
-            "-V" | "--version" => out.version = true,
-            "-i" | "--interactive" => out.interactive = true,
-            "-L" | "--list-countries" => out.list_countries = true,
-            "-l" | "--list-servers" => out.list_servers = true,
-            "-S" | "--status" => out.status = true,
-            "-D" | "--doctor" => out.doctor = true,
-            "-d" | "--disconnect" => out.disconnect = true,
-            "-r" | "--refresh" => out.refresh = true,
-            "-a" | "--autoreconnect" => out.autoreconnect = Some(true),
-            "--no-autoreconnect" => out.autoreconnect = Some(false),
-            "--no-resize" => set_dynamic_resize(false),
-            "-c" | "--country" => {
-                i += 1;
-                out.country = Some(args.get(i).ok_or("Missing value for -c/--country")?.clone());
-            }
-            "-p" | "--proto" => {
-                i += 1;
-                out.proto = Some(args.get(i).ok_or("Missing value for -p/--proto")?.clone());
-            }
-            "-s" | "--sort" => {
-                i += 1;
-                out.sort = Some(args.get(i).ok_or("Missing value for -s/--sort")?.clone());
-            }
-            "-n" | "--limit" => {
-                i += 1;
-                let v = args.get(i).ok_or("Missing value for -n/--limit")?;
-                out.limit = Some(v.parse().map_err(|_| format!("Invalid --limit: {v}"))?);
-            }
-            "-t" | "--timeout" => {
-                i += 1;
-                let v = args.get(i).ok_or("Missing value for -t/--timeout")?;
-                out.timeout = Some(v.parse().map_err(|_| format!("Invalid --timeout: {v}"))?);
-            }
-            "-e" | "--engine" => {
-                i += 1;
-                out.engine = Some(args.get(i).ok_or("Missing value for -e/--engine")?.clone());
-            }
-            "--dns" => {
-                i += 1;
-                out.dns = Some(args.get(i).ok_or("Missing value for --dns")?.clone());
-            }
-            "--start" => {
-                i += 1;
-                let v = args.get(i).ok_or("Missing value for --start")?;
-                out.start = Some(v.parse().map_err(|_| format!("Invalid --start: {v}"))?);
-            }
-            other if other.starts_with('-') => {
-                return Err(format!("Unknown flag '{other}'. Run `vpngate --help`."));
-            }
-            pos => out.positionals.push(pos.to_string()),
-        }
-        i += 1;
-    }
-    Ok(out)
 }
 
 fn delegate_to_window_launcher(raw_args: &[String]) -> i32 {
@@ -177,7 +91,6 @@ fn delegate_to_window_launcher(raw_args: &[String]) -> i32 {
     if let Some(d) = self_dir {
         cands.push(d.join("vpngate-launcher"));
         cands.push(d.join("vpngate-launcher.py"));
-        // Also support running from target/{debug,release}/vpngate inside repo root
         if let Some(repo_root) = d.parent().and_then(|p| p.parent()) {
             cands.push(repo_root.join("vpngate-launcher.py"));
         }
@@ -221,170 +134,213 @@ async fn dispatch() -> io::Result<i32> {
         return Ok(delegate_to_window_launcher(&raw_args));
     }
 
-    let help_txt = help_reference();
+    let help_text = build_help_text();
     if raw_args.is_empty() {
-        return interactive_menu(&paths, &help_txt).await;
+        return interactive_menu(&paths, &help_text).await;
     }
 
-    let flags = match parse_flags(&raw_args) {
-        Ok(f) => f,
-        Err(msg) => {
-            err(&msg);
-            return Ok(2);
-        }
-    };
+    let mut subcmd = String::new();
+    let mut country: Option<String> = None;
+    let mut proto_str = "auto".to_string();
+    let mut sort_str = "score".to_string();
+    let mut limit: Option<usize> = None;
+    let mut timeout_secs: u64 = 22;
+    let mut engine = "auto".to_string();
+    let mut dns = "1.1.1.1 1.0.0.1".to_string();
+    let mut start_index: usize = 1;
+    let mut force_refresh = false;
+    let mut auto_reconnect_override: Option<bool> = None;
+    let mut custom_mirrors: Vec<String> = Vec::new();
+    let mut flag_interactive = false;
+    let mut flag_countries = false;
+    let mut flag_list = false;
+    let mut flag_mirrors = false;
+    let mut flag_status = false;
+    let mut flag_doctor = false;
+    let mut flag_disconnect = false;
+    let mut positional: Vec<String> = Vec::new();
 
-    if flags.help {
-        println!("{help_txt}");
-        return Ok(0);
-    }
-    if flags.version {
-        println!("vpngate {}", env!("CARGO_PKG_VERSION"));
-        return Ok(0);
-    }
-
-    let pfilter = match flags.proto.as_deref() {
-        Some(p) => match ProtocolFilter::from_cli_str(p) {
-            Some(pf) => pf,
-            None => {
-                err(&format!("Invalid protocol '{p}'."));
+    let mut i = 0usize;
+    while i < raw_args.len() {
+        let arg = &raw_args[i];
+        match arg.as_str() {
+            "-h" | "--help" | "help" => {
+                println!("{help_text}");
+                return Ok(0);
+            }
+            "-v" | "--version" | "version" => {
+                println!("vpngate {}", env!("CARGO_PKG_VERSION"));
+                return Ok(0);
+            }
+            "--no-resize" => set_dynamic_resize(false),
+            "--no-clear" => set_screen_clear(false),
+            "-i" | "--interactive" => flag_interactive = true,
+            "-L" | "--list-countries" => flag_countries = true,
+            "-l" | "--list" => flag_list = true,
+            "-M" | "--mirrors" => flag_mirrors = true,
+            "-r" | "--refresh" => force_refresh = true,
+            "-S" | "--status" => flag_status = true,
+            "-D" | "--doctor" => flag_doctor = true,
+            "-d" | "--disconnect" => flag_disconnect = true,
+            "-a" | "--autoreconnect" => auto_reconnect_override = Some(true),
+            "--no-autoreconnect" => auto_reconnect_override = Some(false),
+            "-c" | "--country" => {
+                i += 1;
+                if let Some(v) = raw_args.get(i) {
+                    country = Some(v.clone());
+                }
+            }
+            "-p" | "--proto" => {
+                i += 1;
+                if let Some(v) = raw_args.get(i) {
+                    proto_str = v.clone();
+                }
+            }
+            "-s" | "--sort" => {
+                i += 1;
+                if let Some(v) = raw_args.get(i) {
+                    sort_str = v.clone();
+                }
+            }
+            "-n" | "--limit" => {
+                i += 1;
+                if let Some(v) = raw_args.get(i) {
+                    limit = v.parse::<usize>().ok();
+                }
+            }
+            "-t" | "--timeout" => {
+                i += 1;
+                if let Some(v) = raw_args.get(i) {
+                    timeout_secs = v.parse::<u64>().unwrap_or(22).max(5);
+                }
+            }
+            "-e" | "--engine" => {
+                i += 1;
+                if let Some(v) = raw_args.get(i) {
+                    engine = v.clone();
+                }
+            }
+            "--dns" => {
+                i += 1;
+                if let Some(v) = raw_args.get(i) {
+                    dns = v.clone();
+                }
+            }
+            "--start" => {
+                i += 1;
+                if let Some(v) = raw_args.get(i) {
+                    start_index = v.parse::<usize>().unwrap_or(1).max(1);
+                }
+            }
+            "--mirror" => {
+                i += 1;
+                if let Some(v) = raw_args.get(i) {
+                    custom_mirrors.push(v.clone());
+                }
+            }
+            other if !other.starts_with('-') && subcmd.is_empty() => {
+                subcmd = other.to_ascii_lowercase();
+            }
+            other if !other.starts_with('-') => {
+                positional.push(other.to_string());
+            }
+            unknown => {
+                err(&format!(
+                    "Unknown argument '{unknown}'. Run `vpngate --help` for usage."
+                ));
                 return Ok(2);
             }
-        },
-        None => ProtocolFilter::Auto,
-    };
-    let sby = match flags.sort.as_deref() {
-        Some(s) => match SortBy::from_cli_str(s) {
-            Some(sb) => sb,
-            None => {
-                err(&format!("Invalid sort '{s}'."));
-                return Ok(2);
-            }
-        },
-        None => SortBy::Recommended,
-    };
-
-    if let Some(sub) = flags.positionals.first().map(String::as_str) {
-        match sub {
-            "menu" | "interactive" => return interactive_menu(&paths, &help_txt).await,
-            "countries" | "regions" | "c" => {
-                return cmd_countries(&paths, pfilter, flags.refresh).await;
-            }
-            "list" | "ls" | "servers" => {
-                let country = flags
-                    .country
-                    .as_deref()
-                    .or_else(|| flags.positionals.get(1).map(String::as_str));
-                let lim = flags.limit.unwrap_or(25);
-                return cmd_list(&paths, country, pfilter, sby, lim, flags.refresh).await;
-            }
-            "connect" | "up" | "engage" => {
-                let country = flags
-                    .country
-                    .clone()
-                    .or_else(|| flags.positionals.get(1).cloned())
-                    .unwrap_or_default();
-                let cargs = ConnectArgs {
-                    country,
-                    proto_filter: pfilter,
-                    sort_by: sby,
-                    limit: flags.limit.unwrap_or(0),
-                    timeout_secs: flags.timeout.unwrap_or(22),
-                    engine: flags.engine.unwrap_or_else(|| "auto".to_string()),
-                    dns: flags.dns.unwrap_or_else(|| "1.1.1.1 1.0.0.1".to_string()),
-                    start_index: flags.start.unwrap_or(1),
-                    force_refresh: flags.refresh,
-                    auto_reconnect_override: flags.autoreconnect,
-                };
-                return cmd_connect(&paths, &cargs).await;
-            }
-            "refresh" | "update" => return cmd_refresh(&paths).await,
-            "status" | "st" => return cmd_status(&paths).await,
-            "doctor" | "check" | "diag" => return cmd_doctor(&paths),
-            "watchdog" | "wd" => {
-                let mode = flags
-                    .positionals
-                    .get(1)
-                    .map(String::as_str)
-                    .unwrap_or("status");
-                return Ok(cmd_watchdog(&paths, mode));
-            }
-            "disconnect" | "down" | "stop" | "d" => return cmd_disconnect(&paths).await,
-            "probe" => {
-                let Some(ip) = flags.positionals.get(1) else {
-                    err("Usage: vpngate probe <IPV4>");
-                    return Ok(2);
-                };
-                return cmd_probe(ip).await;
-            }
-            other => {
-                err(&format!("Unknown command '{other}'. Run `vpngate --help`."));
-                return Ok(2);
-            }
         }
+        i += 1;
     }
 
-    // Top-level shorthand flag dispatch (matching Python v5.3)
-    if flags.interactive {
-        if flags.refresh {
-            let _ = cmd_refresh(&paths).await?;
-        }
-        return interactive_menu(&paths, &help_txt).await;
+    let proto_filter = ProtocolFilter::from_cli_str(&proto_str).unwrap_or_else(|| {
+        err(&format!(
+            "Invalid protocol '{proto_str}' (expected auto, l2tp, openvpn-udp, openvpn-tcp, openvpn)."
+        ));
+        std::process::exit(2);
+    });
+    let sort_by = SortBy::from_cli_str(&sort_str).unwrap_or(SortBy::Recommended);
+
+    if flag_interactive || matches!(subcmd.as_str(), "menu" | "interactive") {
+        return interactive_menu(&paths, &help_text).await;
     }
-    if flags.disconnect {
+    if flag_disconnect || matches!(subcmd.as_str(), "disconnect" | "down" | "stop" | "d") {
         return cmd_disconnect(&paths).await;
     }
-    if flags.doctor {
+    if flag_doctor || matches!(subcmd.as_str(), "doctor" | "check" | "diag") {
         return cmd_doctor(&paths);
     }
-    if flags.status {
+    if flag_status || matches!(subcmd.as_str(), "status" | "st") {
         return cmd_status(&paths).await;
     }
-    if flags.list_countries {
-        return cmd_countries(&paths, pfilter, flags.refresh).await;
+    if flag_mirrors || matches!(subcmd.as_str(), "mirrors" | "mirror" | "sites") {
+        return cmd_mirrors(&paths, &custom_mirrors).await;
     }
-    if flags.list_servers {
+    if matches!(subcmd.as_str(), "watchdog" | "wd") {
+        let mode = positional.first().map(String::as_str).unwrap_or("status");
+        return Ok(cmd_watchdog(&paths, mode));
+    }
+    if matches!(subcmd.as_str(), "probe") {
+        let Some(ip) = positional.first() else {
+            err("Usage: vpngate probe <IPv4>");
+            return Ok(2);
+        };
+        return cmd_probe(ip).await;
+    }
+    if matches!(subcmd.as_str(), "refresh" | "update") {
+        return cmd_refresh(&paths, &custom_mirrors).await;
+    }
+    if flag_countries || matches!(subcmd.as_str(), "countries" | "regions" | "c") {
+        return cmd_countries(&paths, proto_filter, force_refresh, &custom_mirrors).await;
+    }
+    if flag_list || matches!(subcmd.as_str(), "list" | "ls" | "servers") {
+        let target_cc = country.or_else(|| positional.first().cloned());
         return cmd_list(
             &paths,
-            flags.country.as_deref(),
-            pfilter,
-            sby,
-            flags.limit.unwrap_or(25),
-            flags.refresh,
+            target_cc.as_deref(),
+            proto_filter,
+            sort_by,
+            limit.unwrap_or(25),
+            force_refresh,
+            &custom_mirrors,
         )
         .await;
     }
-    if let Some(country) = flags.country {
+    if matches!(subcmd.as_str(), "connect" | "up" | "engage") || country.is_some() {
+        let target_cc = country
+            .or_else(|| positional.first().cloned())
+            .unwrap_or_default();
         let cargs = ConnectArgs {
-            country,
-            proto_filter: pfilter,
-            sort_by: sby,
-            limit: flags.limit.unwrap_or(0),
-            timeout_secs: flags.timeout.unwrap_or(22),
-            engine: flags.engine.unwrap_or_else(|| "auto".to_string()),
-            dns: flags.dns.unwrap_or_else(|| "1.1.1.1 1.0.0.1".to_string()),
-            start_index: flags.start.unwrap_or(1),
-            force_refresh: flags.refresh,
-            auto_reconnect_override: flags.autoreconnect,
+            country: target_cc,
+            proto_filter,
+            sort_by,
+            limit: limit.unwrap_or(0),
+            timeout_secs,
+            engine,
+            dns,
+            start_index,
+            force_refresh,
+            auto_reconnect_override,
+            custom_mirrors,
         };
         return cmd_connect(&paths, &cargs).await;
     }
-    if flags.refresh {
-        return cmd_refresh(&paths).await;
+    if force_refresh {
+        return cmd_refresh(&paths, &custom_mirrors).await;
     }
 
-    interactive_menu(&paths, &help_txt).await
+    interactive_menu(&paths, &help_text).await
 }
 
 #[tokio::main]
-async fn main() -> ExitCode {
-    match dispatch().await {
-        Ok(0) => ExitCode::SUCCESS,
-        Ok(code) => ExitCode::from(code.clamp(1, 255) as u8),
-        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+async fn main() {
+    let code = match dispatch().await {
+        Ok(c) => c,
         Err(e) => {
-            err(&format!("I/O error: {e}"));
-            ExitCode::FAILURE
+            err(&format!("Fatal runtime error: {e}"));
+            1
         }
-    }
+    };
+    std::process::exit(code);
 }

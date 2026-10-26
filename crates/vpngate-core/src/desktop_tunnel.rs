@@ -12,6 +12,7 @@ use crate::cache::{
     atomic_write_json, fix_owner, get_public_ip_trace, get_servers_cached, load_cooldowns,
     load_watchdog_pref, now_unix_secs, read_json_opt, save_cooldowns,
 };
+use crate::discovery::ProgressEvent;
 use crate::ikev1::{probe_tcp, verify_l2tp_psk_vpn};
 use crate::ikev1_daemon::VPNGATE_XFRM_REQID;
 use crate::profile::{OvpnPatchOptions, build_patched_ovpn};
@@ -590,10 +591,27 @@ fn stop_ikev1_daemon_and_xfrm(paths: &AppPaths) {
     let _ = fs::remove_file(&paths.ikev1_state);
 }
 
-/// Tears down any active or partial VPN session and restores routes, DNS, firewall, and sysctls.
+/// Tears down any active or partial VPN session silently.
 pub fn cleanup_existing_vpn(paths: &AppPaths, full_teardown: bool, stop_monitor: bool) {
+    cleanup_existing_vpn_with_progress(paths, full_teardown, stop_monitor, true, |_| {});
+}
+
+/// Tears down any active or partial VPN session and restores routes, DNS, firewall, and sysctls.
+pub fn cleanup_existing_vpn_with_progress(
+    paths: &AppPaths,
+    full_teardown: bool,
+    stop_monitor: bool,
+    quiet: bool,
+    mut on_progress: impl FnMut(ProgressEvent),
+) {
     let _ = paths.ensure_dirs();
     if stop_monitor {
+        let mon_pid = get_running_monitor_pid(paths);
+        if mon_pid > 0 && !quiet {
+            on_progress(ProgressEvent::Info(format!(
+                "Stopping Auto-Reconnect Watchdog (PID {mon_pid}) ..."
+            )));
+        }
         stop_monitor_daemon(paths);
     }
     let _ = fs::remove_file(&paths.active_state);
@@ -602,9 +620,19 @@ pub fn cleanup_existing_vpn(paths: &AppPaths, full_teardown: bool, stop_monitor:
         if let Ok(txt) = fs::read_to_string(&paths.ovpn_pid)
             && let Ok(pid) = txt.trim().parse::<u32>()
         {
+            if !quiet {
+                on_progress(ProgressEvent::Info(format!(
+                    "Stopping OpenVPN process (PID {pid}) ..."
+                )));
+            }
             terminate_pid(pid, true);
         }
         let _ = fs::remove_file(&paths.ovpn_pid);
+        if !quiet {
+            on_progress(ProgressEvent::Info(format!(
+                "Disconnecting Windows RAS profile '{WIN_VPN_PROFILE_NAME}' ..."
+            )));
+        }
         let _ = Command::new("rasdial")
             .args([WIN_VPN_PROFILE_NAME, "/DISCONNECT"])
             .stdout(Stdio::null())
@@ -631,6 +659,12 @@ pub fn cleanup_existing_vpn(paths: &AppPaths, full_teardown: bool, stop_monitor:
             let parts: Vec<&str> = line.split(':').collect();
             if parts.len() >= 3 && parts[1].starts_with(NM_PROFILE_PREFIX) {
                 let uuid = parts[0];
+                let name = parts[1];
+                if !quiet {
+                    on_progress(ProgressEvent::Info(format!(
+                        "Removing NetworkManager VPN profile: {name}"
+                    )));
+                }
                 let _ = Command::new("nmcli")
                     .args(["--wait", "5", "connection", "down", "uuid", uuid])
                     .stdout(Stdio::null())
@@ -650,6 +684,11 @@ pub fn cleanup_existing_vpn(paths: &AppPaths, full_teardown: bool, stop_monitor:
         && let Ok(pid) = txt.trim().parse::<u32>()
         && pid_matches_cmdline(pid, "openvpn")
     {
+        if !quiet {
+            on_progress(ProgressEvent::Info(format!(
+                "Stopping OpenVPN daemon (PID {pid}) ..."
+            )));
+        }
         terminate_pid(pid, false);
         std::thread::sleep(Duration::from_millis(400));
     }
@@ -669,6 +708,11 @@ pub fn cleanup_existing_vpn(paths: &AppPaths, full_teardown: bool, stop_monitor:
             && let Ok(pid) = txt.trim().parse::<u32>()
             && pid_matches_cmdline(pid, "xl2tpd")
         {
+            if !quiet {
+                on_progress(ProgressEvent::Info(format!(
+                    "Stopping xl2tpd daemon (PID {pid}) ..."
+                )));
+            }
             terminate_pid(pid, false);
             std::thread::sleep(Duration::from_millis(250));
         }
@@ -678,6 +722,11 @@ pub fn cleanup_existing_vpn(paths: &AppPaths, full_teardown: bool, stop_monitor:
             .stderr(Stdio::null())
             .status();
 
+        if !quiet && (paths.ikev1_pid.exists() || paths.ikev1_state.exists()) {
+            on_progress(ProgressEvent::Info(
+                "Stopping built-in IKEv1/XFRM daemon & flushing kernel XFRM rules ...".to_string(),
+            ));
+        }
         stop_ikev1_daemon_and_xfrm(paths);
 
         if let Some(rt) = read_json_opt::<PinnedRouteRecord>(&paths.l2tp_route) {
@@ -711,6 +760,7 @@ pub async fn connect_l2tp_linux_builtin(
     server: &VpnServer,
     dns_servers: &[String],
     timeout_secs: u64,
+    mut on_progress: impl FnMut(ProgressEvent),
 ) -> std::result::Result<String, String> {
     let xl2tpd_bin = which_bin("xl2tpd")
         .or_else(|| {
@@ -782,7 +832,10 @@ pub async fn connect_l2tp_linux_builtin(
     let _ = fs::write(&paths.ikev1_pid, format!("{}\n", ike_child.id()));
     fix_owner(&paths.ikev1_pid);
 
-    // Wait up to 9s for Phase 1 + Quick Mode + XFRM SA installation
+    // Wait up to 9s for Phase 1 + Quick Mode + XFRM SA installation (with live 100ms spinner)
+    let total_max = timeout_secs.max(14) + 9;
+    let started_all = Instant::now();
+    let mut tick = 0usize;
     let ike_deadline = Instant::now() + Duration::from_secs(9);
     let mut ike_ready = false;
     while Instant::now() < ike_deadline {
@@ -791,6 +844,7 @@ pub async fn connect_l2tp_linux_builtin(
                 ike_ready = true;
                 break;
             } else if st.status == "error" {
+                on_progress(ProgressEvent::ClearTransient);
                 let _ = ike_child.kill();
                 stop_ikev1_daemon_and_xfrm(paths);
                 return Err(format!("IKEv1 negotiation failed: {}", st.error));
@@ -799,9 +853,19 @@ pub async fn connect_l2tp_linux_builtin(
         if ike_child.try_wait().ok().flatten().is_some() {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(120)).await;
+        if tick.is_multiple_of(2) {
+            on_progress(ProgressEvent::Transient {
+                stage: "L2TP/IPsec handshake (IKEv1 Phase 1 & Quick Mode XFRM)".to_string(),
+                elapsed_secs: started_all.elapsed().as_secs(),
+                max_secs: total_max,
+                tick: tick / 2,
+            });
+        }
+        tick += 1;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     if !ike_ready {
+        on_progress(ProgressEvent::ClearTransient);
         let _ = ike_child.kill();
         stop_ikev1_daemon_and_xfrm(paths);
         return Err("IKEv1 Phase 1/2 timed out before XFRM installation".to_string());
@@ -848,8 +912,12 @@ pub async fn connect_l2tp_linux_builtin(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .map_err(|e| format!("Failed starting xl2tpd: {e}"))?;
+        .map_err(|e| {
+            on_progress(ProgressEvent::ClearTransient);
+            format!("Failed starting xl2tpd: {e}")
+        })?;
     if !xl_status.success() {
+        on_progress(ProgressEvent::ClearTransient);
         stop_ikev1_daemon_and_xfrm(paths);
         return Err("xl2tpd exited immediately with non-zero status".to_string());
     }
@@ -862,6 +930,7 @@ pub async fn connect_l2tp_linux_builtin(
             ppp_dev = new_d.clone();
             break;
         }
+        let mut ppp_stage = "dialing xl2tpd L2TP/PPP";
         if let Ok(log_txt) = fs::read_to_string(&pppd_log) {
             let low = log_txt.to_ascii_lowercase();
             if low.contains("authentication failed")
@@ -870,9 +939,24 @@ pub async fn connect_l2tp_linux_builtin(
             {
                 break;
             }
+            if low.contains("chap authentication succeeded") || low.contains("sent [ipcp") {
+                ppp_stage = "negotiating PPP IPCP IPv4 lease";
+            } else if low.contains("using interface ppp") {
+                ppp_stage = "authenticating PPP session";
+            }
         }
-        tokio::time::sleep(Duration::from_millis(350)).await;
+        if tick.is_multiple_of(2) {
+            on_progress(ProgressEvent::Transient {
+                stage: format!("L2TP/IPsec handshake ({ppp_stage})"),
+                elapsed_secs: started_all.elapsed().as_secs(),
+                max_secs: total_max,
+                tick: tick / 2,
+            });
+        }
+        tick += 1;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    on_progress(ProgressEvent::ClearTransient);
 
     if ppp_dev.is_empty() {
         let _ = Command::new("pkill")
@@ -917,6 +1001,7 @@ pub async fn connect_l2tp_windows(
     server: &VpnServer,
     dns_servers: &[String],
     timeout_secs: u64,
+    mut on_progress: impl FnMut(ProgressEvent),
 ) -> std::result::Result<String, String> {
     let gw = get_default_gateway();
     if !gw.gw.is_empty() {
@@ -962,18 +1047,40 @@ pub async fn connect_l2tp_windows(
         .stderr(Stdio::null())
         .status();
 
-    let dial = tokio::time::timeout(
-        Duration::from_secs(timeout_secs.max(30)),
-        tokio::process::Command::new("rasdial")
-            .args([WIN_VPN_PROFILE_NAME, "vpn", "vpn"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status(),
-    )
-    .await
-    .map_err(|_| "Windows rasdial timed out".to_string())?
-    .map_err(|e| format!("rasdial error: {e}"))?;
+    let eff_max = timeout_secs.max(30);
+    let started = Instant::now();
+    let mut tick = 0usize;
+    let mut child = tokio::process::Command::new("rasdial")
+        .args([WIN_VPN_PROFILE_NAME, "vpn", "vpn"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("rasdial spawn error: {e}"))?;
 
+    let status_opt = loop {
+        if let Ok(Some(st)) = child.try_wait() {
+            break Some(st);
+        }
+        if started.elapsed() >= Duration::from_secs(eff_max) {
+            let _ = child.kill().await;
+            break None;
+        }
+        if tick.is_multiple_of(2) {
+            on_progress(ProgressEvent::Transient {
+                stage: "Windows 11 L2TP/IPsec RAS dial (PSK='vpn', Zero IKEv2)".to_string(),
+                elapsed_secs: started.elapsed().as_secs(),
+                max_secs: eff_max,
+                tick: tick / 2,
+            });
+        }
+        tick += 1;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    on_progress(ProgressEvent::ClearTransient);
+
+    let Some(dial) = status_opt else {
+        return Err("Windows rasdial timed out".to_string());
+    };
     if !dial.success() {
         return Err("Windows rasdial returned non-zero status".to_string());
     }
@@ -1005,6 +1112,7 @@ pub async fn connect_openvpn_desktop(
     engine: &str,
     dns_servers: &[String],
     timeout_secs: u64,
+    mut on_progress: impl FnMut(ProgressEvent),
 ) -> std::result::Result<(String, String), String> {
     let ovpn_bin = find_openvpn_bin().ok_or("OpenVPN binary (`openvpn`) not found")?;
     let compat = detect_openvpn_compat(&ovpn_bin);
@@ -1030,9 +1138,9 @@ pub async fn connect_openvpn_desktop(
         snapshot_and_apply_linux_sysctls(paths, false);
     }
 
-    // Try NetworkManager first on Linux if requested (`auto` or `nm`)
+    // Try NetworkManager first on Linux if explicitly requested (`nm`)
     if cfg!(target_os = "linux")
-        && (engine == "auto" || engine == "nm")
+        && engine == "nm"
         && which_bin("nmcli").is_some()
         && let Ok(imp) = Command::new("nmcli")
             .args(["connection", "import", "type", "openvpn", "file"])
@@ -1067,7 +1175,9 @@ pub async fn connect_openvpn_desktop(
             .stderr(Stdio::null())
             .status();
 
-        let up = Command::new("nmcli")
+        let started_nm = Instant::now();
+        let mut tick_nm = 0usize;
+        if let Ok(mut nm_child) = tokio::process::Command::new("nmcli")
             .args([
                 "--wait",
                 &timeout_secs.to_string(),
@@ -1077,14 +1187,36 @@ pub async fn connect_openvpn_desktop(
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status();
-        if up.map(|s| s.success()).unwrap_or(false) {
-            let dev = get_tun_interfaces()
-                .keys()
-                .next()
-                .cloned()
-                .unwrap_or_else(|| "tun0".to_string());
-            return Ok((dev, "nmcli-openvpn".to_string()));
+            .spawn()
+        {
+            let nm_ok = loop {
+                if let Ok(Some(st)) = nm_child.try_wait() {
+                    break st.success();
+                }
+                if started_nm.elapsed() >= Duration::from_secs(timeout_secs + 2) {
+                    let _ = nm_child.kill().await;
+                    break false;
+                }
+                if tick_nm.is_multiple_of(2) {
+                    on_progress(ProgressEvent::Transient {
+                        stage: "OpenVPN handshake (NetworkManager)".to_string(),
+                        elapsed_secs: started_nm.elapsed().as_secs(),
+                        max_secs: timeout_secs,
+                        tick: tick_nm / 2,
+                    });
+                }
+                tick_nm += 1;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            };
+            on_progress(ProgressEvent::ClearTransient);
+            if nm_ok {
+                let dev = get_tun_interfaces()
+                    .keys()
+                    .next()
+                    .cloned()
+                    .unwrap_or_else(|| "tun0".to_string());
+                return Ok((dev, "nmcli-openvpn".to_string()));
+            }
         }
         let _ = Command::new("nmcli")
             .args(["connection", "delete", &profile_name])
@@ -1093,7 +1225,7 @@ pub async fn connect_openvpn_desktop(
             .status();
     }
 
-    // Direct OpenVPN daemon fallback (Linux, macOS, Windows)
+    // Direct OpenVPN daemon with live 100ms `openvpn.log` stage inspection (`PY` parity!)
     let before_tun = get_tun_interfaces();
     let log_path = paths.cache_dir.join("openvpn.log");
     let _ = fs::remove_file(&log_path);
@@ -1118,62 +1250,154 @@ pub async fn connect_openvpn_desktop(
         let _ = fs::write(&paths.ovpn_pid, format!("{}\n", child.id()));
     }
 
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs.max(15));
-    while Instant::now() < deadline {
-        if let Ok(log_txt) = fs::read_to_string(&log_path) {
-            if log_txt.contains("Initialization Sequence Completed") {
-                let cur = get_tun_interfaces();
-                let dev = cur
-                    .keys()
-                    .find(|d| !before_tun.contains_key(*d))
-                    .or_else(|| cur.keys().next())
-                    .cloned()
-                    .unwrap_or_else(|| "tun0".to_string());
+    let eff_timeout = if cfg!(target_os = "windows") {
+        timeout_secs.max(38)
+    } else {
+        timeout_secs.max(15)
+    };
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(eff_timeout);
+    let mut tick = 0usize;
 
-                if cfg!(target_os = "linux")
-                    && !dns_servers.is_empty()
-                    && which_bin("resolvectl").is_some()
-                {
-                    let mut args = vec!["dns".to_string(), dev.clone()];
-                    args.extend(dns_servers.iter().cloned());
-                    let _ = Command::new("resolvectl")
-                        .args(&args)
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status();
-                    let _ = Command::new("resolvectl")
-                        .args(["domain", &dev, "~."])
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status();
-                }
-                return Ok((dev, "openvpn-daemon".to_string()));
-            }
-            if log_txt.contains("AUTH_FAILED") || log_txt.contains("Exiting due to fatal error") {
+    let live_abort_markers = [
+        "Initialization Sequence Completed With Errors",
+        "There are no TAP-Windows adapters",
+        "All tap-windows6 adapters",
+        "All TAP-Windows adapters",
+        "All wintun adapters",
+        "Server did not request DATA_V2",
+        "Blocking DNS failed",
+        "ERROR: Exit Event",
+        "Exiting due to fatal error",
+    ];
+
+    let mut established = false;
+    while Instant::now() < deadline {
+        let mut stage = "connecting";
+        if let Ok(log_txt) = fs::read_to_string(&log_path) {
+            if log_txt.contains("Initialization Sequence Completed With Errors") {
                 break;
             }
+            if log_txt.contains("Initialization Sequence Completed") {
+                established = true;
+                break;
+            }
+            if live_abort_markers.iter().any(|m| log_txt.contains(m)) {
+                break;
+            }
+            if log_txt.matches("AUTH_FAILED").count() >= 2 {
+                break;
+            }
+            if log_txt.contains("PUSH: Received control message") || log_txt.contains("open_tun") {
+                stage = "configuring TUN adapter & routes";
+            } else if log_txt.contains("SENT CONTROL")
+                || log_txt.contains("Peer Connection Initiated")
+            {
+                stage = "requesting VPN IP & routes";
+            } else if log_txt.contains("TLS: Initial packet from") || log_txt.contains("VERIFY OK:")
+            {
+                stage = "TLS handshake";
+            } else if log_txt.contains("Attempting to establish TCP connection")
+                || log_txt.contains("UDPv4 link remote")
+            {
+                stage = "contacting remote peer";
+            }
         }
-        tokio::time::sleep(Duration::from_millis(350)).await;
+
+        if tick.is_multiple_of(2) {
+            on_progress(ProgressEvent::Transient {
+                stage: format!("OpenVPN handshake ({stage})"),
+                elapsed_secs: started.elapsed().as_secs(),
+                max_secs: eff_timeout,
+                tick: tick / 2,
+            });
+        }
+        tick += 1;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    on_progress(ProgressEvent::ClearTransient);
+
+    if established {
+        let cur = get_tun_interfaces();
+        let dev = cur
+            .keys()
+            .find(|d| !before_tun.contains_key(*d))
+            .or_else(|| cur.keys().next())
+            .cloned()
+            .unwrap_or_else(|| "tun0".to_string());
+
+        if cfg!(target_os = "linux") && !dns_servers.is_empty() && which_bin("resolvectl").is_some()
+        {
+            let mut args = vec!["dns".to_string(), dev.clone()];
+            args.extend(dns_servers.iter().cloned());
+            let _ = Command::new("resolvectl")
+                .args(&args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            let _ = Command::new("resolvectl")
+                .args(["domain", &dev, "~."])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        return Ok((dev, "openvpn-daemon".to_string()));
     }
 
-    Err("OpenVPN handshake timed out".to_string())
+    Err("OpenVPN handshake failed or timed out".to_string())
 }
 
 /// Verifies end-to-end tunnel routing and confirms public IPv4 egress changed from `initial_ip`.
 pub async fn verify_tunnel_egress(initial_ip: &str) -> Option<PublicIpTrace> {
-    tokio::time::sleep(Duration::from_millis(1200)).await;
-    for attempt in 0..4 {
-        if let Some(trace) = get_public_ip_trace(Duration::from_secs(5)).await
-            && !trace.ip.is_empty()
-            && (initial_ip.is_empty() || trace.ip != initial_ip)
-        {
-            return Some(trace);
+    verify_tunnel_egress_with_progress(initial_ip, |_| {}).await
+}
+
+/// Verifies end-to-end tunnel routing with live 100ms spinner progress (`PY` parity).
+pub async fn verify_tunnel_egress_with_progress(
+    initial_ip: &str,
+    mut on_progress: impl FnMut(ProgressEvent),
+) -> Option<PublicIpTrace> {
+    let max_secs = 22u64;
+    let started = Instant::now();
+    let mut tick = 0usize;
+
+    let fut = async {
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        for attempt in 0..4 {
+            if let Some(trace) = get_public_ip_trace(Duration::from_secs(5)).await
+                && !trace.ip.is_empty()
+                && (initial_ip.is_empty() || trace.ip != initial_ip)
+            {
+                return Some(trace);
+            }
+            if attempt < 3 {
+                tokio::time::sleep(Duration::from_millis(1300)).await;
+            }
         }
-        if attempt < 3 {
-            tokio::time::sleep(Duration::from_millis(1400)).await;
+        None
+    };
+
+    tokio::pin!(fut);
+    let mut interval = tokio::time::interval(Duration::from_millis(100));
+    let _ = interval.tick().await;
+    let out = loop {
+        tokio::select! {
+            res = &mut fut => break res,
+            _ = interval.tick() => {
+                if tick.is_multiple_of(2) {
+                    on_progress(ProgressEvent::Transient {
+                        stage: "Tunnel up! Verifying end-to-end internet routing & egress IP".to_string(),
+                        elapsed_secs: started.elapsed().as_secs(),
+                        max_secs,
+                        tick: tick / 2,
+                    });
+                }
+                tick += 1;
+            }
         }
-    }
-    None
+    };
+    on_progress(ProgressEvent::ClearTransient);
+    out
 }
 
 /// Checks active VPN session link + optional data-plane egress health for `vpngate _monitor`.
@@ -1265,22 +1489,81 @@ pub struct ConnectSessionConfig {
     pub in_monitor: bool,
 }
 
-/// Attempts connection across ranked `candidates` following `L2TP/IPsec -> OVPN UDP -> OVPN TCP`.
+/// Attempts connection across ranked `candidates` with plain text log callback.
 pub async fn engage_candidates(
     paths: &AppPaths,
     candidates: &[VpnServer],
     cfg: &ConnectSessionConfig,
     mut on_log: impl FnMut(&str),
 ) -> i32 {
+    engage_candidates_with_progress(paths, candidates, cfg, |ev| match ev {
+        ProgressEvent::Info(m) | ProgressEvent::Ok(m) | ProgressEvent::Warn(m) => on_log(&m),
+        ProgressEvent::AttemptBanner {
+            index,
+            total,
+            hostname,
+            ip,
+            country_short,
+            speed_mbps,
+            ..
+        } => on_log(&format!(
+            "[{index}/{total}] Testing {hostname} ({ip} - {country_short}, {speed_mbps:.1} Mbps) ..."
+        )),
+        ProgressEvent::Transient { .. } | ProgressEvent::ClearTransient => {}
+    })
+    .await
+}
+
+/// Attempts connection across ranked `candidates` following `L2TP/IPsec -> OVPN UDP -> OVPN TCP`
+/// with rich `ProgressEvent` reporting (`PY` branch parity).
+pub async fn engage_candidates_with_progress(
+    paths: &AppPaths,
+    candidates: &[VpnServer],
+    cfg: &ConnectSessionConfig,
+    mut on_progress: impl FnMut(ProgressEvent),
+) -> i32 {
     if candidates.is_empty() {
         return 1;
     }
 
     cleanup_existing_vpn(paths, false, !cfg.in_monitor);
-    let initial_ip = get_public_ip_trace(Duration::from_secs(4))
-        .await
-        .map(|t| t.ip)
-        .unwrap_or_default();
+
+    // Check pre-VPN public IP with live spinner
+    let mut ip_tick = 0usize;
+    let ip_started = Instant::now();
+    let trace_fut = get_public_ip_trace(Duration::from_secs(4));
+    tokio::pin!(trace_fut);
+    let mut ip_interval = tokio::time::interval(Duration::from_millis(100));
+    let _ = ip_interval.tick().await;
+    let pre_trace = loop {
+        tokio::select! {
+            res = &mut trace_fut => break res,
+            _ = ip_interval.tick() => {
+                if !cfg.in_monitor && ip_tick.is_multiple_of(2) {
+                    on_progress(ProgressEvent::Transient {
+                        stage: "Checking current public IP before VPN".to_string(),
+                        elapsed_secs: ip_started.elapsed().as_secs(),
+                        max_secs: 4,
+                        tick: ip_tick / 2,
+                    });
+                }
+                ip_tick += 1;
+            }
+        }
+    };
+    on_progress(ProgressEvent::ClearTransient);
+
+    let initial_ip = if let Some(ref tr) = pre_trace {
+        if !cfg.in_monitor {
+            on_progress(ProgressEvent::Info(format!(
+                "Current public IP before VPN: {} ({})",
+                tr.ip, tr.loc
+            )));
+        }
+        tr.ip.clone()
+    } else {
+        String::new()
+    };
 
     let start_pos = cfg.start_index.saturating_sub(1);
     let mut ordered: Vec<VpnServer> = candidates.iter().skip(start_pos).cloned().collect();
@@ -1296,15 +1579,17 @@ pub async fn engage_candidates(
         if protos.is_empty() {
             continue;
         }
-        on_log(&format!(
-            "[{}/{}] Testing {} ({} - {}, {:.1} Mbps) ...",
-            idx + 1,
+        on_progress(ProgressEvent::AttemptBanner {
+            index: idx + 1,
             total,
-            srv.hostname,
-            srv.ip,
-            srv.country_short,
-            srv.speed_mbps()
-        ));
+            hostname: srv.hostname.clone(),
+            ip: srv.ip.clone(),
+            country_short: srv.country_short.clone(),
+            country_long: srv.country_long.clone(),
+            speed_mbps: srv.speed_mbps(),
+            ping_ms: srv.ping_ms,
+            score: srv.score,
+        });
 
         for proto in protos {
             if cooldowns.is_on_cooldown(&srv.ip, proto) {
@@ -1318,26 +1603,47 @@ pub async fn engage_candidates(
                     let pre =
                         verify_l2tp_psk_vpn(ip_v4, Duration::from_millis(1400), 2, b"vpn").await;
                     if !pre.is_verified() {
-                        on_log(&format!("  -> L2TP pre-flight skipped ({pre:?})"));
+                        on_progress(ProgressEvent::Warn(format!(
+                            "  -> L2TP pre-flight skipped ({pre:?})"
+                        )));
                         cooldowns.mark_failed(&srv.ip, proto);
                         save_cooldowns(paths, &mut cooldowns);
                         continue;
                     }
-                    on_log(&format!(
-                        "  -> Engaging L2TP/IPsec (PSK='vpn', Zero IKEv2) on {} ...",
-                        srv.ip
-                    ));
+                    on_progress(ProgressEvent::Info(if cfg!(target_os = "windows") {
+                        format!(
+                            "  -> Engaging Windows 11 Native L2TP/IPsec (`RASMAN`/`IKEEXT`, PSK='vpn', Zero IKEv2) on {} ...",
+                            srv.ip
+                        )
+                    } else {
+                        format!(
+                            "  -> Engaging Built-In IKEv1/XFRM (PSK='vpn', Zero IKEv2) + xl2tpd on {} ...",
+                            srv.ip
+                        )
+                    }));
                     let res = if cfg!(target_os = "windows") {
-                        connect_l2tp_windows(paths, srv, &cfg.dns_servers, cfg.timeout_secs)
-                            .await
-                            .map(|d| (d, "win-ras-l2tp".to_string()))
+                        connect_l2tp_windows(
+                            paths,
+                            srv,
+                            &cfg.dns_servers,
+                            cfg.timeout_secs,
+                            &mut on_progress,
+                        )
+                        .await
+                        .map(|d| (d, "win-ras-l2tp".to_string()))
                     } else if cfg!(target_os = "linux") {
-                        connect_l2tp_linux_builtin(paths, srv, &cfg.dns_servers, cfg.timeout_secs)
-                            .await
-                            .map(|d| {
-                                let label = format!("builtin-xfrm-{d}");
-                                (d, label)
-                            })
+                        connect_l2tp_linux_builtin(
+                            paths,
+                            srv,
+                            &cfg.dns_servers,
+                            cfg.timeout_secs,
+                            &mut on_progress,
+                        )
+                        .await
+                        .map(|d| {
+                            let label = format!("builtin-xfrm-{d}");
+                            (d, label)
+                        })
                     } else {
                         Err(
                             "Automated L2TP on macOS uses Apple profile; falling back to OpenVPN"
@@ -1347,7 +1653,13 @@ pub async fn engage_candidates(
 
                     match res {
                         Ok((dev, backend)) => {
-                            if let Some(trace) = verify_tunnel_egress(&initial_ip).await {
+                            on_progress(ProgressEvent::Info(format!(
+                                "  -> L2TP interface {dev} up! Verifying end-to-end internet routing & egress IP ..."
+                            )));
+                            if let Some(trace) =
+                                verify_tunnel_egress_with_progress(&initial_ip, &mut on_progress)
+                                    .await
+                            {
                                 cooldowns.clear_server(&srv.ip);
                                 save_cooldowns(paths, &mut cooldowns);
                                 record_active_session(
@@ -1361,15 +1673,26 @@ pub async fn engage_candidates(
                                     cfg,
                                 );
                                 if cfg.auto_reconnect && !cfg.in_monitor {
-                                    spawn_auto_reconnect_monitor(paths);
+                                    let mon_pid = spawn_auto_reconnect_monitor(paths);
+                                    if mon_pid > 0 {
+                                        on_progress(ProgressEvent::Info(format!(
+                                            "Auto-Reconnect Monitor armed (PID {mon_pid}, polling every {MONITOR_INTERVAL_SECONDS}s)."
+                                        )));
+                                    }
                                 }
                                 return 0;
                             }
-                            on_log("  -> L2TP interface came up, but egress verification failed.");
+                            on_progress(ProgressEvent::Warn(format!(
+                                "  -> L2TP ({dev}) came up on {} but failed egress verification.",
+                                srv.ip
+                            )));
                             cleanup_existing_vpn(paths, false, !cfg.in_monitor);
                         }
                         Err(e) => {
-                            on_log(&format!("  -> L2TP failed: {e}"));
+                            on_progress(ProgressEvent::Warn(format!(
+                                "  -> L2TP/IPsec negotiation failed on {} ({e}).",
+                                srv.ip
+                            )));
                             cleanup_existing_vpn(paths, false, !cfg.in_monitor);
                         }
                     }
@@ -1377,6 +1700,10 @@ pub async fn engage_candidates(
                     save_cooldowns(paths, &mut cooldowns);
                 }
                 VpnProtocol::OpenVpnUdp | VpnProtocol::OpenVpnTcp => {
+                    let port = match proto {
+                        VpnProtocol::OpenVpnTcp => srv.tcp_port,
+                        _ => srv.udp_port,
+                    };
                     if proto == VpnProtocol::OpenVpnTcp
                         && srv.tcp_port > 0
                         && let Ok(ip_v4) = srv.ip.parse()
@@ -1384,20 +1711,24 @@ pub async fn engage_candidates(
                         let addr =
                             std::net::SocketAddr::new(std::net::IpAddr::V4(ip_v4), srv.tcp_port);
                         if probe_tcp(addr, Duration::from_millis(2000)).await.is_none() {
-                            on_log(&format!(
+                            on_progress(ProgressEvent::Warn(format!(
                                 "  -> TCP port {} unreachable; skipping.",
                                 srv.tcp_port
-                            ));
+                            )));
                             cooldowns.mark_failed(&srv.ip, proto);
                             save_cooldowns(paths, &mut cooldowns);
                             continue;
                         }
                     }
-                    on_log(&format!(
-                        "  -> Engaging {} on {} ...",
-                        proto.as_label(),
+                    let port_tag = if port > 0 {
+                        format!("{}:{port}", proto.as_label())
+                    } else {
+                        proto.as_label().to_string()
+                    };
+                    on_progress(ProgressEvent::Info(format!(
+                        "  -> Engaging {port_tag} on {} ...",
                         srv.ip
-                    ));
+                    )));
                     match connect_openvpn_desktop(
                         paths,
                         srv,
@@ -1405,17 +1736,25 @@ pub async fn engage_candidates(
                         &cfg.engine,
                         &cfg.dns_servers,
                         cfg.timeout_secs,
+                        &mut on_progress,
                     )
                     .await
                     {
                         Ok((dev, backend)) => {
-                            if let Some(trace) = verify_tunnel_egress(&initial_ip).await {
+                            on_progress(ProgressEvent::Info(
+                                "  -> Tunnel up! Verifying end-to-end internet routing & egress IP ..."
+                                    .to_string(),
+                            ));
+                            if let Some(trace) =
+                                verify_tunnel_egress_with_progress(&initial_ip, &mut on_progress)
+                                    .await
+                            {
                                 cooldowns.clear_server(&srv.ip);
                                 save_cooldowns(paths, &mut cooldowns);
                                 record_active_session(
                                     paths,
                                     srv,
-                                    proto.as_label(),
+                                    &port_tag,
                                     &backend,
                                     &dev,
                                     &trace,
@@ -1423,15 +1762,25 @@ pub async fn engage_candidates(
                                     cfg,
                                 );
                                 if cfg.auto_reconnect && !cfg.in_monitor {
-                                    spawn_auto_reconnect_monitor(paths);
+                                    let mon_pid = spawn_auto_reconnect_monitor(paths);
+                                    if mon_pid > 0 {
+                                        on_progress(ProgressEvent::Info(format!(
+                                            "Auto-Reconnect Monitor armed (PID {mon_pid}, polling every {MONITOR_INTERVAL_SECONDS}s)."
+                                        )));
+                                    }
                                 }
                                 return 0;
                             }
-                            on_log("  -> OpenVPN connected, but egress verification failed.");
+                            on_progress(ProgressEvent::Warn(
+                                "  -> Tunnel connected but failed internet egress verification. Retrying next..."
+                                    .to_string(),
+                            ));
                             cleanup_existing_vpn(paths, false, !cfg.in_monitor);
                         }
                         Err(e) => {
-                            on_log(&format!("  -> {} failed: {e}", proto.as_label()));
+                            on_progress(ProgressEvent::Warn(format!(
+                                "  -> {port_tag} handshake failed ({e})."
+                            )));
                             cleanup_existing_vpn(paths, false, !cfg.in_monitor);
                         }
                     }

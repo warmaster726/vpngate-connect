@@ -5,10 +5,134 @@ use std::sync::OnceLock;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STD;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 
 use crate::country::normalize_country_pair;
 use crate::doh::is_poisoned_ipv4;
 use crate::server::VpnServer;
+
+/// Official SoftEther VPN Gate Mirror Site portal (`http://<host>:<port>/en/`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OfficialMirrorSite {
+    /// Base origin without trailing slash, e.g. `http://150.40.105.11:4917`.
+    pub base_url: String,
+    /// Full `/en/` server list page URL, e.g. `http://150.40.105.11:4917/en/`.
+    pub portal_url: String,
+    /// Geographic mirror location label reported by VPN Gate (`Croatia`, `Japan`, `France`, etc.).
+    pub location: String,
+    /// Discovery origin (`sites.aspx`, `mirror-portal`, `daily-feed`, `wayback`, `cached`, `custom`).
+    pub source: String,
+}
+
+/// Normalizes a raw mirror URL (`http://150.40.105.11:4917/en/` or `150.40.105.11:4917`)
+/// into `(base_url, portal_url)`, excluding primary `vpngate.net` itself.
+pub fn normalize_mirror_base_url(raw: &str) -> Option<(String, String)> {
+    let trimmed = raw
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'' || c == '.');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let with_scheme = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{trimmed}")
+    };
+    let parsed = reqwest::Url::parse(&with_scheme).ok()?;
+    let host = parsed.host_str()?;
+    let host_low = host.to_ascii_lowercase();
+    if matches!(
+        host_low.as_str(),
+        "www.vpngate.net"
+            | "vpngate.net"
+            | "www.tsukuba.ac.jp"
+            | "tsukuba.ac.jp"
+            | "www.softether.org"
+            | "softether.org"
+            | "icondrawer.com"
+            | "www.win10pcap.org"
+            | "web.archive.org"
+    ) || host_low.ends_with(".tsukuba.ac.jp")
+        || host_low.ends_with(".archive.org")
+    {
+        return None;
+    }
+    if let Ok(v4) = host.parse::<Ipv4Addr>()
+        && is_poisoned_ipv4(v4)
+    {
+        return None;
+    }
+    let scheme = parsed.scheme();
+    let base = match parsed.port() {
+        Some(port) => format!("{scheme}://{host}:{port}"),
+        None => format!("{scheme}://{host}"),
+    };
+    let portal = format!("{base}/en/");
+    Some((base, portal))
+}
+
+/// Parses Official VPN Gate Mirror Sites from `sites.aspx` HTML or daily mirror email text.
+pub fn parse_vpngate_mirror_sites_html(html: &str, source_label: &str) -> Vec<OfficialMirrorSite> {
+    static RE_URL: OnceLock<Regex> = OnceLock::new();
+    static RE_LOC: OnceLock<Regex> = OnceLock::new();
+
+    if html.is_empty() {
+        return Vec::new();
+    }
+
+    let re_url = RE_URL.get_or_init(|| {
+        Regex::new(r#"(?i)(https?://[a-z0-9.\-]+:\d+(?:/en/?|/?))"#)
+            .expect("valid mirror url regex")
+    });
+    let re_loc = RE_LOC.get_or_init(|| {
+        Regex::new(r"(?i)\(\s*(?:Mirror\s+)?location:\s*([^)<\r\n]+)").expect("valid loc regex")
+    });
+
+    let mut out = Vec::new();
+    let mut seen = BTreeMap::<String, usize>::new();
+
+    let mut push_item = |raw_url: &str, raw_loc: Option<&str>| {
+        let Some((base_url, portal_url)) = normalize_mirror_base_url(raw_url) else {
+            return;
+        };
+        let loc_clean = raw_loc
+            .map(|s| {
+                let s = s.replace("&nbsp;", " ");
+                let before_local = s.split("(LOCAL").next().unwrap_or(&s);
+                before_local.trim().trim_end_matches(')').trim().to_string()
+            })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Unknown".to_string());
+
+        if let Some(&idx) = seen.get(&base_url) {
+            let existing: &mut OfficialMirrorSite = &mut out[idx];
+            if existing.location == "Unknown" && loc_clean != "Unknown" {
+                existing.location = loc_clean;
+            }
+        } else {
+            seen.insert(base_url.clone(), out.len());
+            out.push(OfficialMirrorSite {
+                base_url,
+                portal_url,
+                location: loc_clean,
+                source: source_label.to_string(),
+            });
+        }
+    };
+
+    let normalized = html.replace("<li", "\n<li").replace("<br", "\n<br");
+    for line in normalized.lines() {
+        let loc_opt = re_loc
+            .captures(line)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str());
+        for cap in re_url.captures_iter(line) {
+            push_item(&cap[1], loc_opt);
+        }
+    }
+
+    out
+}
 
 fn parse_u64_clean(s: &str, default: u64) -> u64 {
     let cleaned: String = s.chars().filter(|c| c.is_ascii_digit()).collect();
@@ -444,5 +568,26 @@ mod tests {
         assert_eq!(cand.hostname, "vpn999");
         assert!(!cand.l2tp);
         assert!(!cand.openvpn);
+    }
+
+    #[test]
+    fn parses_official_vpngate_mirror_sites_html() {
+        let sample = r#"
+        <ul>
+          <li><b><a href='http://150.40.105.11:4917/en/' target='_blank'>http://150.40.105.11:4917/en/</a></b>&nbsp;(Mirror location: Croatia (LOCAL Name: Hrvatska))</li>
+          <li><b><a href='http://ns374305.ip-178-32-222.eu:18609/en/'>http://ns374305.ip-178-32-222.eu:18609/en/</a></b> (Mirror location: France)</li>
+          <li><a href='https://www.vpngate.net/en/'>https://www.vpngate.net/en/</a></li>
+        </ul>
+        "#;
+        let mirrors = parse_vpngate_mirror_sites_html(sample, "sites.aspx");
+        assert_eq!(mirrors.len(), 2);
+        assert_eq!(mirrors[0].base_url, "http://150.40.105.11:4917");
+        assert_eq!(mirrors[0].portal_url, "http://150.40.105.11:4917/en/");
+        assert_eq!(mirrors[0].location, "Croatia");
+        assert_eq!(
+            mirrors[1].base_url,
+            "http://ns374305.ip-178-32-222.eu:18609"
+        );
+        assert_eq!(mirrors[1].location, "France");
     }
 }
