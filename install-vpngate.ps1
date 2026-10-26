@@ -196,40 +196,66 @@ if ($Uninstall) {
 $SourceDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 Invoke-VPNGateResidueCleanup -Mode 'Install'
 
-# 1. Resolve or build `vpngate.exe`
+# 1. Resolve or build `vpngate.exe` (Release-free: local checkout, prebuilt exe, or GitHub `main` zip archive)
 $BinSource = $null
-$CargoToml = Join-Path $SourceDir 'Cargo.toml'
-if (Test-Path -LiteralPath $CargoToml) {
-    $CargoCmd = Get-Command 'cargo.exe' -ErrorAction SilentlyContinue
-    if (-not $CargoCmd) {
-        $HomeCargo = Join-Path $HOME '.cargo\bin\cargo.exe'
-        if (Test-Path -LiteralPath $HomeCargo) { $CargoCmd = @{ Source = $HomeCargo } }
+$TempBuildRoot = $null
+try {
+    $WorkDir = $SourceDir
+    $CargoToml = Join-Path $WorkDir 'Cargo.toml'
+    $LocalPrebuilt = Join-Path $WorkDir 'vpngate.exe'
+
+    if (-not (Test-Path -LiteralPath $CargoToml) -and -not (Test-Path -LiteralPath $LocalPrebuilt)) {
+        $BranchName = if ($env:VPNGATE_BRANCH) { $env:VPNGATE_BRANCH } else { 'main' }
+        $ZipUrl = "https://codeload.github.com/$Repo/zip/refs/heads/$BranchName"
+        $TempBuildRoot = Join-Path ([System.IO.Path]::GetTempPath()) "vpngate-src-$PID"
+        New-Item -ItemType Directory -Path $TempBuildRoot -Force | Out-Null
+        $ZipPath = Join-Path $TempBuildRoot 'src.zip'
+        Write-Info "Downloading source archive from $ZipUrl ..."
+        Invoke-WebRequest -Uri $ZipUrl -UseBasicParsing -OutFile $ZipPath
+        Expand-Archive -LiteralPath $ZipPath -DestinationPath $TempBuildRoot -Force
+        $SubDir = Get-ChildItem -LiteralPath $TempBuildRoot -Directory | Select-Object -First 1
+        if (-not $SubDir) { throw "Downloaded source archive was empty." }
+        $WorkDir = $SubDir.FullName
+        $CargoToml = Join-Path $WorkDir 'Cargo.toml'
     }
-    if ($CargoCmd) {
+
+    if (Test-Path -LiteralPath $CargoToml) {
+        $CargoCmd = Get-Command 'cargo.exe' -ErrorAction SilentlyContinue
+        if (-not $CargoCmd) {
+            $HomeCargo = Join-Path $HOME '.cargo\bin\cargo.exe'
+            if (Test-Path -LiteralPath $HomeCargo) { $CargoCmd = @{ Source = $HomeCargo } }
+        }
+        if (-not $CargoCmd -and (Get-Command 'winget.exe' -ErrorAction SilentlyContinue)) {
+            Write-Info "Rust toolchain ('cargo.exe') not found — installing Rustlang.Rustup via winget ..."
+            & winget.exe install -e --id Rustlang.Rustup --silent --accept-package-agreements --accept-source-agreements
+            $HomeCargo = Join-Path $HOME '.cargo\bin\cargo.exe'
+            if (Test-Path -LiteralPath $HomeCargo) { $CargoCmd = @{ Source = $HomeCargo } }
+        }
+        if (-not $CargoCmd) {
+            throw "Rust ('cargo.exe') is required to build vpngate.exe from source. Install from https://rustup.rs and re-run."
+        }
         Write-Info "Building optimized native 'vpngate.exe' via Cargo ..."
         & $CargoCmd.Source build --release -p vpngate-cli --manifest-path $CargoToml
         if ($LASTEXITCODE -ne 0) { throw "Cargo release build failed." }
-        $BinSource = Join-Path $SourceDir 'target\release\vpngate.exe'
-    }
-}
-if (-not $BinSource -or -not (Test-Path -LiteralPath $BinSource)) {
-    $LocalPrebuilt = Join-Path $SourceDir 'vpngate.exe'
-    if (Test-Path -LiteralPath $LocalPrebuilt) {
+        $BinSource = Join-Path $WorkDir 'target\release\vpngate.exe'
+    } elseif (Test-Path -LiteralPath $LocalPrebuilt) {
         $BinSource = $LocalPrebuilt
-    } else {
-        $RelUrl = "https://github.com/$Repo/releases/latest/download/vpngate-windows-x86_64.exe"
-        Write-Info "Downloading prebuilt binary from $RelUrl ..."
-        $TempExe = Join-Path ([System.IO.Path]::GetTempPath()) "vpngate-dl-$PID.exe"
-        Invoke-WebRequest -Uri $RelUrl -UseBasicParsing -OutFile $TempExe
-        $BinSource = $TempExe
+    }
+
+    if (-not $BinSource -or -not (Test-Path -LiteralPath $BinSource)) {
+        throw "Could not build or locate vpngate.exe."
+    }
+
+    New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+    $TargetExe = Join-Path $InstallDir 'vpngate.exe'
+    Copy-Item -LiteralPath $BinSource -Destination $TargetExe -Force
+    try { Unblock-File -LiteralPath $TargetExe -ErrorAction SilentlyContinue } catch {}
+    Write-Ok "Installed native single-binary '$TargetExe'"
+} finally {
+    if ($TempBuildRoot -and (Test-Path -LiteralPath $TempBuildRoot)) {
+        Remove-Item -LiteralPath $TempBuildRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
-
-New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-$TargetExe = Join-Path $InstallDir 'vpngate.exe'
-Copy-Item -LiteralPath $BinSource -Destination $TargetExe -Force
-try { Unblock-File -LiteralPath $TargetExe -ErrorAction SilentlyContinue } catch {}
-Write-Ok "Installed native single-binary '$TargetExe'"
 
 # 2. Ensure %LOCALAPPDATA%\Programs\VPNGate is in User PATH
 $NormInstall = $InstallDir.TrimEnd('\')

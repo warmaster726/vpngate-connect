@@ -11,7 +11,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/warmaster726/vpngate-connect"
-authors = ["War Master726 <warmaster726@gmail.com>"]
+authors = ["warmaster726 <warmaster726@users.noreply.github.com>"]
 
 [workspace.dependencies]
 aes = "0.8"

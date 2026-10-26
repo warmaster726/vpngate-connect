@@ -437,10 +437,32 @@ if [ "${SKIP_DEPS}" -eq 0 ]; then
   fi
 fi
 
-# 2. Locate prebuilt `vpngate` binary, build from local Rust workspace, or download GitHub Release binary
+# 2. Locate local workspace / prebuilt binary, or fetch `main` source archive from GitHub (Release-free!)
+WORK_SRC_DIR="${SCRIPT_DIR}"
 BIN_SRC=""
-if [ -f "${SCRIPT_DIR}/Cargo.toml" ]; then
-  # Inside local Rust workspace checkout (e.g. ~/Downloads/vpngate-connect): build fresh release binary
+
+if [ ! -f "${WORK_SRC_DIR}/Cargo.toml" ] && [ ! -x "${WORK_SRC_DIR}/vpngate" ]; then
+  BRANCH_NAME="${VPNGATE_BRANCH:-main}"
+  BOOTSTRAP_TMP_DIR="$(mktemp -d "/tmp/vpngate-src.XXXXXX")"
+  if [ "$(id -u)" -eq 0 ] && [ -n "${TARGET_UID}" ]; then
+    chown "${TARGET_USER}" "${BOOTSTRAP_TMP_DIR}" 2>/dev/null || true
+  fi
+  ARCHIVE_URL="https://codeload.github.com/${REPO_SLUG}/tar.gz/refs/heads/${BRANCH_NAME}"
+  info "Fetching source archive from ${ARCHIVE_URL} ..."
+  curl -fsSL "${ARCHIVE_URL}" -o "${BOOTSTRAP_TMP_DIR}/src.tar.gz" </dev/null
+  tar -xzf "${BOOTSTRAP_TMP_DIR}/src.tar.gz" -C "${BOOTSTRAP_TMP_DIR}"
+  EXTRACTED_DIR="$(find "${BOOTSTRAP_TMP_DIR}" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+  if [ -z "${EXTRACTED_DIR}" ] || [ ! -f "${EXTRACTED_DIR}/Cargo.toml" ]; then
+    warn "Downloaded source archive did not contain Cargo.toml."
+    exit 1
+  fi
+  if [ "$(id -u)" -eq 0 ] && [ -n "${TARGET_UID}" ]; then
+    chown -R "${TARGET_USER}" "${EXTRACTED_DIR}" 2>/dev/null || true
+  fi
+  WORK_SRC_DIR="${EXTRACTED_DIR}"
+fi
+
+if [ -f "${WORK_SRC_DIR}/Cargo.toml" ]; then
   CARGO_BIN=""
   if [ -x "${TARGET_HOME}/.cargo/bin/cargo" ]; then
     CARGO_BIN="${TARGET_HOME}/.cargo/bin/cargo"
@@ -448,30 +470,38 @@ if [ -f "${SCRIPT_DIR}/Cargo.toml" ]; then
     CARGO_BIN="$(command -v cargo)"
   fi
 
-  if [ -n "${CARGO_BIN}" ]; then
-    info "Building optimized single-binary 'vpngate' from local Rust workspace (${SCRIPT_DIR}) ..."
+  if [ -z "${CARGO_BIN}" ]; then
+    info "Rust toolchain ('cargo') not found — installing minimal stable rustup toolchain for ${TARGET_USER} ..."
     if [ "$(id -u)" -eq 0 ] && [ "${TARGET_USER}" != "root" ]; then
-      sudo -u "${TARGET_USER}" env PATH="${TARGET_HOME}/.cargo/bin:${PATH}" "${CARGO_BIN}" build --release -p vpngate-cli --manifest-path "${SCRIPT_DIR}/Cargo.toml"
+      sudo -u "${TARGET_USER}" sh -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal' </dev/null
     else
-      "${CARGO_BIN}" build --release -p vpngate-cli --manifest-path "${SCRIPT_DIR}/Cargo.toml"
+      sh -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal' </dev/null
     fi
-    BIN_SRC="${SCRIPT_DIR}/target/release/vpngate"
-  elif [ -x "${SCRIPT_DIR}/target/release/vpngate" ]; then
-    BIN_SRC="${SCRIPT_DIR}/target/release/vpngate"
+    if [ -x "${TARGET_HOME}/.cargo/bin/cargo" ]; then
+      CARGO_BIN="${TARGET_HOME}/.cargo/bin/cargo"
+    elif command -v cargo >/dev/null 2>&1; then
+      CARGO_BIN="$(command -v cargo)"
+    fi
   fi
-elif [ -x "${SCRIPT_DIR}/vpngate" ]; then
-  BIN_SRC="${SCRIPT_DIR}/vpngate"
+
+  if [ -n "${CARGO_BIN}" ]; then
+    info "Building optimized single-binary 'vpngate' from Rust workspace (${WORK_SRC_DIR}) ..."
+    if [ "$(id -u)" -eq 0 ] && [ "${TARGET_USER}" != "root" ]; then
+      sudo -u "${TARGET_USER}" env PATH="${TARGET_HOME}/.cargo/bin:${PATH}" "${CARGO_BIN}" build --release -p vpngate-cli --manifest-path "${WORK_SRC_DIR}/Cargo.toml"
+    else
+      "${CARGO_BIN}" build --release -p vpngate-cli --manifest-path "${WORK_SRC_DIR}/Cargo.toml"
+    fi
+    BIN_SRC="${WORK_SRC_DIR}/target/release/vpngate"
+  elif [ -x "${WORK_SRC_DIR}/target/release/vpngate" ]; then
+    BIN_SRC="${WORK_SRC_DIR}/target/release/vpngate"
+  fi
+elif [ -x "${WORK_SRC_DIR}/vpngate" ]; then
+  BIN_SRC="${WORK_SRC_DIR}/vpngate"
 fi
 
 if [ -z "${BIN_SRC}" ] || [ ! -f "${BIN_SRC}" ]; then
-  ARCH_TAG="$(uname -m 2>/dev/null || echo x86_64)"
-  OS_TAG="$(printf '%s' "${HOST_UNAME}" | tr '[:upper:]' '[:lower:]')"
-  BOOTSTRAP_TMP_DIR="$(mktemp -d "/tmp/vpngate-release.XXXXXX")"
-  REL_URL="https://github.com/${REPO_SLUG}/releases/latest/download/vpngate-${OS_TAG}-${ARCH_TAG}"
-  info "Downloading prebuilt binary from ${REL_URL} ..."
-  curl -fsSL "${REL_URL}" -o "${BOOTSTRAP_TMP_DIR}/vpngate" </dev/null
-  chmod 0755 "${BOOTSTRAP_TMP_DIR}/vpngate"
-  BIN_SRC="${BOOTSTRAP_TMP_DIR}/vpngate"
+  warn "Could not build or locate 'vpngate' binary."
+  exit 1
 fi
 
 # Prevent boot-time L2TP/IPsec daemons from holding UDP 500, 4500, or 1701 on Linux
@@ -488,15 +518,15 @@ sudo rm -f /usr/local/bin/vpngate
 info "Installing native binary to /usr/local/bin/vpngate ..."
 sudo install -m 0755 "${BIN_SRC}" /usr/local/bin/vpngate
 
-if [ "${HOST_UNAME}" = "Linux" ] && [ -f "${SCRIPT_DIR}/vpngate-launcher.py" ]; then
+if [ "${HOST_UNAME}" = "Linux" ] && [ -f "${WORK_SRC_DIR}/vpngate-launcher.py" ]; then
   info "Installing GNOME GTK/VTE window launcher (/usr/local/bin/vpngate-launcher) ..."
-  install_lf_file "${SCRIPT_DIR}/vpngate-launcher.py" /usr/local/bin/vpngate-launcher.py 0755
+  install_lf_file "${WORK_SRC_DIR}/vpngate-launcher.py" /usr/local/bin/vpngate-launcher.py 0755
   sudo ln -sf /usr/local/bin/vpngate-launcher.py /usr/local/bin/vpngate-launcher
 
-  if [ -f "${SCRIPT_DIR}/vpngate.desktop" ]; then
+  if [ -f "${WORK_SRC_DIR}/vpngate.desktop" ]; then
     info "Installing GNOME Desktop Entry (/usr/share/applications/vpngate.desktop) ..."
     sudo mkdir -p /usr/share/applications
-    install_lf_file "${SCRIPT_DIR}/vpngate.desktop" /usr/share/applications/vpngate.desktop 0644
+    install_lf_file "${WORK_SRC_DIR}/vpngate.desktop" /usr/share/applications/vpngate.desktop 0644
     if command -v update-desktop-database >/dev/null 2>&1; then
       sudo update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
     fi
