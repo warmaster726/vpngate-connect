@@ -8,12 +8,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 IOS_FW_DIR="${SCRIPT_DIR}/ios/Frameworks"
 RUST_ONLY=0
+SIM_BUILD=0
 TARGET_TRIPLE="aarch64-apple-ios"
 
 for arg in "$@"; do
     case "$arg" in
         --rust-only) RUST_ONLY=1 ;;
         --sim)
+            SIM_BUILD=1
             if [[ "$(uname -m)" == "arm64" ]]; then
                 TARGET_TRIPLE="aarch64-apple-ios-sim"
             else
@@ -61,8 +63,20 @@ if [[ ! -d "${SCRIPT_DIR}/ios/Runner.xcodeproj" ]]; then
     echo "[!] Note: Open ios/Runner.xcworkspace in Xcode once to add the ios/PacketTunnel Network Extension target & signing team."
 fi
 
+# Ensure Runner.xcodeproj meets Flutter 3.47+'s iOS 15.0 deployment floor
+PBXPROJ="${SCRIPT_DIR}/ios/Runner.xcodeproj/project.pbxproj"
+if [[ -f "$PBXPROJ" ]]; then
+    sed -i '' -E 's/IPHONEOS_DEPLOYMENT_TARGET = 1[1-4]\.[0-9]+;/IPHONEOS_DEPLOYMENT_TARGET = 15.0;/g' "$PBXPROJ"
+fi
+
 cd "$SCRIPT_DIR"
 flutter pub get
 (cd ios && pod install)
-flutter build ios --release --no-codesign
-echo "[+] Unsigned iOS build ready under ${SCRIPT_DIR}/build/ios/iphoneos/Runner.app"
+
+if [[ "$SIM_BUILD" -eq 1 ]]; then
+    flutter build ios --simulator
+    echo "[+] Simulator iOS build ready under ${SCRIPT_DIR}/build/ios/iphonesimulator/Runner.app"
+else
+    flutter build ios --release --no-codesign
+    echo "[+] Unsigned iOS build ready under ${SCRIPT_DIR}/build/ios/iphoneos/Runner.app"
+fi

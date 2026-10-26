@@ -1,4 +1,4 @@
-platform :ios, '14.0'
+platform :ios, '15.0'
 
 ENV['COCOAPODS_DISABLE_STATS'] = 'true'
 
@@ -32,19 +32,37 @@ target 'Runner' do
   flutter_install_all_ios_pods File.dirname(File.realpath(__FILE__))
 end
 
-target 'PacketTunnel' do
-  use_frameworks!
-  pod 'OpenVPNAdapter', '~> 0.8.0'
+# Attach OpenVPNAdapter automatically once the PacketTunnel Network Extension target
+# has been added to Runner.xcodeproj in Xcode (allows fresh-clone unsigned builds first).
+pbxproj_path = File.expand_path('Runner.xcodeproj/project.pbxproj', __dir__)
+if File.exist?(pbxproj_path) && File.read(pbxproj_path).include?('PacketTunnel.appex')
+  target 'PacketTunnel' do
+    use_frameworks!
+    pod 'OpenVPNAdapter', '~> 0.8.0'
+  end
 end
 
 post_install do |installer|
   installer.pods_project.targets.each do |target|
     flutter_additional_ios_build_settings(target)
     target.build_configurations.each do |config|
-      config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '14.0'
-      if target.name == 'Runner'
-        config.build_settings['OTHER_LDFLAGS'] ||= ['$(inherited)']
-        config.build_settings['OTHER_LDFLAGS'] << '-force_load $(PROJECT_DIR)/Frameworks/libvpngate_bridge.a'
+      cur = config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'].to_f
+      config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '15.0' if cur < 15.0
+    end
+  end
+
+  # Force-load static Rust C-ABI symbols (vpngate_*) into Runner.app so Dart FFI
+  # DynamicLibrary.process() resolves them under Release DEAD_CODE_STRIPPING=YES.
+  installer.aggregate_targets.each do |aggregate_target|
+    next unless aggregate_target.name == 'Pods-Runner'
+
+    aggregate_target.xcconfigs.each do |config_name, config_file|
+      flags = config_file.attributes['OTHER_LDFLAGS'] || '$(inherited)'
+      force_flag = '-force_load "${PODS_ROOT}/../Frameworks/libvpngate_bridge.a"'
+      unless flags.include?('libvpngate_bridge.a')
+        config_file.attributes['OTHER_LDFLAGS'] = "#{flags} #{force_flag}"
+        xcconfig_path = aggregate_target.xcconfig_path(config_name)
+        config_file.save_as(xcconfig_path)
       end
     end
   end
