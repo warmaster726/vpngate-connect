@@ -220,24 +220,86 @@ try {
     }
 
     if (Test-Path -LiteralPath $CargoToml) {
+        $CargoBinDir = Join-Path $HOME '.cargo\bin'
+        if ((Test-Path -LiteralPath $CargoBinDir) -and ($env:Path -notlike "*$CargoBinDir*")) {
+            $env:Path = "$CargoBinDir;$env:Path"
+        }
+
+        # Detect whether Visual Studio C++ Build Tools (MSVC cl.exe/link.exe) are present;
+        # if not, use lightweight MinGW-w64 (`x86_64-pc-windows-gnu`) so users never need a 6 GB Visual Studio install.
+        $HasMsvc = $false
+        if (Get-Command 'cl.exe' -ErrorAction SilentlyContinue) {
+            $HasMsvc = $true
+        } else {
+            $VsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+            if (Test-Path -LiteralPath $VsWhere) {
+                $VsVc = & $VsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
+                if ($VsVc) { $HasMsvc = $true }
+            }
+        }
+
         $CargoCmd = Get-Command 'cargo.exe' -ErrorAction SilentlyContinue
         if (-not $CargoCmd) {
-            $HomeCargo = Join-Path $HOME '.cargo\bin\cargo.exe'
-            if (Test-Path -LiteralPath $HomeCargo) { $CargoCmd = @{ Source = $HomeCargo } }
-        }
-        if (-not $CargoCmd -and (Get-Command 'winget.exe' -ErrorAction SilentlyContinue)) {
-            Write-Info "Rust toolchain ('cargo.exe') not found — installing Rustlang.Rustup via winget ..."
-            & winget.exe install -e --id Rustlang.Rustup --silent --accept-package-agreements --accept-source-agreements
-            $HomeCargo = Join-Path $HOME '.cargo\bin\cargo.exe'
-            if (Test-Path -LiteralPath $HomeCargo) { $CargoCmd = @{ Source = $HomeCargo } }
+            $RustupInit = Join-Path ([System.IO.Path]::GetTempPath()) "rustup-init-$PID.exe"
+            $DefaultHost = if ($HasMsvc) { 'x86_64-pc-windows-msvc' } else { 'x86_64-pc-windows-gnu' }
+            Write-Info "Rust toolchain not found — bootstrapping minimal Rust ($DefaultHost) via rustup.rs ..."
+            Invoke-WebRequest -Uri 'https://win.rustup.rs/x86_64' -UseBasicParsing -OutFile $RustupInit
+            & $RustupInit -y --profile minimal --default-host $DefaultHost
+            Remove-Item -LiteralPath $RustupInit -Force -ErrorAction SilentlyContinue
+            $env:Path = "$CargoBinDir;$env:Path"
+            $CargoCmd = Get-Command 'cargo.exe' -ErrorAction SilentlyContinue
         }
         if (-not $CargoCmd) {
             throw "Rust ('cargo.exe') is required to build vpngate.exe from source. Install from https://rustup.rs and re-run."
         }
-        Write-Info "Building optimized native 'vpngate.exe' via Cargo ..."
-        & $CargoCmd.Source build --release -p vpngate-cli --manifest-path $CargoToml
-        if ($LASTEXITCODE -ne 0) { throw "Cargo release build failed." }
-        $BinSource = Join-Path $WorkDir 'target\release\vpngate.exe'
+
+        $BuildArgs = @('build', '--release')
+        if (Test-Path -LiteralPath (Join-Path $WorkDir 'Cargo.lock')) {
+            $BuildArgs += '--locked'
+        }
+        $BuildArgs += @('-p', 'vpngate-cli', '--manifest-path', $CargoToml)
+
+        if ($HasMsvc) {
+            Write-Info "Building optimized native 'vpngate.exe' via Cargo (MSVC toolchain) ..."
+            & $CargoCmd.Source @BuildArgs
+            if ($LASTEXITCODE -ne 0) { throw "Cargo release build failed." }
+            $BinSource = Join-Path $WorkDir 'target\release\vpngate.exe'
+        } else {
+            # Ensure gcc.exe / MinGW-w64 is present for `x86_64-pc-windows-gnu` (`ring` C objects + linking)
+            if (-not (Get-Command 'gcc.exe' -ErrorAction SilentlyContinue)) {
+                foreach ($candGccDir in @(
+                    "$env:LOCALAPPDATA\Microsoft\WinGet\Packages",
+                    'C:\msys64\ucrt64\bin',
+                    'C:\msys64\mingw64\bin',
+                    'C:\mingw64\bin'
+                )) {
+                    if (Test-Path -LiteralPath $candGccDir) {
+                        $foundGcc = Get-ChildItem -LiteralPath $candGccDir -Filter 'gcc.exe' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+                        if ($foundGcc) {
+                            $env:Path = "$($foundGcc.DirectoryName);$env:Path"
+                            break
+                        }
+                    }
+                }
+            }
+            if (-not (Get-Command 'gcc.exe' -ErrorAction SilentlyContinue) -and (Get-Command 'winget.exe' -ErrorAction SilentlyContinue)) {
+                Write-Info "MSVC linker not present — installing lightweight MinGW-w64 ('gcc.exe') via winget ..."
+                & winget.exe install -e --id BrechtSanders.WinLibs.POSIX.UCRT --silent --accept-package-agreements --accept-source-agreements
+                $foundGcc = Get-ChildItem -LiteralPath "$env:LOCALAPPDATA\Microsoft\WinGet\Packages" -Filter 'gcc.exe' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($foundGcc) {
+                    $env:Path = "$($foundGcc.DirectoryName);$env:Path"
+                }
+            }
+            $RustupExe = Join-Path $CargoBinDir 'rustup.exe'
+            if (Test-Path -LiteralPath $RustupExe) {
+                & $RustupExe toolchain install stable-x86_64-pc-windows-gnu --profile minimal --no-self-update
+            }
+            Write-Info "Building optimized native 'vpngate.exe' via Cargo (x86_64-pc-windows-gnu toolchain) ..."
+            $GnuArgs = @('+stable-x86_64-pc-windows-gnu') + $BuildArgs + @('--target', 'x86_64-pc-windows-gnu')
+            & $CargoCmd.Source @GnuArgs
+            if ($LASTEXITCODE -ne 0) { throw "Cargo GNU release build failed." }
+            $BinSource = Join-Path $WorkDir 'target\x86_64-pc-windows-gnu\release\vpngate.exe'
+        }
     } elseif (Test-Path -LiteralPath $LocalPrebuilt) {
         $BinSource = $LocalPrebuilt
     }

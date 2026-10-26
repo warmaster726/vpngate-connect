@@ -402,22 +402,30 @@ else
   ok "Pre-install check clean: no legacy residues detected."
 fi
 
-# 1. Install OS tunnel & GNOME window dependencies
+# 1. Install OS tunnel, C linker (for local source build), & GNOME window dependencies
 if [ "${SKIP_DEPS}" -eq 0 ]; then
   if [ "${HOST_UNAME}" = "Darwin" ]; then
+    if ! xcode-select -p >/dev/null 2>&1; then
+      warn "Apple Command Line Tools ('cc' linker) not found. Launching 'xcode-select --install' ..."
+      xcode-select --install || true
+    fi
     if command -v brew >/dev/null 2>&1; then
       info "Ensuring OpenVPN is installed via Homebrew ..."
       sudo -u "${TARGET_USER}" brew list openvpn >/dev/null 2>&1 || sudo -u "${TARGET_USER}" brew install openvpn
     fi
   elif command -v apt-get >/dev/null 2>&1; then
-    info "Installing required OpenVPN & L2TP/PPP packages via apt-get ..."
+    info "Installing required OpenVPN, L2TP/PPP & C linker packages via apt-get ..."
     sudo apt-get update -qq </dev/null
     sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y \
       openvpn \
       xl2tpd \
       ppp \
       iproute2 \
-      curl </dev/null
+      curl \
+      ca-certificates \
+      tar \
+      gcc \
+      libc6-dev </dev/null
     sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y \
       python3 \
       python3-gi \
@@ -427,12 +435,12 @@ if [ "${SKIP_DEPS}" -eq 0 ]; then
       network-manager-openvpn-gnome \
       libnotify-bin </dev/null 2>/dev/null || true
   elif command -v dnf >/dev/null 2>&1; then
-    info "Installing required OpenVPN & L2TP/PPP packages via dnf ..."
-    sudo dnf install -y openvpn xl2tpd ppp iproute curl python3 </dev/null
+    info "Installing required OpenVPN, L2TP/PPP & C linker packages via dnf ..."
+    sudo dnf install -y openvpn xl2tpd ppp iproute curl ca-certificates tar gcc glibc-devel python3 </dev/null
     sudo dnf install -y NetworkManager-openvpn NetworkManager-openvpn-gnome libnotify python3-gobject gtk3 vte291 </dev/null 2>/dev/null || true
   elif command -v pacman >/dev/null 2>&1; then
-    info "Installing required OpenVPN & L2TP/PPP packages via pacman ..."
-    sudo pacman -Sy --needed --noconfirm openvpn xl2tpd ppp iproute2 curl python </dev/null
+    info "Installing required OpenVPN, L2TP/PPP & C linker packages via pacman ..."
+    sudo pacman -Sy --needed --noconfirm openvpn xl2tpd ppp iproute2 curl ca-certificates tar gcc python </dev/null
     sudo pacman -S --needed --noconfirm networkmanager-openvpn libnotify python-gobject gtk3 vte3 </dev/null 2>/dev/null || true
   fi
 fi
@@ -485,11 +493,17 @@ if [ -f "${WORK_SRC_DIR}/Cargo.toml" ]; then
   fi
 
   if [ -n "${CARGO_BIN}" ]; then
+    LOCKED_FLAG=""
+    if [ -f "${WORK_SRC_DIR}/Cargo.lock" ]; then
+      LOCKED_FLAG="--locked"
+    fi
     info "Building optimized single-binary 'vpngate' from Rust workspace (${WORK_SRC_DIR}) ..."
     if [ "$(id -u)" -eq 0 ] && [ "${TARGET_USER}" != "root" ]; then
-      sudo -u "${TARGET_USER}" env PATH="${TARGET_HOME}/.cargo/bin:${PATH}" "${CARGO_BIN}" build --release -p vpngate-cli --manifest-path "${WORK_SRC_DIR}/Cargo.toml"
+      # shellcheck disable=SC2086
+      sudo -u "${TARGET_USER}" env PATH="${TARGET_HOME}/.cargo/bin:${PATH}" "${CARGO_BIN}" build --release ${LOCKED_FLAG} -p vpngate-cli --manifest-path "${WORK_SRC_DIR}/Cargo.toml"
     else
-      "${CARGO_BIN}" build --release -p vpngate-cli --manifest-path "${WORK_SRC_DIR}/Cargo.toml"
+      # shellcheck disable=SC2086
+      "${CARGO_BIN}" build --release ${LOCKED_FLAG} -p vpngate-cli --manifest-path "${WORK_SRC_DIR}/Cargo.toml"
     fi
     BIN_SRC="${WORK_SRC_DIR}/target/release/vpngate"
   elif [ -x "${WORK_SRC_DIR}/target/release/vpngate" ]; then

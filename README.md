@@ -69,6 +69,23 @@ irm https://raw.githubusercontent.com/warmaster726/vpngate-connect/main/install-
 
 ---
 
+### Building Manually From Source (Rust / Cargo)
+
+Because TLS (`rustls`) and IKEv1 cryptography are implemented in pure Rust and exact crate versions are pinned in [`Cargo.lock`](Cargo.lock), **no OpenSSL headers, `pkg-config`, or `cmake` are required**—only a standard Rust toolchain (`rustup`) and a basic C linker (`gcc`/`clang` on Unix, or MSVC / MinGW-w64 `gcc.exe` on Windows):
+
+```bash
+# Option A — Install directly from Git with Cargo (any OS with Rust installed):
+cargo install --git https://github.com/warmaster726/vpngate-connect.git --locked vpngate-cli
+
+# Option B — Clone & compile a standalone release binary manually:
+git clone https://github.com/warmaster726/vpngate-connect.git
+cd vpngate-connect
+cargo build --release --locked -p vpngate-cli
+# Output binary: ./target/release/vpngate  (Windows: .\target\release\vpngate.exe)
+```
+
+---
+
 ## Usage (`vpngate`)
 
 ```bash
