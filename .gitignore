@@ -111,6 +111,9 @@ servers_cache*.json
 cooldowns*.json
 
 # --- 7. Editor & OS Scratch Files ---
+__pycache__/
+**/__pycache__/
+*.py[cod]
 .idea/
 *.swp
 *.swo
