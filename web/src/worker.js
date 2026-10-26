@@ -14,7 +14,7 @@ import { connect } from "cloudflare:sockets";
  *  - Completely isolated from root `Cargo.toml`, `Cargo.lock`, and desktop installer scripts.
  */
 
-const APP_VERSION = "0.2.1";
+const APP_VERSION = "0.2.2";
 const POOL_CACHE_TTL_MS = 180_000;
 const POOL_CACHE_KEY_URL = "https://vpngate-edge-cache.internal/v1/pool-snapshot";
 const USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) VPNGate-WebWorker/0.2";
@@ -1705,7 +1705,7 @@ const PORTAL_CSS = String.raw`
   --shadow: 0 10px 30px rgba(0,0,0,0.28);
 }
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
-html { color-scheme: dark; }
+html { color-scheme: dark; -webkit-text-size-adjust: 100%; }
 html, body {
   margin: 0; padding: 0;
   background: var(--bg); color: var(--text);
@@ -1713,6 +1713,7 @@ html, body {
   min-height: 100dvh;
   background-image: var(--bg-glow);
 }
+::selection { background: rgba(56,189,248,0.32); color: #fff; }
 body { touch-action: manipulation; }
 a { color: var(--cyan); text-decoration: none; }
 .app-shell {
@@ -1734,14 +1735,19 @@ a { color: var(--cyan); text-decoration: none; }
   display: grid; place-items: center; font-family: var(--mono); font-weight: 800; color: var(--cyan);
   letter-spacing: -0.04em;
 }
-.brand-title { font-weight: 750; font-size: 15.5px; letter-spacing: -0.02em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.brand-title { font-weight: 700; font-size: 15.5px; letter-spacing: -0.02em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .brand-sub { font-size: 11px; color: var(--muted); font-family: var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 52vw; }
+@media (max-width: 420px) { .brand-sub { display: none; } }
 .topbar-right { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 .status-pill {
   display: inline-flex; align-items: center; gap: 6px;
   padding: 6px 10px; border-radius: 999px; font-size: 11px; font-family: var(--mono); font-weight: 700;
   background: var(--emerald-dim); color: var(--emerald); border: 1px solid rgba(52,211,153,0.35);
   max-width: 42vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+@media (max-width: 420px) {
+  .status-pill { max-width: 28vw; padding: 6px 8px; }
+  #status-text { overflow: hidden; text-overflow: ellipsis; }
 }
 .status-pill.syncing { background: var(--cyan-dim); color: var(--cyan); border-color: rgba(56,189,248,0.35); }
 .status-pill.error { background: var(--coral-dim); color: var(--coral); border-color: rgba(251,113,133,0.35); }
@@ -1757,7 +1763,7 @@ a { color: var(--cyan); text-decoration: none; }
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
   margin-bottom: 10px;
 }
-.card-title { font-weight: 750; font-size: 13.5px; letter-spacing: 0.01em; color: #F8FAFC; }
+.card-title { font-weight: 700; font-size: 13.5px; letter-spacing: 0.01em; color: #F8FAFC; }
 .card-subtitle { font-size: 12.5px; color: var(--muted); }
 .card-subtitle code { font-family: var(--mono); font-size: 11.5px; color: var(--cyan); }
 
@@ -1774,18 +1780,29 @@ select, input[type="text"] {
   padding: 11px 12px; font-size: 16px; font-family: var(--sans); outline: none;
   min-height: 44px;
 }
+select {
+  appearance: none; -webkit-appearance: none;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'><path fill='%238FA3BB' d='M1.2 1.2L6 6l4.8-4.8'/></svg>");
+  background-repeat: no-repeat; background-position: right 12px center; padding-right: 34px;
+}
 select:focus, input[type="text"]:focus { border-color: var(--cyan); box-shadow: 0 0 0 3px rgba(56,189,248,0.15); }
 button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible {
   outline: 2px solid var(--cyan); outline-offset: 2px;
 }
 
 .pill-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.pill-row.scroll {
+  flex-wrap: nowrap; overflow-x: auto; -webkit-overflow-scrolling: touch;
+  scrollbar-width: none; margin-left: -2px; padding: 2px;
+}
+.pill-row.scroll::-webkit-scrollbar { display: none; }
+.pill-row.scroll .chip { flex-shrink: 0; }
 .chip {
   background: var(--card-alt); color: var(--muted);
   border: 1px solid var(--border); border-radius: 999px;
   padding: 7px 12px; font-size: 12px; font-family: var(--mono); cursor: pointer;
   transition: border-color 0.14s ease, color 0.14s ease, background 0.14s ease;
-  min-height: 34px;
+  min-height: 34px; user-select: none;
 }
 .chip:hover { border-color: var(--cyan); color: var(--text); }
 .chip.active {
@@ -1805,6 +1822,10 @@ button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible
 .step.on { border-color: rgba(56,189,248,0.45); color: var(--cyan); }
 .step.ok { border-color: rgba(52,211,153,0.45); color: var(--emerald); }
 .step.bad { border-color: rgba(251,113,133,0.4); color: var(--coral); }
+@media (max-width: 520px) {
+  .step { font-size: 0; line-height: 0; padding: 9px 4px; }
+  .step b { font-size: 11px; line-height: 1.2; margin: 0; }
+}
 
 .hero-relay {
   background: linear-gradient(180deg, rgba(56,189,248,0.08) 0%, rgba(16,24,39,0.96) 42%);
@@ -1815,7 +1836,7 @@ button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible
 .hero-relay.testing { border-color: rgba(56,189,248,0.55); }
 .hero-relay.dead { border-color: rgba(251,113,133,0.4); }
 .relay-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
-.relay-country { font-size: 17px; font-weight: 750; color: #F8FAFC; letter-spacing: -0.02em; }
+.relay-country { font-size: 17px; font-weight: 700; color: #F8FAFC; letter-spacing: -0.02em; }
 .relay-host { font-family: var(--mono); font-size: 12px; color: var(--cyan); margin-top: 3px; word-break: break-all; }
 .stats-strip {
   display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px;
@@ -1825,7 +1846,7 @@ button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible
 @media (max-width: 520px) { .stats-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 .stat-box { font-family: var(--mono); }
 .stat-k { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
-.stat-v { font-size: 13.5px; font-weight: 750; color: #F8FAFC; margin-top: 2px; }
+.stat-v { font-size: 13.5px; font-weight: 700; color: #F8FAFC; margin-top: 2px; }
 
 .badges { display: flex; flex-wrap: wrap; gap: 5px; justify-content: flex-end; }
 .badge {
@@ -1869,6 +1890,7 @@ button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible
   min-height: 44px;
 }
 .btn:hover { border-color: var(--cyan); color: #fff; }
+.btn:active { transform: scale(0.98); }
 .btn-primary {
   background: linear-gradient(135deg, #0EA5E9, #0369A1);
   border-color: #38BDF8; color: #fff; flex: 1 1 210px;
@@ -1885,6 +1907,7 @@ button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible
   background: var(--console); border: 1px solid var(--border);
   border-radius: 12px; padding: 11px 12px; font-family: var(--mono);
   font-size: 11.5px; max-height: 240px; overflow-y: auto;
+  scrollbar-color: #22304A transparent;
 }
 .log-line { margin: 2px 0; word-break: break-word; }
 .log-ok { color: var(--emerald); }
@@ -1902,10 +1925,14 @@ button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible
 .relay-item.dead { opacity: 0.72; }
 
 .code-copy {
+  display: block; width: 100%; text-align: left;
   background: var(--console); border: 1px solid var(--border); border-radius: 9px;
   padding: 10px 11px; font-family: var(--mono); font-size: 12px; color: var(--cyan);
-  overflow-x: auto; white-space: nowrap; margin-top: 8px;
+  overflow-x: auto; white-space: nowrap; margin-top: 8px; cursor: pointer;
 }
+.code-copy:hover { border-color: var(--cyan); }
+.inline-row { display: flex; gap: 8px; align-items: stretch; }
+@media (max-width: 520px) { .inline-row { flex-direction: column; } }
 
 details.adv {
   margin-top: 10px; border-top: 1px solid var(--border); padding-top: 8px;
@@ -1941,7 +1968,7 @@ details.adv > summary::-webkit-details-marker { display: none; }
   color: var(--muted); padding: 8px 4px; cursor: pointer;
   display: flex; flex-direction: column; align-items: center; gap: 2px;
   font-family: var(--mono); font-size: 11px; font-weight: 700;
-  min-height: 48px;
+  min-height: 48px; user-select: none;
 }
 .nav-tab .nav-ico { font-size: 16px; line-height: 1; }
 .nav-tab.active {
@@ -2451,7 +2478,7 @@ const PORTAL_JS = String.raw`
           '<div class="badges">' + statusBadge + "</div>" +
         "</div>" +
         '<div class="btn-row" style="margin-top:8px">' +
-          '<span class="btn btn-sm btn-lock">Auto-merged</span>' +
+          '<span class="badge badge-live">AUTO-MERGED</span>' +
           '<a class="btn btn-sm" href="' + esc(m.portal_url) + '" target="_blank" rel="noopener noreferrer">Open portal</a>' +
         "</div>" +
       "</div>";
@@ -2630,6 +2657,17 @@ const PORTAL_JS = String.raw`
     runRecursiveVerify({});
   }
 
+  function onSortChange() {
+    state.selectedIndex = 0;
+    renderCountryControls();
+    renderConnectHero();
+    renderRelaysTab();
+    var top = getConnectCandidates()[0];
+    if (top && state.verified && state.verified.ip === top.ip) return;
+    if (top) runRecursiveVerify({ ip: top.ip });
+    else runRecursiveVerify({});
+  }
+
   document.addEventListener("DOMContentLoaded", function () {
     if (!state.device.mobile) {
       state.compat = "ovpn26";
@@ -2671,7 +2709,7 @@ const PORTAL_JS = String.raw`
       document.querySelectorAll("#connect-sort-pills .chip").forEach(function (c) {
         c.classList.toggle("active", c === btn);
       });
-      onFilterChange();
+      onSortChange();
     });
 
     document.getElementById("connect-compat").addEventListener("change", function (e) {
@@ -2726,6 +2764,22 @@ const PORTAL_JS = String.raw`
       appendLog("info", "Console log cleared.");
     });
 
+    var copyBtn = document.getElementById("install-copy");
+    if (copyBtn) {
+      copyBtn.addEventListener("click", function () {
+        var cmd = "curl -fsSL https://raw.githubusercontent.com/warmaster726/vpngate-connect/main/install-vpngate.sh | sh";
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(cmd).then(function () {
+            appendLog("ok", "Desktop installer command copied.");
+          }).catch(function () {
+            appendLog("warn", "Copy failed — select the command manually.");
+          });
+        } else {
+          appendLog("info", cmd);
+        }
+      });
+    }
+
     document.body.addEventListener("click", function (e) {
       var vBtn = e.target.closest("[data-verify-ip]");
       if (vBtn) {
@@ -2777,7 +2831,7 @@ function renderPortalHtml() {
         </div>
       </div>
       <div class="topbar-right">
-        <div class="status-pill syncing" id="status-pill">
+        <div class="status-pill syncing" id="status-pill" aria-live="polite">
           <span class="dot"></span>
           <span id="status-text">BOOTING</span>
         </div>
@@ -2816,12 +2870,12 @@ function renderPortalHtml() {
             </select>
           </div>
         </div>
-        <div class="pill-row" id="quick-country-pills"></div>
-        <label class="field-label" style="margin-top:10px">Sort order (desktop parity)</label>
-        <div class="pill-row" id="connect-sort-pills" style="margin-top:4px">
-          <button type="button" class="chip active" data-csort="recommended">1 · Highest score</button>
-          <button type="button" class="chip" data-csort="speed">2 · Fastest speed</button>
-          <button type="button" class="chip" data-csort="ping">3 · Lowest ping</button>
+        <div class="pill-row scroll" id="quick-country-pills"></div>
+        <label class="field-label" style="margin-top:10px">Server priority</label>
+        <div class="pill-row scroll" id="connect-sort-pills" style="margin-top:4px">
+          <button type="button" class="chip active" data-csort="recommended">Score</button>
+          <button type="button" class="chip" data-csort="speed">Speed</button>
+          <button type="button" class="chip" data-csort="ping">Ping</button>
         </div>
         <details class="adv">
           <summary>Advanced · cipher profile &amp; tunnel DNS</summary>
@@ -2857,15 +2911,15 @@ function renderPortalHtml() {
       </div>
 
       <div class="card">
-        <div class="card-header">
-          <div class="card-title">Device setup</div>
-        </div>
-        <div class="card-subtitle">
-          <strong>iPhone / iPad:</strong> Safari only. Wait until the relay shows <em>LIVE HANDSHAKE</em>, tap <strong>Install Apple L2TP</strong> → Allow → Settings → Profile Downloaded → Install.<br>
-          <strong>Android / OpenVPN:</strong> After handshake, export <code>.ovpn</code> into OpenVPN Connect / OpenVPN for Android (no username prompt).<br>
-          <strong>Linux, Windows 11 &amp; macOS desktop client:</strong>
-        </div>
-        <div class="code-copy">curl -fsSL https://raw.githubusercontent.com/warmaster726/vpngate-connect/main/install-vpngate.sh | sh</div>
+        <details class="adv" style="margin-top:0;border-top:0;padding-top:0">
+          <summary>Device setup · iOS / Android / desktop</summary>
+          <div class="card-subtitle" style="margin-top:8px">
+            <strong>iPhone / iPad:</strong> Safari only. Wait for <em>LIVE HANDSHAKE</em>, tap <strong>Install Apple L2TP</strong> → Allow → Settings → Profile Downloaded → Install.<br>
+            <strong>Android / OpenVPN:</strong> After handshake, export <code>.ovpn</code> into OpenVPN Connect / OpenVPN for Android.<br>
+            <strong>Linux, Windows 11 &amp; macOS:</strong> tap the command to copy, then run it in a terminal.
+          </div>
+          <button type="button" class="code-copy" id="install-copy" title="Tap to copy">curl -fsSL https://raw.githubusercontent.com/warmaster726/vpngate-connect/main/install-vpngate.sh | sh</button>
+        </details>
       </div>
 
       <div class="card">
@@ -2873,7 +2927,7 @@ function renderPortalHtml() {
           <div class="card-title">Live edge console</div>
           <button type="button" class="btn btn-sm" id="btn-clear-log">Clear</button>
         </div>
-        <div class="console-box" id="console-log"></div>
+        <div class="console-box" id="console-log" aria-live="polite"></div>
       </div>
     </section>
 
@@ -2886,14 +2940,14 @@ function renderPortalHtml() {
           </div>
         </div>
         <input type="text" id="relay-search" placeholder="Filter by ISO (JP, KR, US) or country / hostname / IP" autocomplete="off" spellcheck="false">
-        <div class="pill-row" id="relay-proto-pills">
+        <div class="pill-row scroll" id="relay-proto-pills">
           <button type="button" class="chip active" data-rproto="all">All protocols</button>
           <button type="button" class="chip" data-rproto="l2tp">L2TP/IPsec</button>
           <button type="button" class="chip" data-rproto="openvpn">OpenVPN</button>
           <button type="button" class="chip" data-rproto="udp">OVPN UDP</button>
           <button type="button" class="chip" data-rproto="tcp">OVPN TCP</button>
         </div>
-        <div class="pill-row" id="relay-sort-pills">
+        <div class="pill-row scroll" id="relay-sort-pills">
           <button type="button" class="chip active" data-rsort="recommended">Recommended</button>
           <button type="button" class="chip" data-rsort="speed">Speed</button>
           <button type="button" class="chip" data-rsort="ping">Lowest ping</button>
@@ -2914,7 +2968,7 @@ function renderPortalHtml() {
         </div>
         <div class="card-subtitle" style="margin-bottom:8px">Discovery already pulls <code>/api/iphone/</code> from every official portal plus all HTTPS CSV feeds. Add an extra portal only if you have a URL that is not in the directory.</div>
         <label class="field-label" for="custom-mirror-input">Extra portal to merge (optional)</label>
-        <div style="display:flex;gap:8px">
+        <div class="inline-row">
           <input type="text" id="custom-mirror-input" placeholder="http://host:port/en/" autocomplete="off" spellcheck="false">
           <button type="button" class="btn btn-sm" id="btn-apply-mirror">Merge extra</button>
         </div>
