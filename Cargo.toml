@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vpngate-core",
+    "crates/vpngate-cli",
+    "crates/vpngate-bridge",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/warmaster726/vpngate-connect"
+authors = ["War Master726 <warmaster726@gmail.com>"]
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+
+# Optimized for small static binaries on Desktop & strict <15 MB iOS PacketTunnel limits
+[profile.release]
+opt-level = "z"
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"

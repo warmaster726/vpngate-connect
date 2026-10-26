@@ -1,0 +1,122 @@
+# ==============================================================================
+# vpngate-connect (Cross-platform: Rust Workspace + Flutter Mobile Shell)
+# Targets: Windows, macOS, Linux, Android & iOS
+# ==============================================================================
+
+# --- 1. Rust & Cargo Build Artifacts ---
+# Note: Cargo.lock is intentionally tracked for reproducible binary & FFI builds.
+/target/
+**/target/
+**/*.rs.bk
+*.pdb
+*.dwo
+*.profraw
+*.profdata
+lcov.info
+
+# --- 2. Flutter & Dart (mobile/) ---
+.dart_tool/
+**/.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+.pub/
+**/build/
+**/ephemeral/
+**/coverage/
+*.iml
+**/flutter_*.png
+**/linked_*.ds
+**/unlinked*.ds
+
+# flutter_rust_bridge temporary & backup artifacts
+.frb-cache/
+**/frb_generated*.bak
+
+# --- 3. Android (Gradle, NDK & Signing Secrets) ---
+*.apk
+*.aab
+*.ap_
+*.dex
+.gradle/
+**/.gradle/
+**/local.properties
+**/key.properties
+**/*.jks
+**/*.keystore
+**/.cxx/
+**/.externalNativeBuild/
+**/captures/
+**/output-metadata.json
+# Compiled Rust JNI libraries copied into Android build tree
+**/android/app/src/main/jniLibs/
+
+# --- 4. iOS & macOS (Xcode, CocoaPods, SwiftPM & Provisioning) ---
+.DS_Store
+**/.DS_Store
+.AppleDouble
+.LSOverride
+**/Pods/
+**/DerivedData/
+**/*.xcuserdata/
+**/*.xccheckout
+**/*.moved-aside
+**/*.ipa
+**/*.dSYM.zip
+**/*.dSYM/
+**/*.xcframework/
+**/*.mobileprovision
+**/*.cer
+**/*.p12
+**/Flutter/Generated.xcconfig
+**/Flutter/flutter_export_environment.sh
+**/Flutter/App.framework
+**/Flutter/Flutter.framework
+**/Flutter/Flutter.podspec
+**/ServiceDefinitions.json
+
+# --- 5. Windows, macOS & Linux Release Packages / Binaries ---
+Thumbs.db
+Desktop.ini
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+*.exp
+*.msi
+*.msix
+*.deb
+*.rpm
+*.AppImage
+*.pkg.tar.zst
+*.dmg
+
+# --- 6. VPN Runtime Configs, Caches, Logs & Secrets (Never Commit) ---
+*.ovpn
+*.mobileconfig
+*.pbk
+*.pem
+*.key
+*.der
+*.pfx
+*.log
+.env
+.env.*
+*token*.txt
+*secret*
+servers_cache*.json
+cooldowns*.json
+
+# --- 7. Editor & OS Scratch Files ---
+.idea/
+*.swp
+*.swo
+*~
+*.bak
+*.tmp
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json

@@ -1,0 +1,18 @@
+[package]
+name = "vpngate-cli"
+description = "Single-binary CLI and interactive TUI dashboard for Windows, macOS, and Linux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "vpngate"
+path = "src/main.rs"
+
+[dependencies]
+vpngate-core = { path = "../vpngate-core" }
+
+[lints]
+workspace = true

@@ -1,0 +1,11 @@
+[package]
+name = "vpngate-core"
+description = "Shared cross-platform VPN Gate discovery, DoH, pre-flight probing, profile patching, and tunnel engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
