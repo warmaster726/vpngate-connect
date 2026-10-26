@@ -6,6 +6,31 @@ allprojects {
     }
 }
 
+def resolvedSubprojectBuildTools = {
+    def sdkDir = System.getenv("ANDROID_HOME") ?: System.getenv("ANDROID_SDK_ROOT")
+    if (sdkDir == null || sdkDir.trim().isEmpty()) {
+        def localPropsFile = rootProject.file("local.properties")
+        if (localPropsFile.exists()) {
+            def props = new Properties()
+            localPropsFile.withInputStream { props.load(it) }
+            sdkDir = props.getProperty("sdk.dir")
+        }
+    }
+    if (sdkDir != null) {
+        def btRoot = new File(sdkDir, "build-tools")
+        if (btRoot.isDirectory()) {
+            def versions = btRoot.listFiles()
+                ?.findAll { it.isDirectory() && new File(it, "source.properties").exists() }
+                ?.collect { it.name }
+                ?.sort()
+            if (versions != null && !versions.isEmpty()) {
+                return versions.last()
+            }
+        }
+    }
+    return "36.0.0"
+}()
+
 rootProject.buildDir = "../build"
 subprojects {
     project.buildDir = "${rootProject.buildDir}/${project.name}"
@@ -19,6 +44,7 @@ subprojects {
                         namespace proj.group.toString()
                     }
                     compileSdkVersion 36
+                    buildToolsVersion resolvedSubprojectBuildTools
                 }
             }
         }

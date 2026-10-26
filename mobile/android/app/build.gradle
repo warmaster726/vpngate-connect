@@ -4,7 +4,7 @@ plugins {
     id "dev.flutter.flutter-gradle-plugin"
 }
 
-def resolvedNdkVersion = {
+def resolveSdkRoot = {
     def sdkDir = System.getenv("ANDROID_HOME") ?: System.getenv("ANDROID_SDK_ROOT")
     if (sdkDir == null || sdkDir.trim().isEmpty()) {
         def localPropsFile = rootProject.file("local.properties")
@@ -14,6 +14,11 @@ def resolvedNdkVersion = {
             sdkDir = props.getProperty("sdk.dir")
         }
     }
+    return sdkDir
+}
+
+def resolvedNdkVersion = {
+    def sdkDir = resolveSdkRoot()
     if (sdkDir != null) {
         def ndkRoot = new File(sdkDir, "ndk")
         if (ndkRoot.isDirectory()) {
@@ -29,9 +34,27 @@ def resolvedNdkVersion = {
     return flutter.ndkVersion
 }()
 
+def resolvedBuildToolsVersion = {
+    def sdkDir = resolveSdkRoot()
+    if (sdkDir != null) {
+        def btRoot = new File(sdkDir, "build-tools")
+        if (btRoot.isDirectory()) {
+            def versions = btRoot.listFiles()
+                ?.findAll { it.isDirectory() && new File(it, "source.properties").exists() }
+                ?.collect { it.name }
+                ?.sort()
+            if (versions != null && !versions.isEmpty()) {
+                return versions.last()
+            }
+        }
+    }
+    return "36.0.0"
+}()
+
 android {
     namespace = "org.vpngate.connect"
     compileSdk = Math.max(36, flutter.compileSdkVersion as int)
+    buildToolsVersion = resolvedBuildToolsVersion
     ndkVersion = resolvedNdkVersion
 
     compileOptions {
