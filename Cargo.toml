@@ -13,6 +13,22 @@ license = "MIT"
 repository = "https://github.com/warmaster726/vpngate-connect"
 authors = ["War Master726 <warmaster726@gmail.com>"]
 
+[workspace.dependencies]
+base64 = "0.22"
+csv = "1.3"
+hmac = "0.12"
+md-5 = "0.10"
+num-bigint = "0.4"
+rand = "0.8"
+regex = "1.11"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha1 = "0.10"
+subtle = "2.6"
+thiserror = "2.0"
+tokio = { version = "1.43", features = ["rt-multi-thread", "net", "time", "sync", "fs", "macros"] }
+
 [workspace.lints.rust]
 unsafe_code = "warn"
 

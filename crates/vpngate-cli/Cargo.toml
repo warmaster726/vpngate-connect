@@ -1,6 +1,6 @@
 [package]
 name = "vpngate-cli"
-description = "Single-binary CLI and interactive TUI dashboard for Windows, macOS, and Linux"
+description = "Cross-platform CLI + interactive TUI for VPN Gate Connect (Windows, macOS, Linux)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,6 +12,7 @@ name = "vpngate"
 path = "src/main.rs"
 
 [dependencies]
+tokio.workspace = true
 vpngate-core = { path = "../vpngate-core" }
 
 [lints]

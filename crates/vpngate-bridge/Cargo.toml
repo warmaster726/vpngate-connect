@@ -1,6 +1,6 @@
 [package]
 name = "vpngate-bridge"
-description = "FFI bridge crate (flutter_rust_bridge) connecting vpngate-core to Flutter on Android and iOS"
+description = "flutter_rust_bridge FFI bindings exposing vpngate-core to Flutter Desktop & Mobile"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,12 +8,10 @@ repository.workspace = true
 authors.workspace = true
 
 [lib]
-# cdylib -> Android (.so) / Windows (.dll) / Linux (.so) / macOS (.dylib)
-# staticlib -> iOS (.a / .xcframework) for NEPacketTunnelProvider & Flutter app
-# rlib -> Rust integration tests
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
+tokio.workspace = true
 vpngate-core = { path = "../vpngate-core" }
 
 [lints]
