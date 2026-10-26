@@ -34,6 +34,24 @@ if [[ -d /var/tmp && -w /var/tmp ]]; then
     export TMPDIR="${TMPDIR:-/var/tmp}"
 fi
 
+# Prefer OpenJDK 21 LTS (or 17 LTS) for Gradle 8.14 compatibility when a newer
+# non-Gradle-supported default JDK (such as OpenJDK 25) is also installed.
+if [[ -z "${JAVA_HOME:-}" ]] || [[ "${JAVA_HOME:-}" == *java-25* ]] || [[ "${JAVA_HOME:-}" == *java-26* ]]; then
+    for jvm_cand in \
+        /usr/lib/jvm/java-21-openjdk-amd64 \
+        /usr/lib/jvm/java-21-openjdk-arm64 \
+        /usr/lib/jvm/java-21-openjdk \
+        /usr/lib/jvm/temurin-21-jdk-amd64 \
+        /usr/lib/jvm/java-17-openjdk-amd64 \
+        /usr/lib/jvm/java-17-openjdk-arm64; do
+        if [[ -x "${jvm_cand}/bin/javac" ]]; then
+            export JAVA_HOME="${jvm_cand}"
+            export PATH="${JAVA_HOME}/bin:${PATH}"
+            break
+        fi
+    done
+fi
+
 resolve_ndk_dir() {
     for cand in "${ANDROID_NDK_HOME:-}" "${ANDROID_NDK_ROOT:-}" "${NDK_HOME:-}"; do
         if [[ -n "$cand" && -d "$cand/toolchains/llvm/prebuilt" ]]; then
@@ -65,6 +83,9 @@ LLVM_BIN="${HOST_PREBUILT}/bin"
 API_LEVEL="${VPNGATE_ANDROID_API:-24}"
 
 echo "[*] Using Android NDK: ${NDK_DIR}"
+if [[ -n "${JAVA_HOME:-}" ]]; then
+    echo "[*] Using JAVA_HOME:   ${JAVA_HOME}"
+fi
 echo "[*] Compiling crates/vpngate-bridge (--release --locked) for ABIs: ${ABIS_CSV}"
 
 IFS=',' read -r -a ABI_LIST <<< "$ABIS_CSV"
@@ -116,12 +137,18 @@ if [[ "$JNI_ONLY" -eq 1 ]]; then
     exit 0
 fi
 
-# Bootstrap Gradle wrapper scripts on fresh clones without overwriting custom Kotlin/JNI/Gradle files
-if [[ ! -f "${SCRIPT_DIR}/android/gradlew" ]]; then
+# Bootstrap Gradle wrapper launcher + jar on fresh clones while preserving pinned gradle-wrapper.properties
+if [[ ! -f "${SCRIPT_DIR}/android/gradlew" ]] || [[ ! -f "${SCRIPT_DIR}/android/gradle/wrapper/gradle-wrapper.jar" ]]; then
     echo "[*] Bootstrapping Gradle wrapper scaffold via Flutter SDK ..."
     TMP_SCAFFOLD="$(mktemp -d "${TMPDIR:-/tmp}/vpngate-flutter-scaffold.XXXXXX")"
     flutter create --platforms=android --org org.vpngate --project-name vpngate_mobile "$TMP_SCAFFOLD" >/dev/null
-    cp -rn "${TMP_SCAFFOLD}/android/gradle" "${SCRIPT_DIR}/android/" 2>/dev/null || true
+    mkdir -p "${SCRIPT_DIR}/android/gradle/wrapper"
+    cp -f "${TMP_SCAFFOLD}/android/gradle/wrapper/gradle-wrapper.jar" \
+        "${SCRIPT_DIR}/android/gradle/wrapper/gradle-wrapper.jar"
+    if [[ ! -f "${SCRIPT_DIR}/android/gradle/wrapper/gradle-wrapper.properties" ]]; then
+        cp -f "${TMP_SCAFFOLD}/android/gradle/wrapper/gradle-wrapper.properties" \
+            "${SCRIPT_DIR}/android/gradle/wrapper/gradle-wrapper.properties"
+    fi
     cp -f "${TMP_SCAFFOLD}/android/gradlew" "${SCRIPT_DIR}/android/gradlew"
     cp -f "${TMP_SCAFFOLD}/android/gradlew.bat" "${SCRIPT_DIR}/android/gradlew.bat"
     chmod 0755 "${SCRIPT_DIR}/android/gradlew"
