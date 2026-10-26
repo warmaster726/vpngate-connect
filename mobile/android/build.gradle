@@ -11,6 +11,25 @@ subprojects {
     project.buildDir = "${rootProject.buildDir}/${project.name}"
 }
 subprojects {
+    if (project.name != "app") {
+        def configurePluginAndroid = { proj ->
+            if (proj.hasProperty("android")) {
+                proj.android {
+                    if (namespace == null) {
+                        namespace proj.group.toString()
+                    }
+                    compileSdkVersion 36
+                }
+            }
+        }
+        if (project.state.executed) {
+            configurePluginAndroid(project)
+        } else {
+            project.afterEvaluate(configurePluginAndroid)
+        }
+    }
+}
+subprojects {
     project.evaluationDependsOn(":app")
 }
 
