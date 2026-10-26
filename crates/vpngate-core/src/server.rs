@@ -84,6 +84,10 @@ impl VpnServer {
 }
 
 /// Filters servers by 2-letter ISO code or case-insensitive country substring.
+///
+/// When `query` is a 2-letter ASCII alphabetic ISO code (e.g. `US`, `IN`, `DE`, `JP`, `KR`,
+/// plus common alias `UK` -> `GB`), matching is strictly restricted to `country_short` so `-c US`
+/// never matches `Russian Federation` (`rUSsian`), `Australia` (`aUStralia`), or `Belarus`.
 pub fn filter_by_country(servers: &[VpnServer], query: Option<&str>) -> Vec<VpnServer> {
     let Some(q_raw) = query else {
         return servers.to_vec();
@@ -93,15 +97,21 @@ pub fn filter_by_country(servers: &[VpnServer], query: Option<&str>) -> Vec<VpnS
         return servers.to_vec();
     }
     let q_up = q.to_ascii_uppercase();
-    let q_low = q.to_ascii_lowercase();
+    if q.len() == 2 && q.chars().all(|c| c.is_ascii_alphabetic()) {
+        let iso = if q_up == "UK" { "GB" } else { q_up.as_str() };
+        return servers
+            .iter()
+            .filter(|s| s.country_short.eq_ignore_ascii_case(iso))
+            .cloned()
+            .collect();
+    }
 
+    let q_low = q.to_ascii_lowercase();
     servers
         .iter()
         .filter(|s| {
-            if q.len() == 2 && s.country_short.eq_ignore_ascii_case(&q_up) {
-                return true;
-            }
-            s.country_long.to_ascii_lowercase().contains(&q_low)
+            s.country_short.eq_ignore_ascii_case(&q_up)
+                || s.country_long.to_ascii_lowercase().contains(&q_low)
         })
         .cloned()
         .collect()
@@ -133,16 +143,22 @@ pub fn sort_servers(servers: &mut [VpnServer], sort_by: SortBy, filter: Protocol
             ProtocolFilter::Only(_) => std::cmp::Ordering::Equal,
         };
 
+        let eff_ping_a = if a.ping_ms == 0 { u32::MAX } else { a.ping_ms };
+        let eff_ping_b = if b.ping_ms == 0 { u32::MAX } else { b.ping_ms };
+
         match sort_by {
             SortBy::Recommended => tier_cmp
                 .then_with(|| b.score.cmp(&a.score))
                 .then_with(|| b.speed_bps.cmp(&a.speed_bps))
-                .then_with(|| a.ping_ms.cmp(&b.ping_ms)),
-            SortBy::Speed => tier_cmp
-                .then_with(|| b.speed_bps.cmp(&a.speed_bps))
+                .then_with(|| eff_ping_a.cmp(&eff_ping_b)),
+            SortBy::Speed => b
+                .speed_bps
+                .cmp(&a.speed_bps)
+                .then(tier_cmp)
                 .then_with(|| b.score.cmp(&a.score)),
-            SortBy::Ping => tier_cmp
-                .then_with(|| a.ping_ms.cmp(&b.ping_ms))
+            SortBy::Ping => eff_ping_a
+                .cmp(&eff_ping_b)
+                .then(tier_cmp)
                 .then_with(|| b.speed_bps.cmp(&a.speed_bps)),
             SortBy::Score => tier_cmp
                 .then_with(|| b.score.cmp(&a.score))
@@ -187,5 +203,33 @@ mod tests {
         assert_eq!(pool[0].ip, "1.1.1.1");
         assert_eq!(pool[1].ip, "1.1.1.2");
         assert_eq!(pool[2].ip, "1.1.1.3");
+    }
+
+    #[test]
+    fn iso_two_letter_country_filter_never_matches_substring_false_positives() {
+        let mut ru = dummy("2.2.2.1", false, 1194, 443, 500_000);
+        ru.country_short = "RU".to_string();
+        ru.country_long = "Russian Federation".to_string();
+
+        let mut au = dummy("2.2.2.2", false, 1194, 443, 500_000);
+        au.country_short = "AU".to_string();
+        au.country_long = "Australia".to_string();
+
+        let mut us = dummy("2.2.2.3", true, 1194, 443, 500_000);
+        us.country_short = "US".to_string();
+        us.country_long = "United States".to_string();
+
+        let mut gb = dummy("2.2.2.4", false, 1194, 443, 500_000);
+        gb.country_short = "GB".to_string();
+        gb.country_long = "United Kingdom".to_string();
+
+        let pool = vec![ru, au, us, gb];
+        let us_only = filter_by_country(&pool, Some("US"));
+        assert_eq!(us_only.len(), 1);
+        assert_eq!(us_only[0].country_short, "US");
+
+        let uk_alias = filter_by_country(&pool, Some("UK"));
+        assert_eq!(uk_alias.len(), 1);
+        assert_eq!(uk_alias[0].country_short, "GB");
     }
 }

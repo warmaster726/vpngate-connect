@@ -525,6 +525,7 @@ fn snapshot_and_apply_linux_sysctls(paths: &AppPaths, l2tp_mode: bool) {
     let mut keys = vec![
         ("net.ipv6.conf.all.disable_ipv6", "1"),
         ("net.ipv6.conf.default.disable_ipv6", "1"),
+        ("net.ipv6.conf.lo.disable_ipv6", "0"),
     ];
     if l2tp_mode {
         keys.push(("net.ipv4.conf.all.rp_filter", "2"));
@@ -543,6 +544,105 @@ fn snapshot_and_apply_linux_sysctls(paths: &AppPaths, l2tp_mode: bool) {
         let _ = fs::write(&proc_p, format!("{val}\n"));
     }
     let _ = atomic_write_json(&paths.sysctl_backup, &snap);
+}
+
+/// Checks whether the running Linux kernel supports `/dev/ppp` + `XFRM ESP` (`CONFIG_INET_ESP` & `CONFIG_PPP`),
+/// proactively loading modular `xfrm_user`, `esp4`, `ppp_generic`, and `l2tp_ppp` when running as root.
+pub fn probe_linux_l2tp_kernel_support() -> std::result::Result<(), String> {
+    if !cfg!(target_os = "linux") {
+        return Ok(());
+    }
+    if is_root_or_admin() {
+        let modprobe_bin = which_bin("modprobe").or_else(|| {
+            ["/sbin/modprobe", "/usr/sbin/modprobe"]
+                .into_iter()
+                .map(PathBuf::from)
+                .find(|p| p.is_file())
+        });
+        if let Some(mp) = modprobe_bin {
+            for m in ["xfrm_user", "esp4", "ppp_generic", "l2tp_ppp"] {
+                let _ = Command::new(&mp)
+                    .arg(m)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
+    }
+
+    // Inspect `/proc/config.gz` if exposed (common on custom/WSL2/microVM kernels without loadable modules)
+    if Path::new("/proc/config.gz").is_file()
+        && let Ok(out) = Command::new("gzip")
+            .args(["-dc", "/proc/config.gz"])
+            .output()
+        && out.status.success()
+    {
+        let cfg_txt = String::from_utf8_lossy(&out.stdout);
+        let has_esp =
+            cfg_txt.contains("CONFIG_INET_ESP=y") || cfg_txt.contains("CONFIG_INET_ESP=m");
+        let has_ppp = cfg_txt.contains("CONFIG_PPP=y") || cfg_txt.contains("CONFIG_PPP=m");
+        if !has_esp || !has_ppp {
+            return Err(
+                "kernel lacks CONFIG_INET_ESP / CONFIG_PPP (OpenVPN Auto fallback active)"
+                    .to_string(),
+            );
+        }
+    }
+
+    if is_root_or_admin() && !Path::new("/dev/ppp").exists() {
+        return Err("`/dev/ppp` character device unavailable on this kernel".to_string());
+    }
+    Ok(())
+}
+
+/// Locks tunnel DNS on Linux across both `systemd-resolved` (`resolvectl`) and direct `/etc/resolv.conf` distros.
+fn apply_linux_tunnel_dns(paths: &AppPaths, dev: &str, dns_servers: &[String]) {
+    if !cfg!(target_os = "linux") || dns_servers.is_empty() || !is_root_or_admin() {
+        return;
+    }
+
+    let mut resolved_handled = false;
+    let resolv_path = Path::new("/etc/resolv.conf");
+    let is_systemd_symlink = fs::read_link(resolv_path)
+        .ok()
+        .map(|target| target.to_string_lossy().contains("systemd"))
+        .unwrap_or(false);
+
+    if which_bin("resolvectl").is_some() {
+        let mut args = vec!["dns".to_string(), dev.to_string()];
+        args.extend(dns_servers.iter().cloned());
+        let ok_dns = Command::new("resolvectl")
+            .args(&args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        let _ = Command::new("resolvectl")
+            .args(["domain", dev, "~."])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if ok_dns && is_systemd_symlink {
+            resolved_handled = true;
+        }
+    }
+
+    if !resolved_handled && resolv_path.exists() && !resolv_path.is_symlink() {
+        if !paths.l2tp_resolv_bak.exists() {
+            let _ = fs::copy(resolv_path, &paths.l2tp_resolv_bak);
+            fix_owner(&paths.l2tp_resolv_bak);
+        }
+        let mut body =
+            String::from("# Managed by vpngate — original backed up to resolv.conf.bak\n");
+        for ns in dns_servers {
+            let trimmed = ns.trim();
+            if !trimmed.is_empty() {
+                body.push_str(&format!("nameserver {trimmed}\n"));
+            }
+        }
+        let _ = fs::write(resolv_path, body);
+    }
 }
 
 fn restore_linux_sysctls(paths: &AppPaths) {
@@ -762,6 +862,8 @@ pub async fn connect_l2tp_linux_builtin(
     timeout_secs: u64,
     mut on_progress: impl FnMut(ProgressEvent),
 ) -> std::result::Result<String, String> {
+    probe_linux_l2tp_kernel_support()?;
+
     let xl2tpd_bin = which_bin("xl2tpd")
         .or_else(|| {
             let p = PathBuf::from("/usr/sbin/xl2tpd");
@@ -977,20 +1079,7 @@ pub async fn connect_l2tp_linux_builtin(
             .status();
     }
 
-    if !dns_servers.is_empty() && which_bin("resolvectl").is_some() {
-        let mut args = vec!["dns".to_string(), ppp_dev.clone()];
-        args.extend(dns_servers.iter().cloned());
-        let _ = Command::new("resolvectl")
-            .args(&args)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        let _ = Command::new("resolvectl")
-            .args(["domain", &ppp_dev, "~."])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
+    apply_linux_tunnel_dns(paths, &ppp_dev, dns_servers);
 
     Ok(ppp_dev)
 }
@@ -1326,23 +1415,18 @@ pub async fn connect_openvpn_desktop(
             .cloned()
             .unwrap_or_else(|| "tun0".to_string());
 
-        if cfg!(target_os = "linux") && !dns_servers.is_empty() && which_bin("resolvectl").is_some()
-        {
-            let mut args = vec!["dns".to_string(), dev.clone()];
-            args.extend(dns_servers.iter().cloned());
-            let _ = Command::new("resolvectl")
-                .args(&args)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            let _ = Command::new("resolvectl")
-                .args(["domain", &dev, "~."])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        }
+        apply_linux_tunnel_dns(paths, &dev, dns_servers);
         return Ok((dev, "openvpn-daemon".to_string()));
     }
+
+    // Kill failed/timed-out OpenVPN child immediately so no background retry loop lingers
+    if let Ok(txt) = fs::read_to_string(&paths.ovpn_pid)
+        && let Ok(pid) = txt.trim().parse::<u32>()
+        && (cfg!(target_os = "windows") || pid_matches_cmdline(pid, "openvpn"))
+    {
+        terminate_pid(pid, cfg!(target_os = "windows"));
+    }
+    let _ = fs::remove_file(&paths.ovpn_pid);
 
     Err("OpenVPN handshake failed or timed out".to_string())
 }
@@ -1463,7 +1547,11 @@ pub fn spawn_auto_reconnect_monitor(paths: &AppPaths) -> u32 {
 
 fn append_monitor_log(paths: &AppPaths, msg: &str) {
     let ts = now_unix_secs();
-    let line = format!("[{ts}] {msg}\n");
+    let tod = ts % 86_400;
+    let hh = tod / 3600;
+    let mm = (tod % 3600) / 60;
+    let ss = tod % 60;
+    let line = format!("[{hh:02}:{mm:02}:{ss:02} UTC] {msg}\n");
     if let Ok(mut f) = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1573,9 +1661,26 @@ pub async fn engage_candidates_with_progress(
 
     let mut cooldowns = load_cooldowns(paths);
     let total = ordered.len();
+    let linux_l2tp_err = if cfg!(target_os = "linux") {
+        probe_linux_l2tp_kernel_support().err()
+    } else {
+        None
+    };
+    let mut warned_l2tp_kernel = false;
 
     for (idx, srv) in ordered.iter().enumerate() {
-        let protos = srv.candidate_protocols(cfg.proto_filter);
+        let mut protos = srv.candidate_protocols(cfg.proto_filter);
+        if let Some(ref kerr) = linux_l2tp_err
+            && protos.contains(&VpnProtocol::L2tpIpsec)
+        {
+            if !warned_l2tp_kernel {
+                warned_l2tp_kernel = true;
+                on_progress(ProgressEvent::Warn(format!(
+                    "Host Linux L2TP/XFRM unavailable ({kerr}) — skipping L2TP attempts without penalizing servers."
+                )));
+            }
+            protos.retain(|p| *p != VpnProtocol::L2tpIpsec);
+        }
         if protos.is_empty() {
             continue;
         }

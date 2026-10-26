@@ -110,7 +110,12 @@ fn delegate_to_window_launcher(raw_args: &[String]) -> i32 {
         return 1;
     };
 
-    let mut cmd = std::process::Command::new("python3");
+    let py_bin = if Path::new("/usr/bin/python3").is_file() {
+        "/usr/bin/python3"
+    } else {
+        "python3"
+    };
+    let mut cmd = std::process::Command::new(py_bin);
     cmd.arg(launcher);
     if !filtered.is_empty() {
         cmd.arg("--hold");

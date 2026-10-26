@@ -1008,19 +1008,25 @@ pub fn cmd_doctor(paths: &AppPaths) -> io::Result<i32> {
         let has_ppp =
             which_bin("pppd").is_some() || std::path::Path::new("/usr/sbin/pppd").is_file();
         let has_ip = which_bin("ip").is_some();
-        if has_xl && has_ppp && has_ip {
-            let fw_note = if which_bin("nft").is_some() {
-                "nftables native"
-            } else {
-                "iptables"
-            };
-            lines.push(Some(format!(
-                "L2TP Engine  : {GREEN}READY{RESET} — Built-In Rust IKEv1/XFRM + xl2tpd + pppd ({fw_note})"
-            )));
-        } else {
+        if !has_xl || !has_ppp || !has_ip {
             issues += 1;
             lines.push(Some(format!(
                 "L2TP Engine  : {YELLOW}MISSING{RESET} — Install: `sudo apt install -y xl2tpd ppp iproute2`"
+            )));
+        } else if let Err(kerr) = vpngate_core::probe_linux_l2tp_kernel_support() {
+            lines.push(Some(format!(
+                "L2TP Engine  : {YELLOW}SKIPPED{RESET} — {kerr}"
+            )));
+        } else {
+            let fw_note = if which_bin("nft").is_some() {
+                "nftables native"
+            } else if which_bin("iptables").is_some() {
+                "iptables"
+            } else {
+                "host firewall open"
+            };
+            lines.push(Some(format!(
+                "L2TP Engine  : {GREEN}READY{RESET} — Built-In Rust IKEv1/XFRM + xl2tpd + pppd ({fw_note})"
             )));
         }
     } else {

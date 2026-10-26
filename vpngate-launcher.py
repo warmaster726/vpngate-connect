@@ -649,7 +649,27 @@ def run_fallback_terminal(child_argv: list) -> int:
     return subprocess.call(child_argv)
 
 
+def _reexec_system_python_for_gi_if_needed() -> None:
+    if os.environ.get("VPNGATE_LAUNCHER_REEXEC") == "1":
+        return
+    try:
+        import gi  # noqa: F401
+        return
+    except ImportError:
+        pass
+    sys_py = "/usr/bin/python3"
+    if os.path.isfile(sys_py) and os.access(sys_py, os.X_OK):
+        try:
+            if os.path.realpath(sys.executable) != os.path.realpath(sys_py):
+                env = os.environ.copy()
+                env["VPNGATE_LAUNCHER_REEXEC"] = "1"
+                os.execve(sys_py, [sys_py, os.path.realpath(__file__)] + sys.argv[1:], env)
+        except Exception:
+            pass
+
+
 def main() -> int:
+    _reexec_system_python_for_gi_if_needed()
     vpngate_bin = resolve_vpngate_bin()
     hold, passthrough = parse_launcher_args(sys.argv[1:])
     child_argv = build_child_command(vpngate_bin, passthrough, hold)

@@ -426,7 +426,7 @@ if [ "${SKIP_DEPS}" -eq 0 ]; then
       tar \
       gcc \
       libc6-dev </dev/null
-    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       python3 \
       python3-gi \
       gir1.2-gtk-3.0 \
@@ -451,7 +451,9 @@ BIN_SRC=""
 
 if [ ! -f "${WORK_SRC_DIR}/Cargo.toml" ] && [ ! -x "${WORK_SRC_DIR}/vpngate" ]; then
   BRANCH_NAME="${VPNGATE_BRANCH:-main}"
-  BOOTSTRAP_TMP_DIR="$(mktemp -d "/tmp/vpngate-src.XXXXXX")"
+  TMP_PARENT="/var/tmp"
+  [ -d "${TMP_PARENT}" ] && [ -w "${TMP_PARENT}" ] || TMP_PARENT="/tmp"
+  BOOTSTRAP_TMP_DIR="$(mktemp -d "${TMP_PARENT}/vpngate-src.XXXXXX")"
   if [ "$(id -u)" -eq 0 ] && [ -n "${TARGET_UID}" ]; then
     chown "${TARGET_USER}" "${BOOTSTRAP_TMP_DIR}" 2>/dev/null || true
   fi

@@ -32,8 +32,8 @@ pub use desktop_tunnel::{
     cleanup_existing_vpn, cleanup_existing_vpn_with_progress, detect_host_os_label,
     engage_candidates, engage_candidates_with_progress, find_openvpn_bin, get_default_gateway,
     get_ppp_interfaces, get_running_monitor_pid, get_tun_interfaces, is_root_or_admin,
-    prune_stale_state_if_dead, run_monitor_daemon, spawn_auto_reconnect_monitor,
-    stop_monitor_daemon, which_bin,
+    probe_linux_l2tp_kernel_support, prune_stale_state_if_dead, run_monitor_daemon,
+    spawn_auto_reconnect_monitor, stop_monitor_daemon, which_bin,
 };
 pub use discovery::{
     DiscoveryClient, DiscoveryOptions, DiscoveryOutcome, MirrorProbeResult, ProgressEvent,

@@ -1082,6 +1082,21 @@ impl DiscoveryClient {
             }
         }
 
+        // Backfill missing inline `ovpn_b64` on HTML-scraped Official Mirror servers using the
+        // shared SoftEther VPN Gate public client certificate template (`build_patched_ovpn`
+        // rewrites `proto` and `remote <ip> <port>` per server).
+        if let Some(donor_b64) = servers_by_ip
+            .values()
+            .find(|s| !s.ovpn_b64.is_empty())
+            .map(|s| s.ovpn_b64.clone())
+        {
+            for s in servers_by_ip.values_mut() {
+                if s.openvpn && s.ovpn_b64.is_empty() && (s.udp_port > 0 || s.tcp_port > 0) {
+                    s.ovpn_b64 = donor_b64.clone();
+                }
+            }
+        }
+
         let servers: Vec<VpnServer> = servers_by_ip
             .into_values()
             .filter(|s| s.has_any_protocol())
