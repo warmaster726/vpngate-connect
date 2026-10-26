@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 
 use commands::{
     ConnectArgs, cmd_connect, cmd_countries, cmd_disconnect, cmd_doctor, cmd_list, cmd_mirrors,
-    cmd_probe, cmd_refresh, cmd_status, cmd_watchdog, interactive_menu,
+    cmd_probe, cmd_refresh, cmd_status, cmd_watchdog, interactive_menu, set_no_elevate_requested,
+    set_uac_already_attempted,
 };
 use term_ui::{err, init_console, print_line, prompt_input, set_dynamic_resize, set_screen_clear};
 use vpngate_core::{AppPaths, ProtocolFilter, SortBy, run_ikev1_daemon, run_monitor_daemon};
@@ -60,7 +61,7 @@ fn build_help_text() -> String {
     )
 }
 
-fn delegate_to_window_launcher(raw_args: &[String]) -> i32 {
+fn delegate_to_window_launcher(paths: &AppPaths, raw_args: &[String]) -> i32 {
     let filtered: Vec<String> = raw_args
         .iter()
         .filter(|a| a.as_str() != "-w" && a.as_str() != "--window")
@@ -73,13 +74,25 @@ fn delegate_to_window_launcher(raw_args: &[String]) -> i32 {
             err("Could not determine vpngate executable path.");
             return 1;
         };
-        let needs_hold = !filtered.is_empty()
-            && !filtered
+        let is_interactive = filtered.is_empty()
+            || filtered
                 .iter()
                 .any(|a| matches!(a.as_str(), "-i" | "--interactive" | "menu" | "interactive"));
-        let mut launch_args = filtered;
-        if needs_hold {
+        let mut launch_args = vec![
+            "--cache-dir".to_string(),
+            paths.cache_dir.display().to_string(),
+        ];
+        launch_args.extend(filtered);
+        if !is_interactive {
             launch_args.push("--hold".to_string());
+        }
+
+        if !vpngate_core::is_root_or_admin() && !commands::no_elevate_requested() {
+            let mut uac_args = vec!["--uac-elevated".to_string()];
+            uac_args.extend_from_slice(&launch_args);
+            if commands::win_uac::run_elevated(&self_exe, &uac_args, false).is_ok() {
+                return 0;
+            }
         }
 
         if let Some(wt) = vpngate_core::which_bin("wt") {
@@ -111,6 +124,7 @@ fn delegate_to_window_launcher(raw_args: &[String]) -> i32 {
 
     #[cfg(not(windows))]
     {
+        let _ = paths;
         let self_dir = env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
@@ -155,7 +169,7 @@ async fn dispatch() -> io::Result<i32> {
     let is_daemon = matches!(raw_all.first().map(String::as_str), Some("_monitor" | "_ikev1"));
     init_console(!is_daemon);
 
-    // Pre-scan global `--cache-dir <DIR>` and `--hold` before dispatching
+    // Pre-scan global `--cache-dir <DIR>`, `--hold`, and Windows UAC flags before dispatching
     let mut cache_dir_override: Option<PathBuf> = None;
     let mut hold_on_exit = false;
     let mut raw_args: Vec<String> = Vec::with_capacity(raw_all.len());
@@ -172,6 +186,12 @@ async fn dispatch() -> io::Result<i32> {
             }
             "--hold" => {
                 hold_on_exit = true;
+            }
+            "--uac-elevated" => {
+                set_uac_already_attempted(true);
+            }
+            "--no-elevate" | "--read-only" => {
+                set_no_elevate_requested(true);
             }
             other => raw_args.push(other.to_string()),
         }
@@ -191,7 +211,7 @@ async fn dispatch() -> io::Result<i32> {
         return Ok(run_ikev1_daemon(&raw_args[1], Path::new(&raw_args[2])).await);
     }
     if raw_args.iter().any(|a| a == "-w" || a == "--window") {
-        return Ok(delegate_to_window_launcher(&raw_args));
+        return Ok(delegate_to_window_launcher(&paths, &raw_args));
     }
 
     let rc = dispatch_commands(&paths, &raw_args).await?;

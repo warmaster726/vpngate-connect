@@ -35,17 +35,54 @@ pub const WIN_DETACHED_FLAGS: u32 = 0x0000_0008 | 0x0000_0200 | 0x0800_0000;
 #[cfg(windows)]
 mod win_ffi {
     use std::ffi::c_void;
+    use std::ptr::null_mut;
 
     pub const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
     pub const STILL_ACTIVE: u32 = 259;
+    const TOKEN_QUERY: u32 = 0x0008;
+    const TOKEN_ELEVATION_CLASS: u32 = 20;
+    const HKEY_LOCAL_MACHINE: *mut c_void = 0x8000_0002usize as *mut c_void;
+    const RRF_RT_REG_DWORD: u32 = 0x0000_0010;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct TokenElevation {
+        token_is_elevated: u32,
+    }
 
     #[link(name = "shell32")]
     unsafe extern "system" {
         pub fn IsUserAnAdmin() -> i32;
     }
 
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn OpenProcessToken(
+            process_handle: *mut c_void,
+            desired_access: u32,
+            token_handle: *mut *mut c_void,
+        ) -> i32;
+        fn GetTokenInformation(
+            token_handle: *mut c_void,
+            token_information_class: u32,
+            token_information: *mut c_void,
+            token_information_length: u32,
+            return_length: *mut u32,
+        ) -> i32;
+        fn RegGetValueW(
+            hkey: *mut c_void,
+            lp_sub_key: *const u16,
+            lp_value: *const u16,
+            dw_flags: u32,
+            pdw_type: *mut u32,
+            pv_data: *mut c_void,
+            pcb_data: *mut u32,
+        ) -> i32;
+    }
+
     #[link(name = "kernel32")]
     unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut c_void;
         pub fn OpenProcess(
             desired_access: u32,
             inherit_handle: i32,
@@ -53,6 +90,57 @@ mod win_ffi {
         ) -> *mut c_void;
         pub fn GetExitCodeProcess(process: *mut c_void, exit_code: *mut u32) -> i32;
         pub fn CloseHandle(object: *mut c_void) -> i32;
+    }
+
+    pub fn is_current_process_elevated() -> bool {
+        // SAFETY: Queries `TOKEN_ELEVATION` on the current process token, falling back to `IsUserAnAdmin`.
+        unsafe {
+            let mut h_token: *mut c_void = null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut h_token) != 0
+                && !h_token.is_null()
+            {
+                let mut elev = TokenElevation::default();
+                let mut ret_len: u32 = 0;
+                let ok = GetTokenInformation(
+                    h_token,
+                    TOKEN_ELEVATION_CLASS,
+                    (&raw mut elev).cast::<c_void>(),
+                    std::mem::size_of::<TokenElevation>() as u32,
+                    &mut ret_len,
+                );
+                let _ = CloseHandle(h_token);
+                if ok != 0 {
+                    return elev.token_is_elevated != 0;
+                }
+            }
+            IsUserAnAdmin() != 0
+        }
+    }
+
+    pub fn read_policy_agent_natt_rule() -> Option<u32> {
+        let mut subkey: Vec<u16> = "SYSTEM\\CurrentControlSet\\Services\\PolicyAgent"
+            .encode_utf16()
+            .collect();
+        subkey.push(0);
+        let mut val_name: Vec<u16> = "AssumeUDPEncapsulationContextOnSendRule"
+            .encode_utf16()
+            .collect();
+        val_name.push(0);
+        let mut val: u32 = 0;
+        let mut cb: u32 = std::mem::size_of::<u32>() as u32;
+        // SAFETY: Read-only `RegGetValueW` into stack `u32` with exact byte count.
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                subkey.as_ptr(),
+                val_name.as_ptr(),
+                RRF_RT_REG_DWORD,
+                null_mut(),
+                (&raw mut val).cast::<c_void>(),
+                &mut cb,
+            )
+        };
+        if status == 0 { Some(val) } else { None }
     }
 }
 
@@ -105,8 +193,18 @@ pub fn is_root_or_admin() -> bool {
     }
     #[cfg(windows)]
     {
-        // SAFETY: `IsUserAnAdmin` is a thread-safe Shell32 call with no arguments.
-        unsafe { win_ffi::IsUserAnAdmin() != 0 }
+        win_ffi::is_current_process_elevated()
+    }
+}
+
+pub fn query_windows_natt_rule() -> Option<u32> {
+    #[cfg(windows)]
+    {
+        win_ffi::read_policy_agent_natt_rule()
+    }
+    #[cfg(not(windows))]
+    {
+        None
     }
 }
 
@@ -1183,7 +1281,13 @@ pub async fn connect_l2tp_windows(
         .status();
 
     let ps_script = format!(
-        "Start-Service PolicyAgent, IKEEXT, RasMan -ErrorAction SilentlyContinue; \
+        "$pol = 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\PolicyAgent'; \
+         $cur = (Get-ItemProperty -Path $pol -Name 'AssumeUDPEncapsulationContextOnSendRule' -ErrorAction SilentlyContinue).AssumeUDPEncapsulationContextOnSendRule; \
+         if ($cur -ne 2) {{ \
+             New-ItemProperty -Path $pol -Name 'AssumeUDPEncapsulationContextOnSendRule' -PropertyType DWord -Value 2 -Force -ErrorAction SilentlyContinue | Out-Null; \
+             Restart-Service PolicyAgent, IKEEXT -Force -ErrorAction SilentlyContinue \
+         }}; \
+         Start-Service PolicyAgent, IKEEXT, RasMan -ErrorAction SilentlyContinue; \
          $ex = Get-VpnConnection -Name '{WIN_VPN_PROFILE_NAME}' -ErrorAction SilentlyContinue; \
          if ($null -ne $ex) {{ Set-VpnConnection -Name '{WIN_VPN_PROFILE_NAME}' -ServerAddress '{}' -TunnelType L2tp -L2tpPsk 'vpn' -AuthenticationMethod Pap,Chap,MSChapv2 -EncryptionLevel Optional -SplitTunneling:$false -RememberCredential -Force | Out-Null }} \
          else {{ Add-VpnConnection -Name '{WIN_VPN_PROFILE_NAME}' -ServerAddress '{}' -TunnelType L2tp -L2tpPsk 'vpn' -AuthenticationMethod Pap,Chap,MSChapv2 -EncryptionLevel Optional -SplitTunneling:$false -RememberCredential -Force | Out-Null }}",

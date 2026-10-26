@@ -14,21 +14,6 @@ if not exist "!VG_PS_SCRIPT!" (
     exit /b 1
 )
 
-:: Request Administrator privileges via UAC if not already elevated
-net session >nul 2>&1
-if not "!ERRORLEVEL!"=="0" (
-    echo [*] Requesting Administrator privileges via Windows UAC ...
-    set "VG_FWD=%*"
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ^
-        "$ps = $env:VG_PS_SCRIPT; $pause = ($env:VG_PAUSE_ON_EXIT -eq '1'); $raw = $env:VG_FWD; " ^
-        "$scriptCmd = '& \"' + ($ps -replace '\"','`\"') + '\" ' + $raw; " ^
-        "if ($pause) { $scriptCmd += '; Write-Host \"\"; Read-Host \"Press Enter to close\"' }; " ^
-        "$bytes = [System.Text.Encoding]::Unicode.GetBytes($scriptCmd); " ^
-        "$enc = [Convert]::ToBase64String($bytes); " ^
-        "Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $enc)"
-    exit /b !ERRORLEVEL!
-)
-
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "!VG_PS_SCRIPT!" %*
 set "EXIT_CODE=!ERRORLEVEL!"
 

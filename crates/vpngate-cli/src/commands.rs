@@ -3,9 +3,8 @@ use std::env;
 use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use vpngate_core::{
@@ -17,9 +16,10 @@ use vpngate_core::{
     get_ppp_interfaces, get_public_ip_trace, get_running_monitor_pid, get_running_openvpn_pid,
     get_servers_cached_with_progress, get_tun_interfaces, is_root_or_admin, load_cached_mirrors,
     load_cooldowns, load_watchdog_pref, normalize_mirror_base_url, now_unix_secs, probe_tcp,
-    prune_stale_state_if_dead, read_json_opt, run_ikev1_crypto_self_test, save_cached_mirrors,
-    save_cooldowns, save_watchdog_pref, sort_servers, spawn_auto_reconnect_monitor,
-    stop_monitor_daemon, summarize_countries, verify_l2tp_psk_vpn, which_bin,
+    prune_stale_state_if_dead, query_windows_natt_rule, read_json_opt, run_ikev1_crypto_self_test,
+    save_cached_mirrors, save_cooldowns, save_watchdog_pref, sort_servers,
+    spawn_auto_reconnect_monitor, stop_monitor_daemon, summarize_countries, verify_l2tp_psk_vpn,
+    which_bin,
 };
 
 use crate::term_ui::{
@@ -29,6 +29,167 @@ use crate::term_ui::{
     render_progress_event, request_window_resize, screen_clear_enabled, truncate_plain,
     visible_len, warn, win_vt_enabled,
 };
+
+static UAC_ALREADY_ATTEMPTED: AtomicBool = AtomicBool::new(false);
+static NO_ELEVATE_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+pub fn set_uac_already_attempted(val: bool) {
+    UAC_ALREADY_ATTEMPTED.store(val, Ordering::Relaxed);
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn uac_already_attempted() -> bool {
+    UAC_ALREADY_ATTEMPTED.load(Ordering::Relaxed)
+}
+
+pub fn set_no_elevate_requested(val: bool) {
+    NO_ELEVATE_REQUESTED.store(val, Ordering::Relaxed);
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn no_elevate_requested() -> bool {
+    NO_ELEVATE_REQUESTED.load(Ordering::Relaxed)
+}
+
+/// Quotes a single command-line argument using standard Win32 `CommandLineToArgvW` rules.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn quote_windows_arg(arg: &str) -> String {
+    if !arg.is_empty() && !arg.chars().any(|c| c == ' ' || c == '\t' || c == '"') {
+        return arg.to_string();
+    }
+    let mut out = String::with_capacity(arg.len() + 4);
+    out.push('"');
+    let mut backslashes = 0usize;
+    for ch in arg.chars() {
+        if ch == '\\' {
+            backslashes += 1;
+        } else if ch == '"' {
+            out.push_str(&"\\".repeat(backslashes * 2 + 1));
+            out.push('"');
+            backslashes = 0;
+        } else {
+            if backslashes > 0 {
+                out.push_str(&"\\".repeat(backslashes));
+                backslashes = 0;
+            }
+            out.push(ch);
+        }
+    }
+    if backslashes > 0 {
+        out.push_str(&"\\".repeat(backslashes * 2));
+    }
+    out.push('"');
+    out
+}
+
+#[cfg(windows)]
+pub mod win_uac {
+    use std::env;
+    use std::ffi::c_void;
+    use std::path::Path;
+    use std::ptr::{null, null_mut};
+
+    use super::quote_windows_arg;
+
+    const SEE_MASK_NOCLOSEPROCESS: u32 = 0x0000_0040;
+    const SW_SHOWNORMAL: i32 = 1;
+    const INFINITE: u32 = 0xFFFF_FFFF;
+
+    #[repr(C)]
+    struct ShellExecuteInfoW {
+        cb_size: u32,
+        f_mask: u32,
+        hwnd: *mut c_void,
+        lp_verb: *const u16,
+        lp_file: *const u16,
+        lp_parameters: *const u16,
+        lp_directory: *const u16,
+        n_show: i32,
+        h_inst_app: *mut c_void,
+        lp_id_list: *mut c_void,
+        lp_class: *const u16,
+        hkey_class: *mut c_void,
+        dw_hot_key: u32,
+        h_icon_or_monitor: *mut c_void,
+        h_process: *mut c_void,
+    }
+
+    const _: () = assert!(std::mem::size_of::<ShellExecuteInfoW>() == 112);
+
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn ShellExecuteExW(exec_info: *mut ShellExecuteInfoW) -> i32;
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
+        fn GetExitCodeProcess(process: *mut c_void, exit_code: *mut u32) -> i32;
+        fn CloseHandle(object: *mut c_void) -> i32;
+        fn GetLastError() -> u32;
+    }
+
+    fn to_wide_nul(s: &str) -> Vec<u16> {
+        let mut v: Vec<u16> = s.encode_utf16().collect();
+        v.push(0);
+        v
+    }
+
+    /// Launches `exe` directly with native Win32 `"runas"` UAC elevation (never `wt.exe` AppX alias).
+    pub fn run_elevated(exe: &Path, args: &[String], wait: bool) -> Result<i32, u32> {
+        let verb_w = to_wide_nul("runas");
+        let file_w = to_wide_nul(&exe.display().to_string());
+        let params_str = args
+            .iter()
+            .map(|a| quote_windows_arg(a))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let params_w = to_wide_nul(&params_str);
+        let cwd_w = env::current_dir()
+            .ok()
+            .map(|d| to_wide_nul(&d.display().to_string()));
+
+        let mut sei = ShellExecuteInfoW {
+            cb_size: std::mem::size_of::<ShellExecuteInfoW>() as u32,
+            f_mask: if wait { SEE_MASK_NOCLOSEPROCESS } else { 0 },
+            hwnd: null_mut(),
+            lp_verb: verb_w.as_ptr(),
+            lp_file: file_w.as_ptr(),
+            lp_parameters: if params_str.is_empty() {
+                null()
+            } else {
+                params_w.as_ptr()
+            },
+            lp_directory: cwd_w.as_ref().map_or(null(), |v| v.as_ptr()),
+            n_show: SW_SHOWNORMAL,
+            h_inst_app: null_mut(),
+            lp_id_list: null_mut(),
+            lp_class: null(),
+            hkey_class: null_mut(),
+            dw_hot_key: 0,
+            h_icon_or_monitor: null_mut(),
+            h_process: null_mut(),
+        };
+
+        // SAFETY: All UTF-16 buffers outlive `ShellExecuteExW`, and `h_process` is closed if returned.
+        unsafe {
+            if ShellExecuteExW(&mut sei) == 0 {
+                return Err(GetLastError());
+            }
+            if wait && !sei.h_process.is_null() {
+                let _ = WaitForSingleObject(sei.h_process, INFINITE);
+                let mut exit_code: u32 = 1;
+                let _ = GetExitCodeProcess(sei.h_process, &mut exit_code);
+                let _ = CloseHandle(sei.h_process);
+                return Ok(exit_code as i32);
+            }
+            if !sei.h_process.is_null() {
+                let _ = CloseHandle(sei.h_process);
+            }
+            Ok(0)
+        }
+    }
+}
 
 fn parse_custom_mirrors(urls: &[String]) -> Vec<OfficialMirrorSite> {
     let mut out = Vec::new();
@@ -103,25 +264,33 @@ pub fn elevate_self(paths: &AppPaths, sub_args: &[String]) -> i32 {
     }
     #[cfg(windows)]
     {
+        if uac_already_attempted() {
+            err(
+                "Administrator token was not granted after UAC elevation. \
+                 Right-click PowerShell or Windows Terminal -> 'Run as Administrator' and retry.",
+            );
+            return 1;
+        }
         let mut full_args = vec![
+            "--uac-elevated".to_string(),
             "--cache-dir".to_string(),
             paths.cache_dir.display().to_string(),
         ];
         full_args.extend_from_slice(sub_args);
-        let escaped: Vec<String> = full_args
-            .iter()
-            .map(|a| format!("'{}'", a.replace('\'', "''")))
-            .collect();
-        let ps = format!(
-            "$p = Start-Process -FilePath '{}' -ArgumentList @({}) -Verb RunAs -Wait -PassThru; \
-             if ($null -eq $p) {{ exit 1 }}; exit $p.ExitCode",
-            self_exe.display().to_string().replace('\'', "''"),
-            escaped.join(",")
-        );
-        let mut cmd = Command::new("powershell");
-        cmd.args(["-NoProfile", "-Command", &ps])
-            .creation_flags(0x0800_0000);
-        cmd.status().ok().and_then(|s| s.code()).unwrap_or(1)
+        match win_uac::run_elevated(&self_exe, &full_args, true) {
+            Ok(code) => code,
+            Err(1223) => {
+                warn("Windows UAC elevation prompt was cancelled.");
+                1
+            }
+            Err(code) => {
+                err(&format!(
+                    "Windows UAC elevation failed (Win32 error {code}). \
+                     Right-click PowerShell -> 'Run as Administrator' and retry."
+                ));
+                1
+            }
+        }
     }
 }
 
@@ -130,23 +299,18 @@ fn launch_elevated_interactive_console(paths: &AppPaths) -> bool {
     let Ok(self_exe) = env::current_exe() else {
         return false;
     };
-    let cache_dir_s = paths.cache_dir.display().to_string().replace('\'', "''");
-    let exe_s = self_exe.display().to_string().replace('\'', "''");
-
-    let ps = if let Some(wt) = which_bin("wt") {
-        let wt_s = wt.display().to_string().replace('\'', "''");
-        format!(
-            "Start-Process -FilePath '{wt_s}' -ArgumentList @('--title','VPN Gate','{exe_s}','--cache-dir','{cache_dir_s}') -Verb RunAs"
-        )
-    } else {
-        format!(
-            "Start-Process -FilePath '{exe_s}' -ArgumentList @('--cache-dir','{cache_dir_s}') -Verb RunAs"
-        )
-    };
-    let mut cmd = Command::new("powershell");
-    cmd.args(["-NoProfile", "-Command", &ps])
-        .creation_flags(0x0800_0000);
-    cmd.status().is_ok_and(|s| s.success())
+    let mut args = vec![
+        "--uac-elevated".to_string(),
+        "--cache-dir".to_string(),
+        paths.cache_dir.display().to_string(),
+    ];
+    if !dynamic_resize_enabled() {
+        args.push("--no-resize".to_string());
+    }
+    if !screen_clear_enabled() {
+        args.push("--no-clear".to_string());
+    }
+    win_uac::run_elevated(&self_exe, &args, false).is_ok()
 }
 
 fn render_established_session_summary(st: &ActiveSessionState) -> io::Result<()> {
@@ -1055,11 +1219,24 @@ pub fn cmd_doctor(paths: &AppPaths) -> io::Result<i32> {
         }
     }
 
-    // 2. Host L2TP/PPP stack
+    // 2. Host L2TP/PPP stack & Windows 11 Admin / NAT-T readiness
     if cfg!(target_os = "windows") {
+        if is_root_or_admin() {
+            lines.push(Some(format!(
+                "Admin Rights : {GREEN}ELEVATED{RESET} — Administrator token active"
+            )));
+        } else {
+            lines.push(Some(format!(
+                "Admin Rights : {CYAN}STANDARD USER{RESET} — Auto-elevates via UAC when connecting"
+            )));
+        }
+        let natt_note = match query_windows_natt_rule() {
+            Some(2) => "NAT-T Rule = 2, Zero IKEv2",
+            _ => "NAT-T Rule auto-applied on connect, Zero IKEv2",
+        };
         if which_bin("rasdial").is_some() {
             lines.push(Some(format!(
-                "L2TP Engine  : {GREEN}READY{RESET} — Windows Native RASMAN/IKEEXT (Zero IKEv2)"
+                "L2TP Engine  : {GREEN}READY{RESET} — Windows Native RASMAN/IKEEXT ({natt_note})"
             )));
         } else {
             issues += 1;
@@ -1428,51 +1605,17 @@ pub async fn interactive_menu(paths: &AppPaths, help_text: &str) -> io::Result<i
     let os_label = detect_host_os_label();
 
     #[cfg(windows)]
-    if !is_root_or_admin() && is_stdout_tty() {
-        clear_screen_if_tty();
-        let admin_box = vec![
-            Some(format!(
-                "{YELLOW}{BOLD}Administrator Privileges Recommended on Windows 11{RESET}"
-            )),
-            None,
-            Some(format!(
-                "`vpngate` runs best inside an {BOLD}Administrator{RESET} console from startup so all"
-            )),
-            Some(
-                "L2TP/IPsec (RASMAN/IKEEXT), OpenVPN, routes, and Cloudflare DNS operations"
-                    .to_string(),
-            ),
-            Some(
-                "run directly inside one window with zero mid-session UAC window-jumping."
-                    .to_string(),
-            ),
-            None,
-            Some(format!(
-                " {CYAN}[1]{RESET} Open Elevated Administrator VPN Gate Console Now (UAC Prompt) {GREEN}[Default]{RESET}"
-            )),
-            Some(format!(
-                " {CYAN}[2]{RESET} Continue Here in Current Window (Browse Relays / Mirrors / Doctor)"
-            )),
-            Some(format!(" {CYAN}[0]{RESET} Exit")),
-        ];
-        render_dynamic_box(&admin_box, 4, 76)?;
-        let Some(ans) = prompt_input(&format!(
-            "\nSelect option {BOLD}[1-2, Enter=1, 0=Exit]{RESET}: "
-        )) else {
+    if !is_root_or_admin() && is_stdout_tty() && !uac_already_attempted() && !no_elevate_requested()
+    {
+        info("Requesting Administrator privileges via Windows UAC ...");
+        if launch_elevated_interactive_console(paths) {
+            ok("Opened elevated Administrator VPN Gate console window.");
             return Ok(0);
-        };
-        match ans.to_ascii_lowercase().as_str() {
-            "0" | "q" | "quit" | "exit" => return Ok(0),
-            "2" | "c" | "continue" => {}
-            _ => {
-                if launch_elevated_interactive_console(paths) {
-                    ok("Launched elevated Administrator VPN Gate console window.");
-                    return Ok(0);
-                }
-                warn("UAC elevation was cancelled or failed - continuing in current window.");
-                tokio::time::sleep(Duration::from_millis(900)).await;
-            }
         }
+        warn(
+            "UAC elevation was declined - continuing in Read-Only mode (Countries, List, Mirrors, Status, Doctor).",
+        );
+        tokio::time::sleep(Duration::from_millis(900)).await;
     }
 
     loop {
@@ -1731,5 +1874,25 @@ pub async fn interactive_menu(paths: &AppPaths, help_text: &str) -> io::Result<i
                 tokio::time::sleep(Duration::from_millis(800)).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quote_windows_arg;
+
+    #[test]
+    fn quotes_windows_command_line_arguments_accurately() {
+        assert_eq!(quote_windows_arg("--uac-elevated"), "--uac-elevated");
+        assert_eq!(quote_windows_arg(""), "\"\"");
+        assert_eq!(
+            quote_windows_arg(r"C:\Users\Test User\AppData\Local\vpngate"),
+            r#""C:\Users\Test User\AppData\Local\vpngate""#
+        );
+        assert_eq!(
+            quote_windows_arg(r#"C:\Path With Trailing\"#),
+            r#""C:\Path With Trailing\\""#
+        );
+        assert_eq!(quote_windows_arg(r#"a"b"#), r#""a\"b""#);
     }
 }

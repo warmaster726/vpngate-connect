@@ -33,7 +33,8 @@ pub use desktop_tunnel::{
     engage_candidates, engage_candidates_with_progress, find_openvpn_bin, get_default_gateway,
     get_ppp_interfaces, get_running_monitor_pid, get_running_openvpn_pid, get_tun_interfaces,
     is_root_or_admin, probe_linux_l2tp_kernel_support, prune_stale_state_if_dead,
-    run_monitor_daemon, spawn_auto_reconnect_monitor, stop_monitor_daemon, which_bin,
+    query_windows_natt_rule, run_monitor_daemon, spawn_auto_reconnect_monitor,
+    stop_monitor_daemon, which_bin,
 };
 pub use discovery::{
     DiscoveryClient, DiscoveryOptions, DiscoveryOutcome, MirrorProbeResult, ProgressEvent,

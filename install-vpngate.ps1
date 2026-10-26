@@ -30,6 +30,14 @@ param(
 
     [switch]$UserOnly,
 
+    [switch]$ElevatedChild,
+
+    [string]$TargetInstallDir = '',
+
+    [string]$TargetCacheDir = '',
+
+    [string]$TargetStartMenuLnk = '',
+
     [Alias('h')]
     [switch]$Help,
 
@@ -105,11 +113,89 @@ $IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIden
 )
 
 $LocalAppData   = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { Join-Path $HOME 'AppData\Local' }
-$InstallDir     = Join-Path $LocalAppData 'Programs\VPNGate'
-$CacheDir       = if ($env:VPNGATE_CACHE_DIR -and $env:VPNGATE_CACHE_DIR.Trim()) { $env:VPNGATE_CACHE_DIR.Trim() } else { Join-Path $LocalAppData 'vpngate' }
+$InstallDir     = if ($TargetInstallDir -and $TargetInstallDir.Trim()) { $TargetInstallDir.Trim() } else { Join-Path $LocalAppData 'Programs\VPNGate' }
+$CacheDir       = if ($TargetCacheDir -and $TargetCacheDir.Trim()) { $TargetCacheDir.Trim() } elseif ($env:VPNGATE_CACHE_DIR -and $env:VPNGATE_CACHE_DIR.Trim()) { $env:VPNGATE_CACHE_DIR.Trim() } else { Join-Path $LocalAppData 'vpngate' }
 $VpnProfileName = 'VPNGate-L2TP'
+$OvpnFwInRule   = 'VPNGate-OpenVPN-In'
+$OvpnFwOutRule  = 'VPNGate-OpenVPN-Out'
 $PolicyRegistry = 'HKLM:\SYSTEM\CurrentControlSet\Services\PolicyAgent'
-$StartMenuLnk   = Join-Path ([Environment]::GetFolderPath('Programs')) 'VPN Gate.lnk'
+$StartMenuLnk   = if ($TargetStartMenuLnk -and $TargetStartMenuLnk.Trim()) { $TargetStartMenuLnk.Trim() } else { Join-Path ([Environment]::GetFolderPath('Programs')) 'VPN Gate.lnk' }
+
+# Automatically elevate via Windows UAC when invoked from a non-Admin PowerShell session
+if ((-not $IsAdmin) -and (-not $UserOnly) -and (-not $ElevatedChild) -and $PSCommandPath -and (Test-Path -LiteralPath $PSCommandPath)) {
+    Write-Info "Administrator privileges are required on Windows 11 for NAT-T, OpenVPN & Firewall setup."
+    Write-Info "Requesting Windows UAC elevation ..."
+    $PsHostExe = if ($PSVersionTable.PSEdition -eq 'Core' -and (Get-Command 'pwsh.exe' -ErrorAction SilentlyContinue)) {
+        (Get-Command 'pwsh.exe').Source
+    } else {
+        Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    }
+    $CallerWorkDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+    $FwdArgs = New-Object System.Collections.Generic.List[string]
+    $FwdArgs.Add('-NoProfile')
+    $FwdArgs.Add('-ExecutionPolicy')
+    $FwdArgs.Add('Bypass')
+    $FwdArgs.Add('-File')
+    $FwdArgs.Add($PSCommandPath)
+    $FwdArgs.Add('-ElevatedChild')
+    $FwdArgs.Add('-TargetInstallDir')
+    $FwdArgs.Add($InstallDir)
+    $FwdArgs.Add('-TargetCacheDir')
+    $FwdArgs.Add($CacheDir)
+    $FwdArgs.Add('-TargetStartMenuLnk')
+    $FwdArgs.Add($StartMenuLnk)
+    if ($Uninstall)       { $FwdArgs.Add('-Uninstall') }
+    if ($RestoreNatTRule) { $FwdArgs.Add('-RestoreNatTRule') }
+    if ($InstallOpenVPN)  { $FwdArgs.Add('-InstallOpenVPN') }
+    if ($SkipOpenVPN)     { $FwdArgs.Add('-SkipOpenVPN') }
+    if ($KeepToolchain)   { $FwdArgs.Add('-KeepToolchain') }
+    if ($Repo)            { $FwdArgs.Add('-Repo'); $FwdArgs.Add($Repo) }
+
+    try {
+        $ElevProc = Start-Process -FilePath $PsHostExe -ArgumentList $FwdArgs.ToArray() -WorkingDirectory $CallerWorkDir -Verb RunAs -Wait -PassThru
+    } catch {
+        Write-Err "Windows UAC elevation was cancelled or blocked ($($_.Exception.Message))."
+        Write-Host "    Right-click PowerShell -> 'Run as Administrator' and re-run .\install-vpngate.ps1" -ForegroundColor Yellow
+        Write-Host "    (or pass --user-only to skip HKLM/NAT-T/Firewall steps)." -ForegroundColor DarkGray
+        exit 1
+    }
+
+    $ElevExit = if ($null -ne $ElevProc) { $ElevProc.ExitCode } else { 1 }
+    $NormCallerInstall = $InstallDir.TrimEnd('\')
+    if ($ElevExit -eq 0) {
+        if ($Uninstall) {
+            $uRaw = [Environment]::GetEnvironmentVariable('Path', 'User')
+            if ($uRaw) {
+                $uParts = $uRaw.Split(';', [System.StringSplitOptions]::RemoveEmptyEntries)
+                $uFilt = @($uParts | Where-Object { $_.Trim().TrimEnd('\') -ine $NormCallerInstall })
+                if ($uFilt.Count -lt $uParts.Count) {
+                    [Environment]::SetEnvironmentVariable('Path', ($uFilt -join ';'), 'User')
+                }
+            }
+            $env:Path = (($env:Path -split ';') | Where-Object { $_ -and ($_.Trim().TrimEnd('\') -ine $NormCallerInstall) }) -join ';'
+            Write-Ok "VPN Gate has been completely uninstalled."
+        } else {
+            $uRaw = [Environment]::GetEnvironmentVariable('Path', 'User')
+            $uSeen = $false
+            if ($uRaw) {
+                foreach ($entry in $uRaw.Split(';', [System.StringSplitOptions]::RemoveEmptyEntries)) {
+                    if ($entry.Trim().TrimEnd('\') -ieq $NormCallerInstall) { $uSeen = $true; break }
+                }
+            }
+            if (-not $uSeen) {
+                $newUserPath = if ($uRaw) { "$uRaw;$InstallDir" } else { $InstallDir }
+                [Environment]::SetEnvironmentVariable('Path', $newUserPath, 'User')
+            }
+            if ($env:Path -notlike "*$NormCallerInstall*") {
+                $env:Path = "$InstallDir;$env:Path"
+            }
+            Write-Ok "Installation complete! Run 'vpngate' anytime to launch the console."
+        }
+    } else {
+        Write-Err "Elevated installer exited with code $ElevExit."
+    }
+    exit $ElevExit
+}
 
 $CleanedItems = New-Object System.Collections.Generic.List[string]
 function Add-CleanedRecord([string]$Desc) {
@@ -120,12 +206,18 @@ function Invoke-VPNGateResidueCleanup([string]$Mode) {
     Write-Info "Scanning Windows 11 for active VPN sessions and legacy Python/Rust residues ..."
 
     $ExistingExe = Join-Path $InstallDir 'vpngate.exe'
-    if (Test-Path -LiteralPath $ExistingExe) {
-        try { & $ExistingExe disconnect --no-resize *> $null } catch {}
+    if ($IsAdmin -and (Test-Path -LiteralPath $ExistingExe)) {
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try { & $ExistingExe --uac-elevated --cache-dir $CacheDir disconnect --no-resize *> $null } catch {}
+        $ErrorActionPreference = $prevEap
     }
 
     if (Get-Command 'rasdial.exe' -ErrorAction SilentlyContinue) {
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
         try { & rasdial.exe $VpnProfileName /DISCONNECT *> $null } catch {}
+        $ErrorActionPreference = $prevEap
     }
 
     try {
@@ -149,8 +241,18 @@ function Invoke-VPNGateResidueCleanup([string]$Mode) {
     if ($Mode -eq 'Uninstall') {
         try {
             Remove-VpnConnection -Name $VpnProfileName -Force -ErrorAction SilentlyContinue | Out-Null
-            Remove-VpnConnection -Name $VpnProfileName -AllUserConnection -Force -ErrorAction SilentlyContinue | Out-Null
+            if ($IsAdmin) {
+                Remove-VpnConnection -Name $VpnProfileName -AllUserConnection -Force -ErrorAction SilentlyContinue | Out-Null
+            }
         } catch {}
+        if ($IsAdmin) {
+            $prevEap = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            foreach ($fwRule in @($OvpnFwInRule, $OvpnFwOutRule, 'VPNGate-IPv6-Guard')) {
+                try { & netsh.exe advfirewall firewall delete rule "name=$fwRule" *> $null } catch {}
+            }
+            $ErrorActionPreference = $prevEap
+        }
     }
 }
 
@@ -425,6 +527,7 @@ if ($IsAdmin -and -not $UserOnly) {
 }
 
 # 4. Headless OpenVPN Community check & Zero-Prompt hardening
+$HeadlessMsiOverride = '/qn /norestart ADDLOCAL=OpenVPN,OpenVPN.Service,Drivers,Drivers.OvpnDco,Drivers.TAPWindows6 REMOVE=OpenVPN.GUI,OpenVPN.GUI.OnLogon'
 $OvpnExe = $null
 foreach ($pf in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
     if ($pf) {
@@ -433,16 +536,62 @@ foreach ($pf in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
     }
 }
 if ((-not $OvpnExe -or $InstallOpenVPN) -and (-not $SkipOpenVPN) -and (Get-Command 'winget.exe' -ErrorAction SilentlyContinue)) {
-    Write-Info "Installing OpenVPN Community via winget ..."
-    try { & winget.exe install -e --id OpenVPNTechnologies.OpenVPN --silent --accept-package-agreements --accept-source-agreements } catch {}
+    Write-Info "Installing headless OpenVPN Community via winget ..."
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        if ($IsAdmin) {
+            & winget.exe install -e --id OpenVPNTechnologies.OpenVPN --silent --accept-package-agreements --accept-source-agreements --override $HeadlessMsiOverride
+        } else {
+            & winget.exe install -e --id OpenVPNTechnologies.OpenVPN --silent --accept-package-agreements --accept-source-agreements
+        }
+    } catch {}
+    $ErrorActionPreference = $prevEap
+    foreach ($pf in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+        if ($pf) {
+            $cand = Join-Path $pf 'OpenVPN\bin\openvpn.exe'
+            if (Test-Path -LiteralPath $cand) { $OvpnExe = $cand; break }
+        }
+    }
 }
 Get-Process -Name 'openvpn-gui' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'OPENVPN-GUI' -ErrorAction SilentlyContinue
+if ($IsAdmin) {
+    foreach ($rk in @('HKLM:\Software\Microsoft\Windows\CurrentVersion\Run', 'HKLM:\Software\WOW6432Node\Software\Microsoft\Windows\CurrentVersion\Run')) {
+        if (Test-Path -LiteralPath $rk) {
+            Remove-ItemProperty -Path $rk -Name 'OPENVPN-GUI' -ErrorAction SilentlyContinue
+        }
+    }
+    try {
+        $nnKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Network\NewNetworkWindowOff'
+        if (-not (Test-Path -LiteralPath $nnKey)) { New-Item -Path $nnKey -Force | Out-Null }
+    } catch {}
+    if ($OvpnExe -and (Test-Path -LiteralPath $OvpnExe)) {
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            & netsh.exe advfirewall firewall delete rule "name=$OvpnFwInRule" *> $null
+            & netsh.exe advfirewall firewall delete rule "name=$OvpnFwOutRule" *> $null
+            & netsh.exe advfirewall firewall add rule "name=$OvpnFwInRule" dir=in action=allow "program=$OvpnExe" enable=yes profile=any *> $null
+            & netsh.exe advfirewall firewall add rule "name=$OvpnFwOutRule" dir=out action=allow "program=$OvpnExe" enable=yes profile=any *> $null
+            $TapCtl = Join-Path (Split-Path -Parent $OvpnExe) 'tapctl.exe'
+            $ShowAd = (& $OvpnExe --show-adapters 2>&1 | Out-String)
+            if ((Test-Path -LiteralPath $TapCtl) -and ($ShowAd -notmatch '(?im)\btap-windows6\b')) {
+                & $TapCtl create --hwid 'root\tap0901' --name 'VPNGate TAP' *> $null
+            }
+        } catch {}
+        $ErrorActionPreference = $prevEap
+    }
+}
 
 # 5. Create Start Menu shortcut (configured with SLDF_RUNAS_USER so Start Menu launches elevated)
 $WshShell = $null
 $Shortcut = $null
 try {
+    $LnkParent = Split-Path -Parent $StartMenuLnk
+    if ($LnkParent -and -not (Test-Path -LiteralPath $LnkParent)) {
+        New-Item -ItemType Directory -Path $LnkParent -Force | Out-Null
+    }
     $WshShell = New-Object -ComObject WScript.Shell
     $Shortcut = $WshShell.CreateShortcut($StartMenuLnk)
     $Shortcut.TargetPath = $TargetExe
@@ -464,6 +613,15 @@ try {
 
 Write-Host ""
 Write-Ok "Installation complete! Running 'vpngate doctor' readiness check:"
-& $TargetExe doctor --no-resize
+$prevEapDoc = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    & $TargetExe --cache-dir $CacheDir doctor --no-resize
+} finally {
+    $ErrorActionPreference = $prevEapDoc
+}
 Write-Host ""
 Write-Ok "Run 'vpngate' in PowerShell or Windows Terminal anytime to launch the console."
+if ($ElevatedChild) {
+    Start-Sleep -Seconds 2
+}
