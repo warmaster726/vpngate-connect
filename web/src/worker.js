@@ -14,7 +14,7 @@ import { connect } from "cloudflare:sockets";
  *  - Completely isolated from root `Cargo.toml`, `Cargo.lock`, and desktop installer scripts.
  */
 
-const APP_VERSION = "0.2.7";
+const APP_VERSION = "0.2.8";
 const POOL_CACHE_TTL_MS = 180_000;
 const POOL_CACHE_KEY_URL = "https://vpngate-edge-cache.internal/v1/pool-snapshot";
 const VERIFY_MEM_CACHE_URL = "https://vpngate-edge-cache.internal/v1/verify-memory";
@@ -2391,11 +2391,93 @@ const PORTAL_JS = String.raw`
     return "vpngate-" + cc + "-" + srv.ip + "-" + transport + ".ovpn";
   }
 
+  function ovpnExportLabel(transport, compact) {
+    var t = String(transport || "").toUpperCase();
+    if (state.device && state.device.mobile) {
+      return compact ? ("OpenVPN " + t) : ("Open in OpenVPN Connect · " + t);
+    }
+    return compact ? ("OVPN " + t) : ("Export OpenVPN " + t + " (.ovpn)");
+  }
+
+  function openVpnConnectLink(absHttps) {
+    if (state.device && state.device.id === "android") {
+      return "intent://import-profile/" + absHttps +
+        "#Intent;scheme=openvpn;package=net.openvpn.openvpn;S.browser_fallback_url=" +
+        encodeURIComponent("https://play.google.com/store/apps/details?id=net.openvpn.openvpn") +
+        ";end";
+    }
+    return "openvpn://import-profile/" + absHttps;
+  }
+
+  function downloadOvpnBlob(buf, fileName) {
+    var file;
+    try {
+      file = new File([buf], fileName, { type: "application/x-openvpn-profile" });
+    } catch (e1) {
+      file = new Blob([buf], { type: "application/x-openvpn-profile" });
+    }
+    if (typeof File !== "undefined" && file instanceof File && navigator.canShare && navigator.canShare({ files: [file] })) {
+      return navigator.share({ files: [file], title: fileName, text: "Open in OpenVPN Connect" }).then(function () {
+        appendLog("ok", "Shared " + fileName + " — choose OpenVPN Connect.");
+      }).catch(function (shareErr) {
+        if (shareErr && shareErr.name === "AbortError") {
+          appendLog("info", "Export cancelled.");
+          return;
+        }
+        throw shareErr;
+      });
+    }
+    var url = URL.createObjectURL(file);
+    var a = document.createElement("a");
+    a.href = url;
+    a.download = fileName;
+    a.rel = "noopener";
+    a.style.display = "none";
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(function () {
+      URL.revokeObjectURL(url);
+      if (a.parentNode) a.parentNode.removeChild(a);
+    }, 2500);
+    appendLog("ok", "Downloaded " + fileName + ". Open it with OpenVPN Connect.");
+    return Promise.resolve();
+  }
+
   async function exportOvpnFile(href, fileName) {
     if (!href || !fileName) return;
-    appendLog("info", "Exporting " + fileName + " (download/share — not opened as a page)…");
+    var abs = new URL(href, window.location.href).href;
+    var mobile = Boolean(state.device && state.device.mobile);
+    if (mobile) {
+      appendLog("info", "Opening OpenVPN Connect to import " + fileName + "…");
+      var handed = false;
+      function onHide() {
+        if (document.hidden) handed = true;
+      }
+      document.addEventListener("visibilitychange", onHide);
+      try {
+        window.location.href = openVpnConnectLink(abs);
+      } catch (e0) {}
+      window.setTimeout(function () {
+        document.removeEventListener("visibilitychange", onHide);
+        if (handed || document.hidden) {
+          appendLog("ok", "Handed " + fileName + " to OpenVPN Connect.");
+          return;
+        }
+        appendLog("warn", "OpenVPN Connect did not open. Install it, then try again — falling back to share/download.");
+        fetch(href, { headers: { Accept: "application/x-openvpn-profile" } }).then(function (resp) {
+          if (!resp.ok) throw new Error("Export refused (" + resp.status + ")");
+          return resp.arrayBuffer();
+        }).then(function (buf) {
+          return downloadOvpnBlob(buf, fileName);
+        }).catch(function (e) {
+          appendLog("err", "Export failed: " + (e && e.message ? e.message : String(e)));
+        });
+      }, 1600);
+      return;
+    }
+    appendLog("info", "Exporting " + fileName + "…");
     try {
-      var resp = await fetch(href, { headers: { Accept: "application/octet-stream" } });
+      var resp = await fetch(href, { headers: { Accept: "application/x-openvpn-profile" } });
       if (!resp.ok) {
         var err = "Export refused (" + resp.status + ")";
         try {
@@ -2406,33 +2488,7 @@ const PORTAL_JS = String.raw`
         return;
       }
       var buf = await resp.arrayBuffer();
-      var file = new File([buf], fileName, { type: "application/octet-stream" });
-      if (navigator.canShare && navigator.canShare({ files: [file] })) {
-        try {
-          await navigator.share({ files: [file], title: fileName, text: "VPN Gate OpenVPN profile" });
-          appendLog("ok", "Exported " + fileName + " via the system share sheet. You remain in this app.");
-          return;
-        } catch (shareErr) {
-          if (shareErr && shareErr.name === "AbortError") {
-            appendLog("info", "Export cancelled.");
-            return;
-          }
-        }
-      }
-      var url = URL.createObjectURL(file);
-      var a = document.createElement("a");
-      a.href = url;
-      a.download = fileName;
-      a.rel = "noopener";
-      a.target = "_self";
-      a.style.display = "none";
-      document.body.appendChild(a);
-      a.click();
-      setTimeout(function () {
-        URL.revokeObjectURL(url);
-        if (a.parentNode) a.parentNode.removeChild(a);
-      }, 2500);
-      appendLog("ok", "Exported " + fileName + " as a download. Import it in OpenVPN Connect — it is not opened here.");
+      await downloadOvpnBlob(buf, fileName);
     } catch (e) {
       appendLog("err", "Export failed: " + (e && e.message ? e.message : String(e)));
     }
@@ -2698,13 +2754,13 @@ const PORTAL_JS = String.raw`
     }
     if (canUdp) {
       profileBtns += '<button type="button" class="btn btn-primary" data-ovpn-href="' + esc(buildOvpnHref(srv, "udp")) +
-        '" data-ovpn-name="' + esc(ovpnFileName(srv, "udp")) + '">Export OpenVPN UDP (.ovpn)</button>';
+        '" data-ovpn-name="' + esc(ovpnFileName(srv, "udp")) + '">' + esc(ovpnExportLabel("udp", false)) + "</button>";
     } else if (srv.openvpn && srv.udp_port > 0) {
       profileBtns += '<span class="btn btn-lock">' + esc(lockedLabel("udp", "Locked · OpenVPN UDP", srv)) + "</span>";
     }
     if (canTcp) {
       profileBtns += '<button type="button" class="btn" data-ovpn-href="' + esc(buildOvpnHref(srv, "tcp")) +
-        '" data-ovpn-name="' + esc(ovpnFileName(srv, "tcp")) + '">Export OpenVPN TCP (.ovpn)</button>';
+        '" data-ovpn-name="' + esc(ovpnFileName(srv, "tcp")) + '">' + esc(ovpnExportLabel("tcp", false)) + "</button>";
     } else if (srv.openvpn && srv.tcp_port > 0) {
       profileBtns += '<span class="btn btn-lock">' + esc(lockedLabel("tcp", "Locked · OpenVPN TCP", srv)) + "</span>";
     }
@@ -2814,11 +2870,11 @@ const PORTAL_JS = String.raw`
             : (s.l2tp ? '<span class="btn btn-sm btn-lock">' + esc(lockedLabel("l2tp", "L2TP locked", s)) + "</span>" : "")) +
           (canUdp
             ? '<button type="button" class="btn btn-sm" style="border-color:rgba(56,189,248,0.5);color:var(--cyan)" data-ovpn-href="' + esc(buildOvpnHref(s, "udp")) +
-              '" data-ovpn-name="' + esc(ovpnFileName(s, "udp")) + '">OVPN UDP</button>'
+              '" data-ovpn-name="' + esc(ovpnFileName(s, "udp")) + '">' + esc(ovpnExportLabel("udp", true)) + "</button>"
             : (s.openvpn && s.udp_port > 0 ? '<span class="btn btn-sm btn-lock">' + esc(lockedLabel("udp", "UDP locked", s)) + "</span>" : "")) +
           (canTcp
             ? '<button type="button" class="btn btn-sm" data-ovpn-href="' + esc(buildOvpnHref(s, "tcp")) +
-              '" data-ovpn-name="' + esc(ovpnFileName(s, "tcp")) + '">OVPN TCP</button>'
+              '" data-ovpn-name="' + esc(ovpnFileName(s, "tcp")) + '">' + esc(ovpnExportLabel("tcp", true)) + "</button>"
             : (s.openvpn && s.tcp_port > 0 ? '<span class="btn btn-sm btn-lock">' + esc(lockedLabel("tcp", "TCP locked", s)) + "</span>" : "")) +
           '<button type="button" class="btn btn-sm" data-verify-ip="' + esc(s.ip) + '">Verify</button>' +
         "</div>" +
@@ -3478,8 +3534,8 @@ function renderPortalHtml() {
         <details class="adv" style="margin-top:0;border-top:0;padding-top:0">
           <summary>Device setup · iOS / Android / desktop</summary>
           <div class="card-subtitle" style="margin-top:8px">
-            <strong>iPhone / iPad:</strong> Safari only. Wait for <em>LIVE HANDSHAKE</em>, tap <strong>Install Apple L2TP</strong> → Allow → Settings → Profile Downloaded → Install. OpenVPN uses <strong>Export</strong> (share sheet / Save to Files) — the <code>.ovpn</code> is never opened as a page, so you stay in this app.<br>
-            <strong>Android / OpenVPN:</strong> After handshake, tap <strong>Export</strong> and import the download into OpenVPN Connect / OpenVPN for Android.<br>
+            <strong>iPhone / iPad:</strong> Safari only. Wait for <em>LIVE HANDSHAKE</em>, tap <strong>Install Apple L2TP</strong> → Allow → Settings → Profile Downloaded → Install. OpenVPN: tap <strong>Open in OpenVPN Connect</strong> (install that app first) — the profile is handed to the app, not opened as a page.<br>
+            <strong>Android / OpenVPN:</strong> After handshake, tap <strong>Open in OpenVPN Connect</strong>. If the app is missing you will be offered Play Store, then share/download.<br>
             <strong>Linux, Windows 11 &amp; macOS:</strong> tap the command to copy, then run it in a terminal.
           </div>
           <button type="button" class="code-copy" id="install-copy" title="Tap to copy">curl -fsSL https://raw.githubusercontent.com/warmaster726/vpngate-connect/main/install-vpngate.sh | sh</button>
@@ -3876,13 +3932,15 @@ export default {
       const fileName = `vpngate-${cc}-${ip}-${transport}.ovpn`;
       const dest = request.headers.get("Sec-Fetch-Dest") || "";
       const mode = request.headers.get("Sec-Fetch-Mode") || "";
-      if (mode === "navigate" || dest === "document") {
+      const ua = request.headers.get("User-Agent") || "";
+      const ovpnClient = /openvpn/i.test(ua);
+      if (!ovpnClient && (mode === "navigate" || dest === "document")) {
         return Response.redirect(new URL("/", url).toString(), 303);
       }
       return new Response(patched, {
         status: 200,
         headers: {
-          "Content-Type": "application/octet-stream",
+          "Content-Type": "application/x-openvpn-profile",
           "Content-Disposition": `attachment; filename="${fileName}"; filename*=UTF-8''${encodeURIComponent(fileName)}`,
           "X-Content-Type-Options": "nosniff",
           "Cache-Control": "no-store",
