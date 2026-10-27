@@ -14,7 +14,7 @@ import { connect } from "cloudflare:sockets";
  *  - Completely isolated from root `Cargo.toml`, `Cargo.lock`, and desktop installer scripts.
  */
 
-const APP_VERSION = "0.2.5";
+const APP_VERSION = "0.2.6";
 const POOL_CACHE_TTL_MS = 180_000;
 const POOL_CACHE_KEY_URL = "https://vpngate-edge-cache.internal/v1/pool-snapshot";
 const VERIFY_MEM_CACHE_URL = "https://vpngate-edge-cache.internal/v1/verify-memory";
@@ -1425,15 +1425,22 @@ function decorateServersWithVerification(servers) {
   const mem = globalThis.__VG_VERIFIED;
   return (servers || []).map((s) => {
     const rec = mem ? mem.get(s.ip) : null;
-    if (!rec) return { ...s, verify_state: "untested", dead_until: 0 };
+    if (!rec) return { ...s, verify_state: "untested", dead_until: 0, unlocked: [], locked: [] };
     const ttl = verifyRecordTtl(rec);
-    if (now - rec.ts > ttl) return { ...s, verify_state: "untested", dead_until: 0 };
+    if (now - rec.ts > ttl) return { ...s, verify_state: "untested", dead_until: 0, unlocked: [], locked: [] };
+    const avail = profileAvailability(s, rec);
+    const unlocked = rec.unlocked || avail.unlocked;
+    const locked = rec.locked || avail.locked;
+    const adv = advertisedProfileKinds(s);
+    const fullLive = adv.length > 0 && adv.every((k) => unlocked.includes(k));
     return {
       ...s,
-      verify_state: rec.ok ? "live" : "dead",
+      verify_state: rec.ok || unlocked.length ? (fullLive ? "live" : "partial") : "dead",
       verified_port: rec.port || 0,
       verified_rtt_ms: rec.rtt_ms || null,
-      dead_until: rec.ok ? 0 : rec.ts + DEAD_PENALTY_MS,
+      unlocked,
+      locked,
+      dead_until: rec.ok || unlocked.length ? 0 : rec.ts + DEAD_PENALTY_MS,
     };
   });
 }
@@ -1504,6 +1511,7 @@ async function probeOpenVpnHandshake(ip, port, timeoutMs = HANDSHAKE_TIMEOUT_MS)
   const t0 = Date.now();
   const deadline = t0 + timeoutMs;
   let socket;
+  let tcpOpen = false;
   try {
     socket = connect({ hostname: ip, port: Number(port) });
     await Promise.race([
@@ -1512,6 +1520,7 @@ async function probeOpenVpnHandshake(ip, port, timeoutMs = HANDSHAKE_TIMEOUT_MS)
         throw new Error("TCP connect timeout");
       }),
     ]);
+    tcpOpen = true;
     const { pkt, sid } = buildOpenVpnHardReset();
     const writer = socket.writable.getWriter();
     await writer.write(pkt);
@@ -1523,6 +1532,7 @@ async function probeOpenVpnHandshake(ip, port, timeoutMs = HANDSHAKE_TIMEOUT_MS)
     const handshake = parseOpenVpnHardResetReply(buf, sid);
     return {
       reachable: Boolean(handshake),
+      tcp_open: true,
       handshake,
       rtt_ms: Math.max(1, Date.now() - t0),
       engine: "openvpn-tcp-v2",
@@ -1532,8 +1542,9 @@ async function probeOpenVpnHandshake(ip, port, timeoutMs = HANDSHAKE_TIMEOUT_MS)
     try { if (socket) await socket.close(); } catch {}
     return {
       reachable: false,
+      tcp_open: tcpOpen,
       handshake: false,
-      rtt_ms: null,
+      rtt_ms: tcpOpen ? Math.max(1, Date.now() - t0) : null,
       engine: "openvpn-tcp-v2",
       error: err && err.message ? String(err.message) : "OpenVPN handshake unavailable",
     };
@@ -1580,32 +1591,131 @@ function portsToProbe(server) {
   for (const p of [443, 995, 5555]) {
     if (!ports.includes(p)) ports.push(p);
   }
-  return advertised > 0 ? ports.slice(0, 1) : ports.slice(0, 2);
+  return ports.slice(0, 1);
+}
+
+async function probeTcpConnect(ip, port, timeoutMs = HANDSHAKE_TIMEOUT_MS) {
+  const t0 = Date.now();
+  let socket;
+  try {
+    socket = connect({ hostname: ip, port: Number(port) });
+    await Promise.race([
+      socket.opened,
+      sleep(timeoutMs).then(() => {
+        throw new Error("TCP connect timeout");
+      }),
+    ]);
+    try { await socket.close(); } catch {}
+    return {
+      reachable: true,
+      rtt_ms: Math.max(1, Date.now() - t0),
+      engine: "tcp-connect",
+    };
+  } catch (err) {
+    try { if (socket) await socket.close(); } catch {}
+    return {
+      reachable: false,
+      rtt_ms: null,
+      engine: "tcp-connect",
+      error: err && err.message ? String(err.message) : "TCP connect unavailable",
+    };
+  }
+}
+
+function advertisedProfileKinds(server) {
+  const kinds = [];
+  if (server && server.l2tp) kinds.push("l2tp");
+  if (supportsOpenvpnUdp(server)) kinds.push("udp");
+  if (supportsOpenvpnTcp(server)) kinds.push("tcp");
+  return kinds;
+}
+
+function profileAvailability(server, result) {
+  const unlocked = [];
+  const locked = [];
+  const tcpHs = Boolean(result && (result.tcp_handshake || (result.ok && result.engine === "openvpn-tcp-v2" && result.tcp_handshake !== false)));
+  const hostUp = Boolean(result && (result.host_up || result.tcp_open || tcpHs));
+  const advTcp = supportsOpenvpnTcp(server);
+  const advUdp = supportsOpenvpnUdp(server);
+  const advL2tp = Boolean(server && server.l2tp);
+
+  if (advTcp) {
+    if (tcpHs) unlocked.push("tcp");
+    else locked.push({ kind: "tcp", reason: "no OpenVPN HARD_RESET" });
+  }
+  if (advUdp) {
+    if (tcpHs) unlocked.push("udp");
+    else if (!advTcp && hostUp) unlocked.push("udp");
+    else locked.push({ kind: "udp", reason: "OpenVPN not live" });
+  }
+  if (advL2tp) {
+    if (hostUp || tcpHs) unlocked.push("l2tp");
+    else locked.push({ kind: "l2tp", reason: "host unreachable" });
+  }
+  return { unlocked, locked };
+}
+
+function unlockedProfiles(server, result) {
+  return profileAvailability(server, result).unlocked;
 }
 
 async function verifyRelay(server) {
+  const advTcp = supportsOpenvpnTcp(server);
+  const advUdp = supportsOpenvpnUdp(server);
+  const advL2tp = Boolean(server.l2tp);
   const ports = portsToProbe(server);
-  let last = {
-    ok: false,
-    port: ports[0] || 0,
-    rtt_ms: null,
-    engine: "openvpn-tcp-v2",
-    error: "no probe ports",
-  };
-  for (const port of ports) {
-    const r = await probeOpenVpnHandshake(server.ip, port, HANDSHAKE_TIMEOUT_MS);
-    if (r.handshake) {
-      return { ok: true, port, rtt_ms: r.rtt_ms, engine: r.engine };
+  const port0 = ports[0] || 443;
+
+  let tcpHandshake = false;
+  let hostUp = false;
+  let port = port0;
+  let rtt_ms = null;
+  let engine = "openvpn-tcp-v2";
+  let error = "no probe";
+
+  if (advTcp) {
+    for (const p of ports) {
+      const r = await probeOpenVpnHandshake(server.ip, p, HANDSHAKE_TIMEOUT_MS);
+      port = p;
+      rtt_ms = r.rtt_ms;
+      engine = r.engine;
+      if (r.tcp_open) hostUp = true;
+      if (r.handshake) {
+        tcpHandshake = true;
+        hostUp = true;
+        error = undefined;
+        break;
+      }
+      error = r.error || "handshake failed";
     }
-    last = {
-      ok: false,
-      port,
-      rtt_ms: r.rtt_ms,
-      engine: r.engine,
-      error: r.error || "handshake failed",
-    };
+  } else if (advUdp || advL2tp) {
+    const r = await probeTcpConnect(server.ip, port0, HANDSHAKE_TIMEOUT_MS);
+    hostUp = Boolean(r.reachable);
+    rtt_ms = r.rtt_ms;
+    engine = r.engine;
+    error = hostUp ? undefined : (r.error || "TCP connect failed");
   }
-  return last;
+
+  const avail = profileAvailability(server, {
+    tcp_handshake: tcpHandshake,
+    host_up: hostUp,
+    tcp_open: hostUp,
+    ok: tcpHandshake,
+    engine,
+    port,
+  });
+
+  return {
+    ok: avail.unlocked.length > 0,
+    port,
+    rtt_ms,
+    engine: tcpHandshake ? "openvpn-tcp-v2" : engine,
+    tcp_handshake: tcpHandshake,
+    host_up: hostUp,
+    unlocked: avail.unlocked,
+    locked: avail.locked,
+    error: avail.unlocked.length ? undefined : (error || "no live protocol"),
+  };
 }
 
 async function verifyRelayCached(server, { force = false, ctx = null } = {}) {
@@ -1615,15 +1725,6 @@ async function verifyRelayCached(server, { force = false, ctx = null } = {}) {
   }
   const res = await verifyRelay(server);
   return rememberVerify(server.ip, res, ctx);
-}
-
-function unlockedProfiles(server, result) {
-  const unlocked = [];
-  if (!result || !result.ok) return unlocked;
-  if (server.l2tp) unlocked.push("l2tp");
-  if (server.openvpn && (server.tcp_port > 0 || result.port > 0)) unlocked.push("tcp");
-  if (server.openvpn && server.udp_port > 0) unlocked.push("udp");
-  return unlocked;
 }
 
 function sortVerifyCandidates(list, sortKey = "recommended", proto = "auto") {
@@ -1683,6 +1784,10 @@ async function recursiveVerifyRelays({
         rtt_ms: res.rtt_ms || null,
         error: res.ok ? undefined : res.error,
         engine: res.engine,
+        unlocked: res.unlocked || unlockedProfiles(srv, res),
+        locked: res.locked || profileAvailability(srv, res).locked,
+        tcp_handshake: Boolean(res.tcp_handshake),
+        host_up: Boolean(res.host_up),
         dead_until: res.ok ? 0 : (res.ts || Date.now()) + DEAD_PENALTY_MS,
         cached: Boolean(res.ts && Date.now() - res.ts > 250 && !force),
       });
@@ -1702,6 +1807,7 @@ async function recursiveVerifyRelays({
 
   const srv = winner.server;
   const res = winner.result;
+  const avail = profileAvailability(srv, res);
   return {
     verified: {
       ip: srv.ip,
@@ -1710,7 +1816,7 @@ async function recursiveVerifyRelays({
       country_long: srv.country_long,
       port: res.port,
       rtt_ms: res.rtt_ms,
-      handshake: "openvpn-tcp-v2",
+      handshake: res.tcp_handshake ? "openvpn-tcp-v2" : (res.engine || "tcp-connect"),
       l2tp: srv.l2tp,
       openvpn: srv.openvpn,
       tcp_port: srv.tcp_port,
@@ -1721,7 +1827,10 @@ async function recursiveVerifyRelays({
       ping_ms: srv.ping_ms,
       sessions: srv.sessions,
       operator: srv.operator,
-      unlocked: unlockedProfiles(srv, res),
+      tcp_handshake: Boolean(res.tcp_handshake),
+      host_up: Boolean(res.host_up),
+      unlocked: res.unlocked || avail.unlocked,
+      locked: res.locked || avail.locked,
     },
     attempts,
     scanned: attempts.length,
@@ -1746,21 +1855,21 @@ async function assertVerifiedForProfile(ctx, ip, kind) {
     return { error: "Relay does not advertise OpenVPN UDP.", status: 409, found };
   }
   const verified = await verifyRelayCached(found, { ctx });
-  if (!verified.ok) {
+  const avail = profileAvailability(found, verified);
+  if (!avail.unlocked.includes(kind)) {
+    const lock = (avail.locked || []).find((l) => l.kind === kind);
+    const why = lock && lock.reason
+      ? lock.reason
+      : (!verified || !verified.ok
+        ? "relay did not answer a live path"
+        : "this protocol stayed locked on the host");
     return {
-      error: "Live handshake failed — profile withheld until the relay answers OpenVPN HARD_RESET.",
+      error: `Profile locked (${kind}): ${why}. Other protocols on this relay may still be available.`,
       status: 409,
       found,
       verified,
-    };
-  }
-  const unlocked = unlockedProfiles(found, verified);
-  if (!unlocked.includes(kind)) {
-    return {
-      error: `Verified host does not unlock '${kind}' profile.`,
-      status: 409,
-      found,
-      verified,
+      unlocked: avail.unlocked,
+      locked: avail.locked,
     };
   }
   return { found, verified, snap };
@@ -1920,6 +2029,7 @@ button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible
 .hero-relay.live { border-color: rgba(52,211,153,0.5); background: linear-gradient(180deg, rgba(52,211,153,0.1) 0%, rgba(16,24,39,0.96) 46%); }
 .hero-relay.testing { border-color: rgba(56,189,248,0.55); }
 .hero-relay.dead { border-color: rgba(251,113,133,0.4); }
+.hero-relay.partial { border-color: rgba(251,191,36,0.5); }
 .relay-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
 .relay-country { font-size: 17px; font-weight: 700; color: #F8FAFC; letter-spacing: -0.02em; }
 .relay-host { font-family: var(--mono); font-size: 12px; color: var(--cyan); margin-top: 3px; word-break: break-all; }
@@ -1943,6 +2053,7 @@ button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible
 .badge-tcp { background: var(--amber-dim); color: var(--amber); border: 1px solid rgba(251,191,36,0.35); }
 .badge-err { background: var(--coral-dim); color: var(--coral); border: 1px solid rgba(251,113,133,0.35); }
 .badge-live { background: var(--emerald-dim); color: var(--emerald); border: 1px solid rgba(52,211,153,0.45); }
+.badge-partial { background: var(--amber-dim); color: var(--amber); border: 1px solid rgba(251,191,36,0.4); }
 .badge-wait { background: var(--cyan-dim); color: var(--cyan); border: 1px solid rgba(56,189,248,0.35); }
 
 .lock-note {
@@ -1952,6 +2063,9 @@ button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible
 }
 .lock-note.ok {
   background: rgba(52,211,153,0.08); border-color: rgba(52,211,153,0.3); color: #A7F3D0;
+}
+.lock-note.partial {
+  background: rgba(251,191,36,0.08); border-color: rgba(251,191,36,0.3); color: #FDE68A;
 }
 
 .progress-track {
@@ -2011,6 +2125,7 @@ button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible
 .relay-item:hover { border-color: rgba(56,189,248,0.45); }
 .relay-item.live { border-color: rgba(52,211,153,0.4); }
 .relay-item.dead { opacity: 0.72; }
+.relay-item.partial { border-color: rgba(251,191,36,0.35); }
 
 .code-copy {
   display: block; width: 100%; text-align: left;
@@ -2284,6 +2399,43 @@ const PORTAL_JS = String.raw`
     }
   }
 
+  function protoNeeds(proto) {
+    if (!proto || proto === "auto" || proto === "all") return null;
+    if (proto === "l2tp") return ["l2tp"];
+    if (proto === "udp") return ["udp"];
+    if (proto === "tcp") return ["tcp"];
+    if (proto === "openvpn" || proto === "ovpn") return ["udp", "tcp"];
+    return null;
+  }
+
+  function satisfiesProto(unlocked, proto) {
+    if (!unlocked || !unlocked.length) return false;
+    var need = protoNeeds(proto);
+    if (!need) return true;
+    for (var i = 0; i < need.length; i++) {
+      if (unlocked.indexOf(need[i]) !== -1) return true;
+    }
+    return false;
+  }
+
+  function lockReason(kind, srv) {
+    var locked = [];
+    if (state.verified && srv && state.verified.ip === srv.ip && Array.isArray(state.verified.locked)) {
+      locked = state.verified.locked;
+    } else if (srv && Array.isArray(srv.locked)) {
+      locked = srv.locked;
+    }
+    for (var i = 0; i < locked.length; i++) {
+      if (locked[i] && locked[i].kind === kind && locked[i].reason) return locked[i].reason;
+    }
+    return "";
+  }
+
+  function lockedLabel(kind, fallback, srv) {
+    var why = lockReason(kind, srv);
+    return why ? (fallback + " — " + why) : fallback;
+  }
+
   function isPenalized(srv) {
     if (!srv || srv.verify_state !== "dead") return false;
     if (srv.dead_until && Date.now() >= srv.dead_until) {
@@ -2341,6 +2493,8 @@ const PORTAL_JS = String.raw`
       out += '<span class="badge badge-wait">TESTING</span>';
     } else if (srv.verify_state === "live") {
       out += '<span class="badge badge-live">LIVE HANDSHAKE</span>';
+    } else if (srv.verify_state === "partial") {
+      out += '<span class="badge badge-partial">PARTIAL</span>';
     } else if (isPenalized(srv)) {
       var left = fmtPenaltyLeft(srv);
       out += '<span class="badge badge-err">DEAD' + (left ? " · " + left : "") + "</span>";
@@ -2419,8 +2573,10 @@ const PORTAL_JS = String.raw`
   }
 
   function unlockedFor(srv) {
-    if (!state.verified || !srv || state.verified.ip !== srv.ip) return [];
-    return state.verified.unlocked || [];
+    if (state.verified && srv && state.verified.ip === srv.ip && Array.isArray(state.verified.unlocked)) {
+      return state.verified.unlocked;
+    }
+    return (srv && srv.unlocked) || [];
   }
 
   function renderConnectHero() {
@@ -2441,9 +2597,14 @@ const PORTAL_JS = String.raw`
     var canL2tp = unlocked.indexOf("l2tp") !== -1;
     var canUdp = unlocked.indexOf("udp") !== -1;
     var canTcp = unlocked.indexOf("tcp") !== -1;
+    var anyLive = canL2tp || canUdp || canTcp;
+    var someLocked = (srv.l2tp && !canL2tp)
+      || (srv.openvpn && srv.udp_port > 0 && !canUdp)
+      || (srv.openvpn && srv.tcp_port > 0 && !canTcp);
     var heroClass = "hero-relay";
     if (state.verifying) heroClass += " testing";
-    else if (canL2tp || canUdp || canTcp) heroClass += " live";
+    else if (anyLive && !someLocked) heroClass += " live";
+    else if (anyLive) heroClass += " partial";
     else if (srv.verify_state === "dead") heroClass += " dead";
 
     var handshakeMs;
@@ -2458,28 +2619,40 @@ const PORTAL_JS = String.raw`
       lockHtml = '<div class="progress-track"><div class="progress-fill"></div></div>' +
         '<div class="progress-label">' + esc(state.verifyLabel || "Testing live path") +
         ' · <span id="verify-elapsed">0.0s this hop · 0.0s total</span></div>';
-    } else if (canL2tp || canUdp || canTcp) {
-      lockHtml = '<div class="lock-note ok">Live OpenVPN HARD_RESET completed on ' +
-        esc(srv.ip) + ":" + esc(state.verified.port) + " · profiles unlocked for this relay only.</div>";
+    } else if (anyLive && !someLocked) {
+      lockHtml = '<div class="lock-note ok">Live path on ' +
+        esc(srv.ip) + (state.verified && state.verified.port ? (":" + esc(state.verified.port)) : "") +
+        " · advertised profiles unlocked for this relay only.</div>";
+    } else if (anyLive) {
+      var openBits = [];
+      if (canL2tp) openBits.push("Apple L2TP");
+      if (canUdp) openBits.push("OpenVPN UDP");
+      if (canTcp) openBits.push("OpenVPN TCP");
+      var shutBits = [];
+      if (srv.l2tp && !canL2tp) shutBits.push("Apple L2TP" + (lockReason("l2tp", srv) ? " (" + lockReason("l2tp", srv) + ")" : ""));
+      if (srv.openvpn && srv.udp_port > 0 && !canUdp) shutBits.push("OpenVPN UDP" + (lockReason("udp", srv) ? " (" + lockReason("udp", srv) + ")" : ""));
+      if (srv.openvpn && srv.tcp_port > 0 && !canTcp) shutBits.push("OpenVPN TCP" + (lockReason("tcp", srv) ? " (" + lockReason("tcp", srv) + ")" : ""));
+      lockHtml = '<div class="lock-note partial">Unlocked: ' + esc(openBits.join(", ") || "none") +
+        ". Locked: " + esc(shutBits.join(", ") || "none") + ".</div>";
     } else {
-      lockHtml = '<div class="lock-note">Profiles stay locked until this edge proves a live tunnel handshake. Dead listings are never exported.</div>';
+      lockHtml = '<div class="lock-note">Profiles stay locked until this edge proves a live path. Dead listings are never exported.</div>';
     }
 
     var profileBtns = "";
     if (canL2tp) {
       profileBtns += '<a class="btn btn-emerald" href="' + esc(buildMobileconfigHref(srv)) + '"> Install Apple L2TP (.mobileconfig)</a>';
     } else if (srv.l2tp) {
-      profileBtns += '<span class="btn btn-lock">Locked · Apple L2TP</span>';
+      profileBtns += '<span class="btn btn-lock">' + esc(lockedLabel("l2tp", "Locked · Apple L2TP", srv)) + "</span>";
     }
     if (canUdp) {
       profileBtns += '<a class="btn btn-primary" href="' + esc(buildOvpnHref(srv, "udp")) + '">Export OpenVPN UDP (.ovpn)</a>';
     } else if (srv.openvpn && srv.udp_port > 0) {
-      profileBtns += '<span class="btn btn-lock">Locked · OpenVPN UDP</span>';
+      profileBtns += '<span class="btn btn-lock">' + esc(lockedLabel("udp", "Locked · OpenVPN UDP", srv)) + "</span>";
     }
     if (canTcp) {
       profileBtns += '<a class="btn" href="' + esc(buildOvpnHref(srv, "tcp")) + '">Export OpenVPN TCP (.ovpn)</a>';
     } else if (srv.openvpn && srv.tcp_port > 0) {
-      profileBtns += '<span class="btn btn-lock">Locked · OpenVPN TCP</span>';
+      profileBtns += '<span class="btn btn-lock">' + esc(lockedLabel("tcp", "Locked · OpenVPN TCP", srv)) + "</span>";
     }
     if (!profileBtns) {
       profileBtns = '<span class="btn btn-lock">No profile until a live handshake exists</span>';
@@ -2550,7 +2723,7 @@ const PORTAL_JS = String.raw`
       return matchRelayQuery(s, state.relaySearch) && matchProto(s, state.relayProto);
     });
     var sorted = sortList(filtered, state.relaySort, state.relayProto);
-    var liveN = sorted.filter(function (s) { return s.verify_state === "live"; }).length;
+    var liveN = sorted.filter(function (s) { return s.verify_state === "live" || s.verify_state === "partial"; }).length;
     metaEl.textContent = "Showing " + Math.min(sorted.length, state.relayLimit) + " of " + sorted.length +
       " matching relays · " + liveN + " handshake-verified";
 
@@ -2569,6 +2742,7 @@ const PORTAL_JS = String.raw`
       var canTcp = unlocked.indexOf("tcp") !== -1;
       var itemCls = "relay-item";
       if (s.verify_state === "live") itemCls += " live";
+      if (s.verify_state === "partial") itemCls += " partial";
       if (s.verify_state === "dead") itemCls += " dead";
       out += '<div class="' + itemCls + '">' +
         '<div class="relay-top">' +
@@ -2583,13 +2757,13 @@ const PORTAL_JS = String.raw`
         '<div class="btn-row" style="margin-top:9px">' +
           (canL2tp
             ? '<a class="btn btn-sm" style="border-color:rgba(52,211,153,0.5);color:var(--emerald)" href="' + esc(buildMobileconfigHref(s)) + '">.mobileconfig</a>'
-            : (s.l2tp ? '<span class="btn btn-sm btn-lock">L2TP locked</span>' : "")) +
+            : (s.l2tp ? '<span class="btn btn-sm btn-lock">' + esc(lockedLabel("l2tp", "L2TP locked", s)) + "</span>" : "")) +
           (canUdp
             ? '<a class="btn btn-sm" style="border-color:rgba(56,189,248,0.5);color:var(--cyan)" href="' + esc(buildOvpnHref(s, "udp")) + '">OVPN UDP</a>'
-            : (s.openvpn && s.udp_port > 0 ? '<span class="btn btn-sm btn-lock">UDP locked</span>' : "")) +
+            : (s.openvpn && s.udp_port > 0 ? '<span class="btn btn-sm btn-lock">' + esc(lockedLabel("udp", "UDP locked", s)) + "</span>" : "")) +
           (canTcp
             ? '<a class="btn btn-sm" href="' + esc(buildOvpnHref(s, "tcp")) + '">OVPN TCP</a>'
-            : (s.openvpn && s.tcp_port > 0 ? '<span class="btn btn-sm btn-lock">TCP locked</span>' : "")) +
+            : (s.openvpn && s.tcp_port > 0 ? '<span class="btn btn-sm btn-lock">' + esc(lockedLabel("tcp", "TCP locked", s)) + "</span>" : "")) +
           '<button type="button" class="btn btn-sm" data-verify-ip="' + esc(s.ip) + '">Verify</button>' +
         "</div>" +
       "</div>";
@@ -2685,13 +2859,23 @@ const PORTAL_JS = String.raw`
   function markServerState(ip, rec) {
     for (var j = 0; j < state.servers.length; j++) {
       if (state.servers[j].ip !== ip) continue;
-      if (rec && rec.ok) {
-        state.servers[j].verify_state = "live";
+      var unlocked = (rec && rec.unlocked) || [];
+      var locked = (rec && rec.locked) || [];
+      if (rec && (rec.ok || unlocked.length)) {
+        var advN = 0;
+        if (state.servers[j].l2tp) advN += 1;
+        if (state.servers[j].openvpn && state.servers[j].udp_port > 0) advN += 1;
+        if (state.servers[j].openvpn && state.servers[j].tcp_port > 0) advN += 1;
+        state.servers[j].unlocked = unlocked;
+        state.servers[j].locked = locked;
+        state.servers[j].verify_state = (advN > 0 && unlocked.length >= advN) ? "live" : "partial";
         state.servers[j].verified_port = rec.port;
         state.servers[j].verified_rtt_ms = rec.rtt_ms;
         state.servers[j].dead_until = 0;
       } else {
         state.servers[j].verify_state = "dead";
+        state.servers[j].unlocked = [];
+        state.servers[j].locked = locked;
         state.servers[j].dead_until = (rec && rec.dead_until) ? rec.dead_until : (Date.now() + DEAD_PENALTY_MS);
       }
       break;
@@ -2804,6 +2988,10 @@ const PORTAL_JS = String.raw`
       var forceThis = Boolean(opts.force) || (opts.forceIp && cand.ip === opts.forceIp);
       if (opts.skipIp && cand.ip === opts.skipIp) continue;
       if (!forceThis && isPenalized(cand)) continue;
+      if (!forceThis && cand.verify_state && cand.verify_state !== "untested" && Array.isArray(cand.unlocked)
+        && !satisfiesProto(cand.unlocked, state.proto)) {
+        continue;
+      }
       if (probed >= WALK_CAP) {
         appendLog("warn", "Walk cap (" + WALK_CAP + ") reached — remaining slots keep their listed numbers.");
         break;
@@ -2838,14 +3026,37 @@ const PORTAL_JS = String.raw`
 
       var attempt = data && Array.isArray(data.attempts) && data.attempts[0] ? data.attempts[0] : null;
       if (attempt) state.attempts.push(attempt);
-      var ok = Boolean(data && data.verified && data.verified.ip === cand.ip);
-      if (ok) {
-        markServerState(cand.ip, { ok: true, port: data.verified.port, rtt_ms: data.verified.rtt_ms });
-        appendLog("ok", "LIVE [" + (i + 1) + "/" + candidates.length + "] " + cand.ip + ":" + data.verified.port + " · " + data.verified.rtt_ms + " ms · " + fmtElapsed(Date.now() - state.hopStartedAt));
-        winner = { index: i, payload: data.verified };
+      var unlocked = [];
+      var locked = [];
+      if (data && data.verified && Array.isArray(data.verified.unlocked)) unlocked = data.verified.unlocked;
+      else if (attempt && Array.isArray(attempt.unlocked)) unlocked = attempt.unlocked;
+      if (data && data.verified && Array.isArray(data.verified.locked)) locked = data.verified.locked;
+      else if (attempt && Array.isArray(attempt.locked)) locked = attempt.locked;
+      var rec = {
+        ok: unlocked.length > 0,
+        port: data && data.verified ? data.verified.port : (attempt && attempt.port),
+        rtt_ms: data && data.verified ? data.verified.rtt_ms : (attempt && attempt.rtt_ms),
+        unlocked: unlocked,
+        locked: locked,
+        dead_until: attempt && attempt.dead_until
+      };
+      if (satisfiesProto(unlocked, state.proto)) {
+        markServerState(cand.ip, rec);
+        appendLog("ok", "LIVE [" + (i + 1) + "/" + candidates.length + "] " + cand.ip +
+          " · " + unlocked.join("+").toUpperCase() +
+          (rec.rtt_ms ? (" · " + rec.rtt_ms + " ms") : "") +
+          " · " + fmtElapsed(Date.now() - state.hopStartedAt));
+        winner = { index: i, payload: (data && data.verified) || { ip: cand.ip, unlocked: unlocked, locked: locked, port: rec.port, rtt_ms: rec.rtt_ms } };
         break;
       }
-      markServerState(cand.ip, { ok: false, dead_until: attempt && attempt.dead_until });
+      if (unlocked.length) {
+        markServerState(cand.ip, rec);
+        appendLog("warn", "Partial [" + (i + 1) + "/" + candidates.length + "] " + cand.ip +
+          " · unlocked " + unlocked.join("+").toUpperCase() +
+          " · selected protocol still locked · next slot");
+        continue;
+      }
+      markServerState(cand.ip, { ok: false, dead_until: rec.dead_until, locked: locked });
       appendLog("warn", "Dead [" + (i + 1) + "/" + candidates.length + "] " + cand.ip +
         (attempt && attempt.error ? " · " + attempt.error : "") +
         " · 15m pool penalty · next slot");
@@ -2860,7 +3071,9 @@ const PORTAL_JS = String.raw`
       state.verified = winner.payload;
       setStepper("profile");
       setStatusPill("", "LIVE · #" + (winner.index + 1));
-      appendLog("ok", "Profiles unlocked for sort slot [" + (winner.index + 1) + "/" + candidates.length + "] " + winner.payload.ip + " after " + probed + " handshake(s) in " + fmtElapsed(Date.now() - state.walkStartedAt) + ".");
+      appendLog("ok", "Profiles updated for sort slot [" + (winner.index + 1) + "/" + candidates.length + "] " + winner.payload.ip +
+        " · unlocked " + ((winner.payload.unlocked || []).join("+").toUpperCase() || "none") +
+        " after " + probed + " handshake(s) in " + fmtElapsed(Date.now() - state.walkStartedAt) + ".");
     } else {
       state.selectedIndex = lastIdx;
       state.verified = null;
