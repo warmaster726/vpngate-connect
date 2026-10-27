@@ -14,13 +14,15 @@ import { connect } from "cloudflare:sockets";
  *  - Completely isolated from root `Cargo.toml`, `Cargo.lock`, and desktop installer scripts.
  */
 
-const APP_VERSION = "0.2.4";
+const APP_VERSION = "0.2.5";
 const POOL_CACHE_TTL_MS = 180_000;
 const POOL_CACHE_KEY_URL = "https://vpngate-edge-cache.internal/v1/pool-snapshot";
 const VERIFY_MEM_CACHE_URL = "https://vpngate-edge-cache.internal/v1/verify-memory";
 const VERIFY_IP_CACHE_PREFIX = "https://vpngate-edge-cache.internal/v1/verify-ip/";
-/** Desktop tunnel wait is 15–22s; web probes fail faster so the walk can advance. */
-const HANDSHAKE_TIMEOUT_MS = 1200;
+/** Desktop default tunnel wait is 22s; web uses 80% so distant relays can still answer. */
+const HANDSHAKE_TIMEOUT_MS = 17_600;
+/** Client fetch abort: handshake budget plus HTTP slack, still under the Workers ~30s cap. */
+const VERIFY_CLIENT_ABORT_MS = 21_000;
 const DEAD_PENALTY_MS = 15 * 60 * 1000;
 const USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) VPNGate-WebWorker/0.2";
 const OFFICIAL_CSV_URLS = [
@@ -2701,7 +2703,7 @@ const PORTAL_JS = String.raw`
     qs.set("ip", srv.ip);
     if (force) qs.set("force", "1");
     var ctrl = new AbortController();
-    var timer = setTimeout(function () { ctrl.abort(); }, 2500);
+    var timer = setTimeout(function () { ctrl.abort(); }, ${VERIFY_CLIENT_ABORT_MS});
     try {
       var resp = await fetch("/api/verify?" + qs.toString(), { signal: ctrl.signal });
       return await resp.json();
@@ -2790,7 +2792,7 @@ const PORTAL_JS = String.raw`
     startElapsedTicker();
     appendLog("info", single
       ? ("Handshake on sort slot [" + (start + 1) + "/" + candidates.length + "]")
-      : ("Walking sort order from [" + (start + 1) + "/" + candidates.length + "] — dead hops skip in 1.2s and stay numbered."));
+      : ("Walking sort order from [" + (start + 1) + "/" + candidates.length + "] — up to 17.6s per hop (80% of desktop 22s)."));
 
     var winner = null;
     var probed = 0;
