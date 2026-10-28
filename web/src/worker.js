@@ -14,7 +14,7 @@ import { connect } from "cloudflare:sockets";
  *  - Completely isolated from root `Cargo.toml`, `Cargo.lock`, and desktop installer scripts.
  */
 
-const APP_VERSION = "0.2.8";
+const APP_VERSION = "0.2.9";
 const POOL_CACHE_TTL_MS = 180_000;
 const POOL_CACHE_KEY_URL = "https://vpngate-edge-cache.internal/v1/pool-snapshot";
 const VERIFY_MEM_CACHE_URL = "https://vpngate-edge-cache.internal/v1/verify-memory";
@@ -2127,11 +2127,14 @@ button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible
 .relay-item.dead { opacity: 0.72; }
 .relay-item.partial { border-color: rgba(251,191,36,0.35); }
 
+.code-copy-label {
+  margin-top: 10px; font-family: var(--mono); font-size: 11px; color: var(--muted); font-weight: 700;
+}
 .code-copy {
   display: block; width: 100%; text-align: left;
   background: var(--console); border: 1px solid var(--border); border-radius: 9px;
   padding: 10px 11px; font-family: var(--mono); font-size: 12px; color: var(--cyan);
-  overflow-x: auto; white-space: nowrap; margin-top: 8px; cursor: pointer;
+  overflow-x: auto; white-space: nowrap; margin-top: 6px; cursor: pointer;
 }
 .code-copy:hover { border-color: var(--cyan); }
 .inline-row { display: flex; gap: 8px; align-items: stretch; }
@@ -2230,6 +2233,61 @@ const PORTAL_JS = String.raw`
     if (isMac) return { id: "macos", label: "macOS · Native L2TP + OpenVPN 2.6", apple: true, mobile: false };
     if (isWin) return { id: "windows", label: "Windows 11 · Patched .ovpn + native CLI", apple: false, mobile: false };
     return { id: "linux", label: "Linux · Patched .ovpn + native CLI", apple: false, mobile: false };
+  }
+
+  var INSTALL_SH = "https://raw.githubusercontent.com/warmaster726/vpngate-connect/main/install-vpngate.sh";
+  var INSTALL_PS1 = "https://raw.githubusercontent.com/warmaster726/vpngate-connect/main/install-vpngate.ps1";
+  var INSTALL_CMDS = {
+    linux: {
+      hint: "Linux / macOS · POSIX sh",
+      install: "curl -fsSL " + INSTALL_SH + " | sh -s --",
+      uninstall: "curl -fsSL " + INSTALL_SH + " | sh -s -- --uninstall"
+    },
+    windows: {
+      hint: "Windows 11 · Administrator PowerShell",
+      install: "irm " + INSTALL_PS1 + " | iex",
+      uninstall: "& ([scriptblock]::Create((irm " + INSTALL_PS1 + "))) --uninstall"
+    }
+  };
+
+  function defaultInstallOs() {
+    return (state.device && state.device.id === "windows") ? "windows" : "linux";
+  }
+
+  function applyInstallOs(os) {
+    if (os !== "windows") os = "linux";
+    state.installOs = os;
+    var cmds = INSTALL_CMDS[os];
+    var hint = document.getElementById("install-os-hint");
+    var installBtn = document.getElementById("install-copy");
+    var uninstallBtn = document.getElementById("uninstall-copy");
+    if (hint) hint.textContent = cmds.hint;
+    if (installBtn) {
+      installBtn.textContent = cmds.install;
+      installBtn.setAttribute("data-cmd", cmds.install);
+    }
+    if (uninstallBtn) {
+      uninstallBtn.textContent = cmds.uninstall;
+      uninstallBtn.setAttribute("data-cmd", cmds.uninstall);
+    }
+    document.querySelectorAll("#install-os-pills .chip").forEach(function (c) {
+      c.classList.toggle("active", c.getAttribute("data-install-os") === os);
+    });
+  }
+
+  function copyDesktopCommand(btn, okMsg) {
+    var cmd = "";
+    if (btn) cmd = (btn.getAttribute("data-cmd") || btn.textContent || "").trim();
+    if (!cmd) return;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(cmd).then(function () {
+        appendLog("ok", okMsg);
+      }).catch(function () {
+        appendLog("warn", "Copy failed — select the command manually.");
+      });
+    } else {
+      appendLog("info", cmd);
+    }
   }
 
   function flagEmoji(cc) {
@@ -3378,19 +3436,25 @@ const PORTAL_JS = String.raw`
       appendLog("info", "Console log cleared.");
     });
 
+    applyInstallOs(defaultInstallOs());
+    var osPills = document.getElementById("install-os-pills");
+    if (osPills) {
+      osPills.addEventListener("click", function (e) {
+        var btn = e.target.closest("[data-install-os]");
+        if (!btn) return;
+        applyInstallOs(btn.getAttribute("data-install-os"));
+      });
+    }
     var copyBtn = document.getElementById("install-copy");
     if (copyBtn) {
       copyBtn.addEventListener("click", function () {
-        var cmd = "curl -fsSL https://raw.githubusercontent.com/warmaster726/vpngate-connect/main/install-vpngate.sh | sh";
-        if (navigator.clipboard && navigator.clipboard.writeText) {
-          navigator.clipboard.writeText(cmd).then(function () {
-            appendLog("ok", "Desktop installer command copied.");
-          }).catch(function () {
-            appendLog("warn", "Copy failed — select the command manually.");
-          });
-        } else {
-          appendLog("info", cmd);
-        }
+        copyDesktopCommand(copyBtn, "Desktop install command copied.");
+      });
+    }
+    var uninstallBtn = document.getElementById("uninstall-copy");
+    if (uninstallBtn) {
+      uninstallBtn.addEventListener("click", function () {
+        copyDesktopCommand(uninstallBtn, "Desktop uninstall command copied.");
       });
     }
 
@@ -3536,9 +3600,17 @@ function renderPortalHtml() {
           <div class="card-subtitle" style="margin-top:8px">
             <strong>iPhone / iPad:</strong> Safari only. Wait for <em>LIVE HANDSHAKE</em>, tap <strong>Install Apple L2TP</strong> → Allow → Settings → Profile Downloaded → Install. OpenVPN: tap <strong>Open in OpenVPN Connect</strong> (install that app first) — the profile is handed to the app, not opened as a page.<br>
             <strong>Android / OpenVPN:</strong> After handshake, tap <strong>Open in OpenVPN Connect</strong>. If the app is missing you will be offered Play Store, then share/download.<br>
-            <strong>Linux, Windows 11 &amp; macOS:</strong> tap the command to copy, then run it in a terminal.
+            <strong>Linux &amp; Windows 11:</strong> Linux command is shown by default. Windows devices switch automatically. Tap a command to copy.
           </div>
-          <button type="button" class="code-copy" id="install-copy" title="Tap to copy">curl -fsSL https://raw.githubusercontent.com/warmaster726/vpngate-connect/main/install-vpngate.sh | sh</button>
+          <div class="pill-row" id="install-os-pills" style="margin-top:8px">
+            <button type="button" class="chip active" data-install-os="linux">Linux</button>
+            <button type="button" class="chip" data-install-os="windows">Windows</button>
+          </div>
+          <div class="card-subtitle" id="install-os-hint" style="margin-top:8px">Linux / macOS · POSIX sh</div>
+          <div class="code-copy-label">Install · tap to copy</div>
+          <button type="button" class="code-copy" id="install-copy" title="Tap to copy">curl -fsSL https://raw.githubusercontent.com/warmaster726/vpngate-connect/main/install-vpngate.sh | sh -s --</button>
+          <div class="code-copy-label">Uninstall · same one-liner + --uninstall</div>
+          <button type="button" class="code-copy" id="uninstall-copy" title="Tap to copy">curl -fsSL https://raw.githubusercontent.com/warmaster726/vpngate-connect/main/install-vpngate.sh | sh -s -- --uninstall</button>
         </details>
       </div>
 
