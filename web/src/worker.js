@@ -14,7 +14,7 @@ import { connect } from "cloudflare:sockets";
  *  - Completely isolated from root `Cargo.toml`, `Cargo.lock`, and desktop installer scripts.
  */
 
-const APP_VERSION = "0.2.13";
+const APP_VERSION = "0.2.14";
 const POOL_CACHE_TTL_MS = 180_000;
 const POOL_CACHE_KEY_URL = "https://vpngate-edge-cache.internal/v1/pool-snapshot";
 const VERIFY_MEM_CACHE_URL = "https://vpngate-edge-cache.internal/v1/verify-memory";
@@ -1926,9 +1926,9 @@ a { color: var(--cyan); text-decoration: none; }
   width: 38px; height: 38px; border-radius: 11px; flex-shrink: 0;
   background: linear-gradient(160deg, rgba(56,189,248,0.28), rgba(16,185,129,0.16));
   border: 1px solid rgba(56,189,248,0.42);
-  display: grid; place-items: center; font-family: var(--mono); font-weight: 800; color: var(--cyan);
-  letter-spacing: -0.04em;
+  display: grid; place-items: center;
 }
+.brand-icon svg { width: 22px; height: 22px; display: block; }
 .brand-title { font-weight: 700; font-size: 15.5px; letter-spacing: -0.02em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .brand-sub { font-size: 11px; color: var(--muted); font-family: var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 52vw; }
 @media (max-width: 420px) { .brand-sub { display: none; } }
@@ -3772,7 +3772,13 @@ function renderPortalHtml() {
   <div class="app-shell">
     <header class="topbar">
       <div class="brand">
-        <div class="brand-icon">VG</div>
+        <div class="brand-icon" aria-hidden="true" title="VPN Gate Connect">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none">
+            <path d="M6.5 27.5V11.2L16 5.5l9.5 5.7v16.3" stroke="#38BDF8" stroke-width="2.3" stroke-linejoin="round" stroke-linecap="round"/>
+            <path d="M12 27.5V14.4L16 12l4 2.4v13.1" stroke="#34D399" stroke-width="2.1" stroke-linejoin="round" stroke-linecap="round"/>
+            <circle cx="16" cy="18" r="2.35" fill="#7DD3FC"/>
+          </svg>
+        </div>
         <div>
           <div class="brand-title">VPN Gate Connect</div>
           <div class="brand-sub" id="detected-device">Cloudflare Edge Profile Console</div>
@@ -4175,7 +4181,7 @@ export default {
       return jsonResponse(
         {
           name: "VPN Gate Connect",
-          short_name: "VPNGate",
+          short_name: "VPN Gate",
           start_url: "/",
           display: "standalone",
           background_color: "#070B14",
@@ -4191,8 +4197,10 @@ export default {
       const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
         <rect width="128" height="128" rx="28" fill="#070B14"/>
         <rect x="8" y="8" width="112" height="112" rx="22" fill="#101827" stroke="#38BDF8" stroke-width="4"/>
-        <path d="M64 24L96 38V62C96 84 82 100 64 106C46 100 32 84 32 62V38L64 24Z" fill="rgba(56,189,248,0.16)" stroke="#34D399" stroke-width="5"/>
-        <text x="64" y="73" text-anchor="middle" font-family="monospace" font-weight="bold" font-size="30" fill="#E8EEF7">VG</text>
+        <path d="M30 100V44L64 24l34 20v56" fill="none" stroke="#38BDF8" stroke-width="7" stroke-linejoin="round" stroke-linecap="round"/>
+        <path d="M48 100V56L64 46l16 10v44" fill="none" stroke="#34D399" stroke-width="6.5" stroke-linejoin="round" stroke-linecap="round"/>
+        <circle cx="64" cy="68" r="9" fill="#38BDF8"/>
+        <circle cx="64" cy="68" r="4" fill="#E8EEF7"/>
       </svg>`;
       return new Response(svg, {
         headers: {
