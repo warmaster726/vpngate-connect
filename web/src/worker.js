@@ -14,7 +14,7 @@ import { connect } from "cloudflare:sockets";
  *  - Completely isolated from root `Cargo.toml`, `Cargo.lock`, and desktop installer scripts.
  */
 
-const APP_VERSION = "0.2.11";
+const APP_VERSION = "0.2.12";
 const POOL_CACHE_TTL_MS = 180_000;
 const POOL_CACHE_KEY_URL = "https://vpngate-edge-cache.internal/v1/pool-snapshot";
 const VERIFY_MEM_CACHE_URL = "https://vpngate-edge-cache.internal/v1/verify-memory";
@@ -2082,6 +2082,24 @@ button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible
 #verify-elapsed, #hero-hop-elapsed {
   color: var(--amber); font-variant-numeric: tabular-nums; font-weight: 700;
 }
+.hop-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px;
+}
+@media (max-width: 520px) { .hop-grid { grid-template-columns: 1fr; } }
+.hop-card {
+  background: var(--card-alt); border: 1px solid var(--border);
+  border-radius: 10px; padding: 10px 11px;
+}
+.hop-card.head { border-color: rgba(56,189,248,0.55); box-shadow: 0 0 0 1px rgba(56,189,248,0.18); }
+.hop-card.live { border-color: rgba(52,211,153,0.45); }
+.hop-card.partial { border-color: rgba(251,191,36,0.4); }
+.hop-card.dead { border-color: rgba(251,113,133,0.35); opacity: 0.88; }
+.hop-card-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
+.hop-card-title { font-size: 13px; font-weight: 700; color: #F8FAFC; line-height: 1.3; }
+.hop-slot { color: var(--muted); font-family: var(--mono); font-size: 11px; font-weight: 700; }
+.hop-card-host { font-family: var(--mono); font-size: 11.5px; color: var(--cyan); margin-top: 4px; overflow-wrap: anywhere; }
+.hop-card-meta { font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 4px; }
+.hop-elapsed { color: var(--amber); font-weight: 700; font-variant-numeric: tabular-nums; }
 
 .btn-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 .btn {
@@ -2221,7 +2239,9 @@ const PORTAL_JS = String.raw`
     walkStartedAt: 0,
     hopStartedAt: 0,
     walkSlot: 0,
-    walkTotal: 0
+    walkTotal: 0,
+    walkHops: [],
+    walkHeadJob: 0
   };
 
   function detectDevice() {
@@ -2639,6 +2659,11 @@ const PORTAL_JS = String.raw`
     var txt = document.getElementById("status-text");
     if (hopEl) hopEl.textContent = hop + " this hop · " + total + " total";
     if (hopStat) hopStat.textContent = hop;
+    var hopEls = document.querySelectorAll(".hop-elapsed");
+    for (var hi = 0; hi < hopEls.length; hi++) {
+      var started = Number(hopEls[hi].getAttribute("data-hop-start") || 0);
+      hopEls[hi].textContent = fmtElapsed(Date.now() - (started || Date.now()));
+    }
     if (txt && state.verifying && state.walkTotal) {
       var nFlight = 0;
       if (state.testingIps) {
@@ -2756,6 +2781,37 @@ const PORTAL_JS = String.raw`
     return (srv && srv.unlocked) || [];
   }
 
+  function hopStatusBadge(status) {
+    if (status === "live") return '<span class="badge badge-live">LIVE</span>';
+    if (status === "partial") return '<span class="badge badge-partial">PARTIAL</span>';
+    if (status === "dead") return '<span class="badge badge-err">DEAD</span>';
+    return '<span class="badge badge-wait">TESTING</span>';
+  }
+
+  function renderWalkHopsHtml() {
+    var hops = state.walkHops || [];
+    if (!state.verifying || !hops.length) return "";
+    var html = '<div class="hop-grid" aria-label="Parallel handshake hops">';
+    for (var i = 0; i < hops.length; i++) {
+      var h = hops[i];
+      var cls = "hop-card " + (h.status || "testing");
+      if (h.head) cls += " head";
+      var ping = (!h.ping_ms || h.ping_ms >= 9999) ? "—" : (h.ping_ms + " ms");
+      html += '<div class="' + cls + '">' +
+        '<div class="hop-card-top">' +
+          '<div class="hop-card-title">' + flagEmoji(h.country_short) + " " + esc(h.country_long || "Relay") +
+            ' <span class="hop-slot">[' + (h.index + 1) + "/" + state.walkTotal + "]</span></div>" +
+          hopStatusBadge(h.status) +
+        "</div>" +
+        '<div class="hop-card-host">' + esc(h.host) + " · " + esc(h.ip) + "</div>" +
+        '<div class="hop-card-meta">' + fmtMbps(h.speed_bps) + " · " + ping +
+          ' · <span class="hop-elapsed" data-hop-start="' + (h.startedAt || 0) + '">0.0s</span></div>' +
+      "</div>";
+    }
+    html += "</div>";
+    return html;
+  }
+
   function renderConnectHero() {
     var wrap = document.getElementById("hero-container");
     if (!wrap) return;
@@ -2795,7 +2851,8 @@ const PORTAL_JS = String.raw`
     if (state.verifying) {
       lockHtml = '<div class="progress-track"><div class="progress-fill"></div></div>' +
         '<div class="progress-label">' + esc(state.verifyLabel || "Testing live path") +
-        ' · <span id="verify-elapsed">0.0s this hop · 0.0s total</span></div>';
+        ' · <span id="verify-elapsed">0.0s this hop · 0.0s total</span></div>' +
+        renderWalkHopsHtml();
     } else if (anyLive && !someLocked) {
       lockHtml = '<div class="lock-note ok">Live path on ' +
         esc(srv.ip) + (state.verified && state.verified.port ? (":" + esc(state.verified.port)) : "") +
@@ -3178,6 +3235,7 @@ const PORTAL_JS = String.raw`
       state.verifying = false;
       state.testingIp = "";
       state.testingIps = {};
+      state.walkHops = [];
       state.verified = null;
       stopElapsedTicker();
       setStepper("fail");
@@ -3232,6 +3290,8 @@ const PORTAL_JS = String.raw`
     state.verified = null;
     state.attempts = [];
     state.testingIps = {};
+    state.walkHops = [];
+    state.walkHeadJob = 0;
     state.selectedIndex = start;
     state.testingIp = candidates[start] ? candidates[start].ip : "";
     state.walkSlot = start + 1;
@@ -3268,13 +3328,45 @@ const PORTAL_JS = String.raw`
       setStatusPill("syncing", (job.index + 1) + "/" + candidates.length + (nFlight > 1 ? (" · " + nFlight + " hops") : ""));
     }
 
+    function snapshotWalkWindow(headJobIdx) {
+      if (typeof headJobIdx !== "number") headJobIdx = state.walkHeadJob || 0;
+      var hops = [];
+      var until = Math.min(jobs.length, headJobIdx + parallel);
+      for (var h = headJobIdx; h < until; h++) {
+        var job = jobs[h];
+        var srv = job.cand;
+        var st = "testing";
+        if (settledMark[h]) {
+          if (srv.verify_state === "live") st = "live";
+          else if (srv.verify_state === "partial") st = "partial";
+          else st = "dead";
+        }
+        hops.push({
+          index: job.index,
+          ip: srv.ip,
+          host: hostLabel(srv),
+          country_short: srv.country_short,
+          country_long: srv.country_long,
+          speed_bps: srv.speed_bps,
+          ping_ms: srv.ping_ms,
+          status: st,
+          head: h === headJobIdx,
+          startedAt: hopStartAt[h] || Date.now()
+        });
+      }
+      state.walkHops = hops;
+      state.walkHeadJob = headJobIdx;
+    }
+
     function refreshTestingIps(headJobIdx) {
       var ips = {};
       for (var t = 0; t < jobs.length; t++) {
         if (pending[t] && !settledMark[t]) ips[jobs[t].cand.ip] = true;
       }
       state.testingIps = ips;
+      if (typeof headJobIdx !== "number") headJobIdx = state.walkHeadJob;
       if (typeof headJobIdx === "number" && jobs[headJobIdx]) paintHead(jobs[headJobIdx]);
+      snapshotWalkWindow(headJobIdx);
     }
 
     function launchJob(jobIdx) {
@@ -3293,7 +3385,9 @@ const PORTAL_JS = String.raw`
         if (gen === verifyGen && !parsed.aborted) {
           if (parsed.unlocked && parsed.unlocked.length) markServerState(job.cand.ip, parsed.rec);
           else markServerState(job.cand.ip, { ok: false, dead_until: parsed.rec.dead_until, locked: parsed.locked });
-          refreshTestingIps(undefined);
+          refreshTestingIps();
+          renderConnectHero();
+          paintElapsed();
           renderRelaysTab();
         }
         return parsed;
@@ -3355,6 +3449,7 @@ const PORTAL_JS = String.raw`
     state.verifying = false;
     state.testingIp = "";
     state.testingIps = {};
+    state.walkHops = [];
     stopElapsedTicker();
     if (winner) {
       state.selectedIndex = winner.index;
