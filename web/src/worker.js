@@ -14,7 +14,7 @@ import { connect } from "cloudflare:sockets";
  *  - Completely isolated from root `Cargo.toml`, `Cargo.lock`, and desktop installer scripts.
  */
 
-const APP_VERSION = "0.2.9";
+const APP_VERSION = "0.2.10";
 const POOL_CACHE_TTL_MS = 180_000;
 const POOL_CACHE_KEY_URL = "https://vpngate-edge-cache.internal/v1/pool-snapshot";
 const VERIFY_MEM_CACHE_URL = "https://vpngate-edge-cache.internal/v1/verify-memory";
@@ -2131,10 +2131,10 @@ button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible
   margin-top: 10px; font-family: var(--mono); font-size: 11px; color: var(--muted); font-weight: 700;
 }
 .code-copy {
-  display: block; width: 100%; text-align: left;
+  display: block; width: 100%; max-width: 100%; box-sizing: border-box; text-align: left;
   background: var(--console); border: 1px solid var(--border); border-radius: 9px;
   padding: 10px 11px; font-family: var(--mono); font-size: 12px; color: var(--cyan);
-  overflow-x: auto; white-space: nowrap; margin-top: 6px; cursor: pointer;
+  overflow-wrap: anywhere; word-break: break-word; white-space: pre-wrap; margin-top: 6px; cursor: pointer;
 }
 .code-copy:hover { border-color: var(--cyan); }
 .inline-row { display: flex; gap: 8px; align-items: stretch; }
@@ -2246,7 +2246,7 @@ const PORTAL_JS = String.raw`
     windows: {
       hint: "Windows 11 · Administrator PowerShell",
       install: "irm " + INSTALL_PS1 + " | iex",
-      uninstall: "& ([scriptblock]::Create((irm " + INSTALL_PS1 + "))) --uninstall"
+      uninstall: "irm " + INSTALL_PS1 + " -OutFile $env:TEMP\\install-vpngate.ps1; powershell -ExecutionPolicy Bypass -File $env:TEMP\\install-vpngate.ps1 --uninstall"
     }
   };
 
@@ -2265,10 +2265,12 @@ const PORTAL_JS = String.raw`
     if (installBtn) {
       installBtn.textContent = cmds.install;
       installBtn.setAttribute("data-cmd", cmds.install);
+      installBtn.setAttribute("title", cmds.install);
     }
     if (uninstallBtn) {
       uninstallBtn.textContent = cmds.uninstall;
       uninstallBtn.setAttribute("data-cmd", cmds.uninstall);
+      uninstallBtn.setAttribute("title", cmds.uninstall);
     }
     document.querySelectorAll("#install-os-pills .chip").forEach(function (c) {
       c.classList.toggle("active", c.getAttribute("data-install-os") === os);
