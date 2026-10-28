@@ -14,7 +14,7 @@ import { connect } from "cloudflare:sockets";
  *  - Completely isolated from root `Cargo.toml`, `Cargo.lock`, and desktop installer scripts.
  */
 
-const APP_VERSION = "0.2.10";
+const APP_VERSION = "0.2.11";
 const POOL_CACHE_TTL_MS = 180_000;
 const POOL_CACHE_KEY_URL = "https://vpngate-edge-cache.internal/v1/pool-snapshot";
 const VERIFY_MEM_CACHE_URL = "https://vpngate-edge-cache.internal/v1/verify-memory";
@@ -2191,6 +2191,7 @@ const PORTAL_JS = String.raw`
   "use strict";
 
   var verifyGen = 0;
+  var walkAbort = null;
   var state = {
     tab: "connect",
     servers: [],
@@ -2211,6 +2212,7 @@ const PORTAL_JS = String.raw`
     device: detectDevice(),
     verifying: false,
     testingIp: "",
+    testingIps: {},
     verifyLabel: "",
     verified: null,
     attempts: [],
@@ -2638,7 +2640,14 @@ const PORTAL_JS = String.raw`
     if (hopEl) hopEl.textContent = hop + " this hop · " + total + " total";
     if (hopStat) hopStat.textContent = hop;
     if (txt && state.verifying && state.walkTotal) {
-      txt.textContent = state.walkSlot + "/" + state.walkTotal + " · " + hop;
+      var nFlight = 0;
+      if (state.testingIps) {
+        for (var ipk in state.testingIps) {
+          if (state.testingIps[ipk]) nFlight += 1;
+        }
+      }
+      txt.textContent = state.walkSlot + "/" + state.walkTotal + " · " + hop +
+        (nFlight > 1 ? (" · " + nFlight + " hops") : "");
     }
   }
 
@@ -2657,7 +2666,7 @@ const PORTAL_JS = String.raw`
 
   function renderBadges(srv) {
     var out = "";
-    if (state.verifying && state.testingIp === srv.ip) {
+    if (state.verifying && (state.testingIp === srv.ip || (state.testingIps && state.testingIps[srv.ip]))) {
       out += '<span class="badge badge-wait">TESTING</span>';
     } else if (srv.verify_state === "live") {
       out += '<span class="badge badge-live">LIVE HANDSHAKE</span>';
@@ -3054,17 +3063,80 @@ const PORTAL_JS = String.raw`
     }
   }
 
-  async function handshakeOne(srv, force) {
+  function isAbortErr(e) {
+    if (!e) return false;
+    if (e.name === "AbortError") return true;
+    return /abort/i.test(String(e.message || e));
+  }
+
+  function countTestingIps() {
+    var n = 0;
+    if (!state.testingIps) return 0;
+    for (var k in state.testingIps) {
+      if (state.testingIps[k]) n += 1;
+    }
+    return n;
+  }
+
+  function normalizeVerifyResult(data, cand, err) {
+    if (err) {
+      return {
+        rec: { ok: false },
+        unlocked: [],
+        locked: [],
+        attempt: { ip: cand.ip, ok: false, error: err && err.message ? err.message : String(err) },
+        errorMsg: err && err.message ? err.message : String(err),
+        aborted: isAbortErr(err)
+      };
+    }
+    var attempt = data && Array.isArray(data.attempts) && data.attempts[0] ? data.attempts[0] : null;
+    var unlocked = [];
+    var locked = [];
+    if (data && data.verified && Array.isArray(data.verified.unlocked)) unlocked = data.verified.unlocked;
+    else if (attempt && Array.isArray(attempt.unlocked)) unlocked = attempt.unlocked;
+    if (data && data.verified && Array.isArray(data.verified.locked)) locked = data.verified.locked;
+    else if (attempt && Array.isArray(attempt.locked)) locked = attempt.locked;
+    var rec = {
+      ok: unlocked.length > 0,
+      port: data && data.verified ? data.verified.port : (attempt && attempt.port),
+      rtt_ms: data && data.verified ? data.verified.rtt_ms : (attempt && attempt.rtt_ms),
+      unlocked: unlocked,
+      locked: locked,
+      dead_until: attempt && attempt.dead_until
+    };
+    return {
+      rec: rec,
+      unlocked: unlocked,
+      locked: locked,
+      attempt: attempt,
+      aborted: false,
+      payload: (data && data.verified) || {
+        ip: cand.ip,
+        unlocked: unlocked,
+        locked: locked,
+        port: rec.port,
+        rtt_ms: rec.rtt_ms
+      }
+    };
+  }
+
+  async function handshakeOne(srv, force, signal) {
     var qs = new URLSearchParams();
     qs.set("ip", srv.ip);
     if (force) qs.set("force", "1");
     var ctrl = new AbortController();
     var timer = setTimeout(function () { ctrl.abort(); }, ${VERIFY_CLIENT_ABORT_MS});
+    function onWalkAbort() { ctrl.abort(); }
+    if (signal) {
+      if (signal.aborted) ctrl.abort();
+      else signal.addEventListener("abort", onWalkAbort);
+    }
     try {
       var resp = await fetch("/api/verify?" + qs.toString(), { signal: ctrl.signal });
       return await resp.json();
     } finally {
       clearTimeout(timer);
+      if (signal) signal.removeEventListener("abort", onWalkAbort);
     }
   }
 
@@ -3095,12 +3167,17 @@ const PORTAL_JS = String.raw`
   async function runRecursiveVerify(opts) {
     opts = opts || {};
     var gen = ++verifyGen;
+    if (walkAbort) walkAbort.abort();
+    walkAbort = new AbortController();
+    var signal = walkAbort.signal;
     var WALK_CAP = 24;
+    var WALK_PARALLEL = 4;
     var revealed = opts.ip ? revealIpInConnectList(opts.ip) : { candidates: getConnectCandidates(), index: -1 };
     var candidates = revealed.candidates;
     if (candidates.length === 0) {
       state.verifying = false;
       state.testingIp = "";
+      state.testingIps = {};
       state.verified = null;
       stopElapsedTicker();
       setStepper("fail");
@@ -3132,9 +3209,29 @@ const PORTAL_JS = String.raw`
       }
     }
 
+    var jobs = [];
+    for (var oi = 0; oi < order.length; oi++) {
+      var oiIdx = order[oi];
+      var oiCand = candidates[oiIdx];
+      var oiForce = Boolean(opts.force) || (opts.forceIp && oiCand.ip === opts.forceIp);
+      if (opts.skipIp && oiCand.ip === opts.skipIp) continue;
+      if (!oiForce && isPenalized(oiCand)) continue;
+      if (!oiForce && oiCand.verify_state && oiCand.verify_state !== "untested" && Array.isArray(oiCand.unlocked)
+        && !satisfiesProto(oiCand.unlocked, state.proto)) {
+        continue;
+      }
+      jobs.push({ index: oiIdx, cand: oiCand, forceThis: oiForce });
+      if (jobs.length >= WALK_CAP) {
+        appendLog("warn", "Walk cap (" + WALK_CAP + ") reached — remaining slots keep their listed numbers.");
+        break;
+      }
+    }
+
+    var parallel = single ? 1 : Math.min(WALK_PARALLEL, Math.max(1, jobs.length));
     state.verifying = true;
     state.verified = null;
     state.attempts = [];
+    state.testingIps = {};
     state.selectedIndex = start;
     state.testingIp = candidates[start] ? candidates[start].ip : "";
     state.walkSlot = start + 1;
@@ -3148,95 +3245,116 @@ const PORTAL_JS = String.raw`
     startElapsedTicker();
     appendLog("info", single
       ? ("Handshake on sort slot [" + (start + 1) + "/" + candidates.length + "]")
-      : ("Walking sort order from [" + (start + 1) + "/" + candidates.length + "] — up to 17.6s per hop (80% of desktop 22s)."));
+      : ("Walking sort order from [" + (start + 1) + "/" + candidates.length +
+        "] — " + parallel + " hops at once, 17.6s each (80% of desktop 22s). Slot numbers stay in listed order."));
 
     var winner = null;
     var probed = 0;
     var lastIdx = start;
-    for (var oi = 0; oi < order.length; oi++) {
-      if (gen !== verifyGen) return;
-      var i = order[oi];
-      var cand = candidates[i];
-      var forceThis = Boolean(opts.force) || (opts.forceIp && cand.ip === opts.forceIp);
-      if (opts.skipIp && cand.ip === opts.skipIp) continue;
-      if (!forceThis && isPenalized(cand)) continue;
-      if (!forceThis && cand.verify_state && cand.verify_state !== "untested" && Array.isArray(cand.unlocked)
-        && !satisfiesProto(cand.unlocked, state.proto)) {
-        continue;
-      }
-      if (probed >= WALK_CAP) {
-        appendLog("warn", "Walk cap (" + WALK_CAP + ") reached — remaining slots keep their listed numbers.");
-        break;
-      }
+    var pending = {};
+    var hopStartAt = {};
+    var settledMark = {};
 
-      lastIdx = i;
-      state.selectedIndex = i;
-      state.testingIp = cand.ip;
-      state.walkSlot = i + 1;
+    function paintHead(job) {
+      if (!job) return;
+      state.selectedIndex = job.index;
+      state.testingIp = job.cand.ip;
+      state.walkSlot = job.index + 1;
       state.walkTotal = candidates.length;
-      state.hopStartedAt = Date.now();
-      state.verifyLabel = "Testing [" + (i + 1) + "/" + candidates.length + "] " + cand.ip;
-      setStatusPill("syncing", (i + 1) + "/" + candidates.length);
+      if (hopStartAt[job._job]) state.hopStartedAt = hopStartAt[job._job];
+      else state.hopStartedAt = Date.now();
+      state.verifyLabel = "Testing [" + (job.index + 1) + "/" + candidates.length + "] " + job.cand.ip;
+      var nFlight = countTestingIps();
+      setStatusPill("syncing", (job.index + 1) + "/" + candidates.length + (nFlight > 1 ? (" · " + nFlight + " hops") : ""));
+    }
+
+    function refreshTestingIps(headJobIdx) {
+      var ips = {};
+      for (var t = 0; t < jobs.length; t++) {
+        if (pending[t] && !settledMark[t]) ips[jobs[t].cand.ip] = true;
+      }
+      state.testingIps = ips;
+      if (typeof headJobIdx === "number" && jobs[headJobIdx]) paintHead(jobs[headJobIdx]);
+    }
+
+    function launchJob(jobIdx) {
+      if (pending[jobIdx] || jobIdx >= jobs.length) return pending[jobIdx];
+      var job = jobs[jobIdx];
+      job._job = jobIdx;
+      hopStartAt[jobIdx] = Date.now();
+      probed += 1;
+      appendLog("info", "Handshake [" + (job.index + 1) + "/" + candidates.length + "] " + hostLabel(job.cand) + " · " + job.cand.ip);
+      pending[jobIdx] = handshakeOne(job.cand, job.forceThis, signal).then(function (data) {
+        return normalizeVerifyResult(data, job.cand, null);
+      }, function (e) {
+        return normalizeVerifyResult(null, job.cand, e);
+      }).then(function (parsed) {
+        settledMark[jobIdx] = true;
+        if (gen === verifyGen && !parsed.aborted) {
+          if (parsed.unlocked && parsed.unlocked.length) markServerState(job.cand.ip, parsed.rec);
+          else markServerState(job.cand.ip, { ok: false, dead_until: parsed.rec.dead_until, locked: parsed.locked });
+          refreshTestingIps(undefined);
+          renderRelaysTab();
+        }
+        return parsed;
+      });
+      return pending[jobIdx];
+    }
+
+    for (var commit = 0; commit < jobs.length; commit++) {
+      if (gen !== verifyGen) return;
+      for (var p = 0; p < parallel && (commit + p) < jobs.length; p++) launchJob(commit + p);
+      var head = jobs[commit];
+      lastIdx = head.index;
+      refreshTestingIps(commit);
       setStepper("handshake");
       renderConnectHero();
       paintElapsed();
-      appendLog("info", "Handshake [" + (i + 1) + "/" + candidates.length + "] " + hostLabel(cand) + " · " + cand.ip);
 
-      var data;
+      var parsed;
       try {
-        data = await handshakeOne(cand, forceThis);
+        parsed = await pending[commit];
       } catch (e) {
-        if (gen !== verifyGen) return;
-        markServerState(cand.ip, { ok: false });
-        state.attempts.push({ ip: cand.ip, ok: false, error: e && e.message ? e.message : String(e) });
-        appendLog("err", "Probe error [" + (i + 1) + "/" + candidates.length + "] " + cand.ip + " · " + (e && e.message ? e.message : String(e)) + " — 15m penalty, advancing.");
-        probed += 1;
-        continue;
+        parsed = normalizeVerifyResult(null, head.cand, e);
       }
       if (gen !== verifyGen) return;
-      probed += 1;
+      if (parsed && parsed.aborted) return;
 
-      var attempt = data && Array.isArray(data.attempts) && data.attempts[0] ? data.attempts[0] : null;
+      var unlocked = (parsed && parsed.unlocked) || [];
+      var rec = (parsed && parsed.rec) || { ok: false };
+      var attempt = parsed && parsed.attempt;
       if (attempt) state.attempts.push(attempt);
-      var unlocked = [];
-      var locked = [];
-      if (data && data.verified && Array.isArray(data.verified.unlocked)) unlocked = data.verified.unlocked;
-      else if (attempt && Array.isArray(attempt.unlocked)) unlocked = attempt.unlocked;
-      if (data && data.verified && Array.isArray(data.verified.locked)) locked = data.verified.locked;
-      else if (attempt && Array.isArray(attempt.locked)) locked = attempt.locked;
-      var rec = {
-        ok: unlocked.length > 0,
-        port: data && data.verified ? data.verified.port : (attempt && attempt.port),
-        rtt_ms: data && data.verified ? data.verified.rtt_ms : (attempt && attempt.rtt_ms),
-        unlocked: unlocked,
-        locked: locked,
-        dead_until: attempt && attempt.dead_until
-      };
+      else if (parsed && parsed.errorMsg) {
+        state.attempts.push({ ip: head.cand.ip, ok: false, error: parsed.errorMsg });
+      }
+
       if (satisfiesProto(unlocked, state.proto)) {
-        markServerState(cand.ip, rec);
-        appendLog("ok", "LIVE [" + (i + 1) + "/" + candidates.length + "] " + cand.ip +
+        markServerState(head.cand.ip, rec);
+        appendLog("ok", "LIVE [" + (head.index + 1) + "/" + candidates.length + "] " + head.cand.ip +
           " · " + unlocked.join("+").toUpperCase() +
           (rec.rtt_ms ? (" · " + rec.rtt_ms + " ms") : "") +
-          " · " + fmtElapsed(Date.now() - state.hopStartedAt));
-        winner = { index: i, payload: (data && data.verified) || { ip: cand.ip, unlocked: unlocked, locked: locked, port: rec.port, rtt_ms: rec.rtt_ms } };
+          " · " + fmtElapsed(Date.now() - (hopStartAt[commit] || state.hopStartedAt)));
+        winner = { index: head.index, payload: parsed.payload };
         break;
       }
       if (unlocked.length) {
-        markServerState(cand.ip, rec);
-        appendLog("warn", "Partial [" + (i + 1) + "/" + candidates.length + "] " + cand.ip +
+        markServerState(head.cand.ip, rec);
+        appendLog("warn", "Partial [" + (head.index + 1) + "/" + candidates.length + "] " + head.cand.ip +
           " · unlocked " + unlocked.join("+").toUpperCase() +
           " · selected protocol still locked · next slot");
         continue;
       }
-      markServerState(cand.ip, { ok: false, dead_until: rec.dead_until, locked: locked });
-      appendLog("warn", "Dead [" + (i + 1) + "/" + candidates.length + "] " + cand.ip +
-        (attempt && attempt.error ? " · " + attempt.error : "") +
+      markServerState(head.cand.ip, { ok: false, dead_until: rec.dead_until, locked: parsed.locked || [] });
+      appendLog("warn", "Dead [" + (head.index + 1) + "/" + candidates.length + "] " + head.cand.ip +
+        (attempt && attempt.error ? " · " + attempt.error : (parsed.errorMsg ? " · " + parsed.errorMsg : "")) +
         " · 15m pool penalty · next slot");
     }
 
+    if (walkAbort && walkAbort === signal) walkAbort.abort();
     if (gen !== verifyGen) return;
     state.verifying = false;
     state.testingIp = "";
+    state.testingIps = {};
     stopElapsedTicker();
     if (winner) {
       state.selectedIndex = winner.index;
