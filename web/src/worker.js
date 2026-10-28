@@ -14,7 +14,7 @@ import { connect } from "cloudflare:sockets";
  *  - Completely isolated from root `Cargo.toml`, `Cargo.lock`, and desktop installer scripts.
  */
 
-const APP_VERSION = "0.2.12";
+const APP_VERSION = "0.2.13";
 const POOL_CACHE_TTL_MS = 180_000;
 const POOL_CACHE_KEY_URL = "https://vpngate-edge-cache.internal/v1/pool-snapshot";
 const VERIFY_MEM_CACHE_URL = "https://vpngate-edge-cache.internal/v1/verify-memory";
@@ -2090,10 +2090,12 @@ button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible
   background: var(--card-alt); border: 1px solid var(--border);
   border-radius: 10px; padding: 10px 11px;
 }
-.hop-card.head { border-color: rgba(56,189,248,0.55); box-shadow: 0 0 0 1px rgba(56,189,248,0.18); }
 .hop-card.live { border-color: rgba(52,211,153,0.45); }
 .hop-card.partial { border-color: rgba(251,191,36,0.4); }
 .hop-card.dead { border-color: rgba(251,113,133,0.35); opacity: 0.88; }
+.hop-card.selectable { cursor: pointer; }
+.hop-card.selectable:hover { border-color: rgba(52,211,153,0.8); color: #fff; }
+.hop-hint { margin-top: 8px; font-family: var(--mono); font-size: 11px; color: var(--muted); }
 .hop-card-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
 .hop-card-title { font-size: 13px; font-weight: 700; color: #F8FAFC; line-height: 1.3; }
 .hop-slot { color: var(--muted); font-family: var(--mono); font-size: 11px; font-weight: 700; }
@@ -2788,16 +2790,50 @@ const PORTAL_JS = String.raw`
     return '<span class="badge badge-wait">TESTING</span>';
   }
 
+  function adoptWalkHop(ip) {
+    if (!state.verifying) return;
+    var hops = state.walkHops || [];
+    var hop = null;
+    for (var i = 0; i < hops.length; i++) {
+      if (hops[i].ip === ip) { hop = hops[i]; break; }
+    }
+    if (!hop || (hop.status !== "live" && hop.status !== "partial") || !hop.payload) return;
+    verifyGen += 1;
+    if (walkAbort) walkAbort.abort();
+    state.verifying = false;
+    state.testingIp = "";
+    state.testingIps = {};
+    state.walkHops = [];
+    stopElapsedTicker();
+    state.selectedIndex = hop.index;
+    state.verified = hop.payload;
+    markServerState(hop.ip, {
+      ok: true,
+      port: hop.payload.port,
+      rtt_ms: hop.payload.rtt_ms,
+      unlocked: hop.payload.unlocked || [],
+      locked: hop.payload.locked || []
+    });
+    setStepper("profile");
+    setStatusPill("", "LIVE · #" + (hop.index + 1));
+    appendLog("ok", "Selected listed slot [" + (hop.index + 1) + "/" + state.walkTotal + "] " + hop.ip +
+      " · walk stopped.");
+    renderConnectHero();
+    renderRelaysTab();
+  }
+
   function renderWalkHopsHtml() {
     var hops = state.walkHops || [];
     if (!state.verifying || !hops.length) return "";
-    var html = '<div class="hop-grid" aria-label="Parallel handshake hops">';
+    var html = '<div class="hop-grid" aria-label="Prefetch handshake hops">';
     for (var i = 0; i < hops.length; i++) {
       var h = hops[i];
+      var selectable = (h.status === "live" || h.status === "partial") && h.payload;
       var cls = "hop-card " + (h.status || "testing");
-      if (h.head) cls += " head";
+      if (selectable) cls += " selectable";
       var ping = (!h.ping_ms || h.ping_ms >= 9999) ? "—" : (h.ping_ms + " ms");
-      html += '<div class="' + cls + '">' +
+      html += '<div class="' + cls + '" data-walk-ip="' + esc(h.ip) + '" data-selectable="' + (selectable ? "1" : "0") + '"' +
+        (selectable ? ' role="button" tabindex="0" title="Use this live relay and stop scanning"' : "") + ">" +
         '<div class="hop-card-top">' +
           '<div class="hop-card-title">' + flagEmoji(h.country_short) + " " + esc(h.country_long || "Relay") +
             ' <span class="hop-slot">[' + (h.index + 1) + "/" + state.walkTotal + "]</span></div>" +
@@ -2809,6 +2845,7 @@ const PORTAL_JS = String.raw`
       "</div>";
     }
     html += "</div>";
+    html += '<div class="hop-hint">Four prefetch hops — not the hero above. Tap LIVE to use that listed slot and stop the scan.</div>';
     return html;
   }
 
@@ -2919,6 +2956,14 @@ const PORTAL_JS = String.raw`
     "</div>";
 
     wrap.innerHTML = html;
+    var hopGrid = wrap.querySelector(".hop-grid");
+    if (hopGrid) {
+      hopGrid.addEventListener("click", function (e) {
+        var card = e.target.closest("[data-walk-ip]");
+        if (!card || card.getAttribute("data-selectable") !== "1") return;
+        adoptWalkHop(card.getAttribute("data-walk-ip"));
+      });
+    }
     var vBtn = document.getElementById("btn-verify-now");
     if (vBtn) {
       vBtn.disabled = state.verifying;
@@ -3228,7 +3273,8 @@ const PORTAL_JS = String.raw`
     walkAbort = new AbortController();
     var signal = walkAbort.signal;
     var WALK_CAP = 24;
-    var WALK_PARALLEL = 4;
+    var WALK_PARALLEL = 5;
+    var WALK_BOXES = 4;
     var revealed = opts.ip ? revealIpInConnectList(opts.ip) : { candidates: getConnectCandidates(), index: -1 };
     var candidates = revealed.candidates;
     if (candidates.length === 0) {
@@ -3306,7 +3352,7 @@ const PORTAL_JS = String.raw`
     appendLog("info", single
       ? ("Handshake on sort slot [" + (start + 1) + "/" + candidates.length + "]")
       : ("Walking sort order from [" + (start + 1) + "/" + candidates.length +
-        "] — " + parallel + " hops at once, 17.6s each (80% of desktop 22s). Slot numbers stay in listed order."));
+        "] — 1 hero + " + WALK_BOXES + " prefetch hops, 17.6s each. Slot numbers stay in listed order."));
 
     var winner = null;
     var probed = 0;
@@ -3314,6 +3360,7 @@ const PORTAL_JS = String.raw`
     var pending = {};
     var hopStartAt = {};
     var settledMark = {};
+    var jobPayloads = {};
 
     function paintHead(job) {
       if (!job) return;
@@ -3331,8 +3378,9 @@ const PORTAL_JS = String.raw`
     function snapshotWalkWindow(headJobIdx) {
       if (typeof headJobIdx !== "number") headJobIdx = state.walkHeadJob || 0;
       var hops = [];
-      var until = Math.min(jobs.length, headJobIdx + parallel);
-      for (var h = headJobIdx; h < until; h++) {
+      var from = headJobIdx + 1;
+      var until = Math.min(jobs.length, from + WALK_BOXES);
+      for (var h = from; h < until; h++) {
         var job = jobs[h];
         var srv = job.cand;
         var st = "testing";
@@ -3350,7 +3398,7 @@ const PORTAL_JS = String.raw`
           speed_bps: srv.speed_bps,
           ping_ms: srv.ping_ms,
           status: st,
-          head: h === headJobIdx,
+          payload: jobPayloads[h] || null,
           startedAt: hopStartAt[h] || Date.now()
         });
       }
@@ -3383,6 +3431,7 @@ const PORTAL_JS = String.raw`
       }).then(function (parsed) {
         settledMark[jobIdx] = true;
         if (gen === verifyGen && !parsed.aborted) {
+          if (parsed.payload) jobPayloads[jobIdx] = parsed.payload;
           if (parsed.unlocked && parsed.unlocked.length) markServerState(job.cand.ip, parsed.rec);
           else markServerState(job.cand.ip, { ok: false, dead_until: parsed.rec.dead_until, locked: parsed.locked });
           refreshTestingIps();
