@@ -41,6 +41,8 @@ Censorship-resilient **SoftEther VPN Gate** desktop client engineered around a *
 curl -fsSL https://raw.githubusercontent.com/warmaster726/vpngate-connect/main/install-vpngate.sh | sh
 ```
 
+If a Rust toolchain or C linker must be downloaded to compile from source, the installer **asks whether to keep those compile tools** or **remove them after `vpngate` is built**. Pre-existing toolchains are left untouched. Non-interactive runs remove tools this installer added; pass `--keep-toolchain` or `--remove-toolchain` to skip the prompt.
+
 **Or from a local `git clone`:**
 
 ```bash
@@ -64,6 +66,8 @@ sh ./install-vpngate.sh --uninstall
 ```powershell
 irm https://raw.githubusercontent.com/warmaster726/vpngate-connect/main/install-vpngate.ps1 | iex
 ```
+
+Same compile-tool prompt as Linux: keep or remove Rust / MinGW after `vpngate.exe` is built (`-KeepToolchain` / `-RemoveToolchain`).
 
 **Or from a local `git clone`:**
 - Double-click **`install-vpngate.cmd`** (auto-elevates via Windows UAC), or run `.\install-vpngate.ps1` in an elevated PowerShell window.

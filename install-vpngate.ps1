@@ -25,6 +25,8 @@ param(
 
     [switch]$KeepToolchain,
 
+    [switch]$RemoveToolchain,
+
     [string]$Repo = 'warmaster726/vpngate-connect',
 
     [switch]$RestoreNatTRule,
@@ -73,9 +75,15 @@ Options:
   --user-only                  Install/uninstall without Administrator (skips HKLM/Service/MSI steps)
   --skip-openvpn               Skip automatic OpenVPN Community winget installation if missing
   --install-openvpn            Explicitly install/repair OpenVPN Community via winget
-  --keep-toolchain             If Rust (`cargo.exe`) must be bootstrapped on a clean PC, keep `.rustup` & `.cargo`
+  --keep-toolchain             Keep compile tools (Rust toolchain and any MinGW gcc we install) after building vpngate.exe
+  --remove-toolchain           Remove compile tools after building vpngate.exe (default when there is no prompt)
   --repo <owner/repo>          GitHub repository slug when downloading source archive outside a checkout
   --help, -Help, -h            Show this help message and exit
+
+When Rust (cargo.exe) or MinGW gcc must be bootstrapped, an interactive install
+asks whether to keep those compile tools or delete them after vpngate.exe is built.
+Pre-existing toolchains are never removed. Non-interactive runs default to removing
+tools this installer added.
 "@
 }
 
@@ -92,8 +100,9 @@ if ($RemainingArgs) {
             '--user-only'       { $UserOnly = $true }
             '--install-openvpn' { $InstallOpenVPN = $true }
             '--skip-openvpn'    { $SkipOpenVPN = $true }
-            '--keep-toolchain'  { $KeepToolchain = $true }
-            '--repo'            { if ($idx + 1 -lt $RemainingArgs.Count) { $idx++; $Repo = $RemainingArgs[$idx] } }
+            '--keep-toolchain'    { $KeepToolchain = $true; $RemoveToolchain = $false }
+            '--remove-toolchain'  { $RemoveToolchain = $true; $KeepToolchain = $false }
+            '--repo'              { if ($idx + 1 -lt $RemainingArgs.Count) { $idx++; $Repo = $RemainingArgs[$idx] } }
             '--help'            { $Help = $true }
             '-h'                { $Help = $true }
             default {
@@ -136,9 +145,99 @@ if (-not $Uninstall) {
     Assert-NativeX64
 }
 
+function Test-HasMsvc {
+    if (Get-Command 'cl.exe' -ErrorAction SilentlyContinue) { return $true }
+    $VsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+    if (Test-Path -LiteralPath $VsWhere) {
+        $VsVc = & $VsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
+        if ($VsVc) { return $true }
+    }
+    return $false
+}
+
+function Find-HostGcc {
+    $cmd = Get-Command 'gcc.exe' -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    foreach ($candGccDir in @(
+        "$env:LOCALAPPDATA\Microsoft\WinGet\Packages",
+        'C:\msys64\ucrt64\bin',
+        'C:\msys64\mingw64\bin',
+        'C:\mingw64\bin'
+    )) {
+        if (Test-Path -LiteralPath $candGccDir) {
+            $foundGcc = Get-ChildItem -LiteralPath $candGccDir -Filter 'gcc.exe' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($foundGcc) { return $foundGcc.FullName }
+        }
+    }
+    return $null
+}
+
+function Resolve-CompileToolPolicy {
+    param([string[]]$Tools)
+    if ($KeepToolchain) { return 'keep' }
+    if ($RemoveToolchain) { return 'remove' }
+    $canPrompt = $false
+    try {
+        if ([Environment]::UserInteractive) {
+            $redirected = $false
+            try { $redirected = [Console]::IsInputRedirected } catch { $redirected = $false }
+            if (-not $redirected) { $canPrompt = $true }
+        }
+    } catch { $canPrompt = $false }
+    if (-not $canPrompt) {
+        Write-Info "No interactive terminal - compile tools will be removed after the build."
+        Write-Info "Re-run with --keep-toolchain to keep them, or --remove-toolchain to skip this notice."
+        return 'remove'
+    }
+    Write-Host ""
+    Write-Host "VPN Gate Connect compiles from source and needs to install:" -ForegroundColor Cyan
+    foreach ($t in $Tools) { Write-Host "  - $t" }
+    Write-Host ""
+    Write-Host "Keep these compile tools after VPN Gate Connect is installed?"
+    Write-Host "  [K] Keep them on this machine"
+    Write-Host "  [R] Remove them after compilation (default - only vpngate remains)"
+    $ans = Read-Host "Choice [R/k]"
+    if ($ans -match '^(k|keep|y|yes)$') {
+        Write-Ok "Will keep compile tools after VPN Gate Connect is built."
+        return 'keep'
+    }
+    Write-Ok "Will remove compile tools after VPN Gate Connect is built."
+    return 'remove'
+}
+
+
 $IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator
 )
+
+if (-not $Uninstall) {
+    $probeCargoBin = Join-Path $HOME '.cargo\bin'
+    if ((Test-Path -LiteralPath (Join-Path $probeCargoBin 'cargo.exe')) -and ($env:Path -notlike "*$probeCargoBin*")) {
+        $env:Path = "$probeCargoBin;$env:Path"
+    }
+    $srcProbe = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+    $willCompile = (Test-Path -LiteralPath (Join-Path $srcProbe 'Cargo.toml')) -or -not (Test-Path -LiteralPath (Join-Path $srcProbe 'vpngate.exe'))
+    $needRust = $false
+    $needMingw = $false
+    if ($willCompile) {
+        if (-not (Get-Command 'cargo.exe' -ErrorAction SilentlyContinue)) { $needRust = $true }
+        if (-not (Test-HasMsvc) -and -not (Find-HostGcc)) { $needMingw = $true }
+    }
+    if ($needRust -or $needMingw) {
+        $toolList = New-Object System.Collections.Generic.List[string]
+        if ($needRust) { [void]$toolList.Add('Rust toolchain (rustup, cargo, rustc) - used only to compile vpngate') }
+        if ($needMingw) { [void]$toolList.Add('C linker (MinGW-w64 gcc) - required when MSVC Build Tools are not installed') }
+        $policy = Resolve-CompileToolPolicy -Tools $toolList.ToArray()
+        if ($policy -eq 'keep') {
+            $KeepToolchain = $true
+            $RemoveToolchain = $false
+        } else {
+            $KeepToolchain = $false
+            $RemoveToolchain = $true
+        }
+    }
+}
+
 
 $LocalAppData   = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { Join-Path $HOME 'AppData\Local' }
 $InstallDir     = if ($TargetInstallDir -and $TargetInstallDir.Trim()) { $TargetInstallDir.Trim() } else { Join-Path $LocalAppData 'Programs\VPNGate' }
@@ -177,6 +276,7 @@ if ((-not $IsAdmin) -and (-not $UserOnly) -and (-not $ElevatedChild) -and $PSCom
     if ($InstallOpenVPN)  { $FwdArgs.Add('-InstallOpenVPN') }
     if ($SkipOpenVPN)     { $FwdArgs.Add('-SkipOpenVPN') }
     if ($KeepToolchain)   { $FwdArgs.Add('-KeepToolchain') }
+    if ($RemoveToolchain) { $FwdArgs.Add('-RemoveToolchain') }
     if ($Repo)            { $FwdArgs.Add('-Repo'); $FwdArgs.Add($Repo) }
 
     try {
@@ -342,6 +442,7 @@ $OrigRustupHome = $env:RUSTUP_HOME
 $OrigCargoHome = $env:CARGO_HOME
 $HadExistingCargo = $false
 $UsedEphemeralRustup = $false
+$script:InstalledWinLibs = $false
 
 New-Item -ItemType Directory -Path $TempInstallRoot -Force | Out-Null
 
@@ -374,16 +475,7 @@ try {
 
         # Detect whether Visual Studio C++ Build Tools (MSVC cl.exe/link.exe) are present;
         # if not, use lightweight MinGW-w64 (`x86_64-pc-windows-gnu`) so users never need a 6 GB Visual Studio install.
-        $HasMsvc = $false
-        if (Get-Command 'cl.exe' -ErrorAction SilentlyContinue) {
-            $HasMsvc = $true
-        } else {
-            $VsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-            if (Test-Path -LiteralPath $VsWhere) {
-                $VsVc = & $VsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
-                if ($VsVc) { $HasMsvc = $true }
-            }
-        }
+        $HasMsvc = [bool](Test-HasMsvc)
 
         $CargoCmd = Get-Command 'cargo.exe' -ErrorAction SilentlyContinue
         if ($CargoCmd) {
@@ -394,7 +486,7 @@ try {
             Invoke-WebRequest -Uri 'https://win.rustup.rs/x86_64' -UseBasicParsing -OutFile $RustupInit
 
             if ($KeepToolchain) {
-                Write-Info "Rust toolchain not found - installing minimal Rust ($DefaultHost) via rustup.rs (--keep-toolchain) ..."
+                Write-Info "Rust toolchain not found - installing minimal Rust ($DefaultHost) via rustup.rs (kept after install) ..."
                 & $RustupInit -y --profile minimal --default-host $DefaultHost
                 $ActiveCargoBinDir = $DefaultCargoBinDir
             } else {
@@ -403,7 +495,7 @@ try {
                 $env:CARGO_HOME  = Join-Path $TempInstallRoot 'cargo'
                 New-Item -ItemType Directory -Path $env:RUSTUP_HOME -Force | Out-Null
                 New-Item -ItemType Directory -Path $env:CARGO_HOME -Force | Out-Null
-                Write-Info "Rust toolchain not found - bootstrapping ephemeral minimal Rust ($DefaultHost, auto-removed after build) ..."
+                Write-Info "Rust toolchain not found - bootstrapping ephemeral minimal Rust ($DefaultHost, removed after compilation) ..."
                 & $RustupInit -y --profile minimal --no-modify-path --default-host $DefaultHost
                 $ActiveCargoBinDir = Join-Path $env:CARGO_HOME 'bin'
             }
@@ -439,28 +531,18 @@ try {
             $BinSource = Join-Path $EffectiveTargetDir 'x86_64-pc-windows-msvc\release\vpngate.exe'
         } else {
             # Ensure gcc.exe / MinGW-w64 is present for `x86_64-pc-windows-gnu` (`ring` C objects + linking)
-            if (-not (Get-Command 'gcc.exe' -ErrorAction SilentlyContinue)) {
-                foreach ($candGccDir in @(
-                    "$env:LOCALAPPDATA\Microsoft\WinGet\Packages",
-                    'C:\msys64\ucrt64\bin',
-                    'C:\msys64\mingw64\bin',
-                    'C:\mingw64\bin'
-                )) {
-                    if (Test-Path -LiteralPath $candGccDir) {
-                        $foundGcc = Get-ChildItem -LiteralPath $candGccDir -Filter 'gcc.exe' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-                        if ($foundGcc) {
-                            $env:Path = "$($foundGcc.DirectoryName);$env:Path"
-                            break
-                        }
-                    }
-                }
-            }
-            if (-not (Get-Command 'gcc.exe' -ErrorAction SilentlyContinue) -and (Get-Command 'winget.exe' -ErrorAction SilentlyContinue)) {
+            $foundGccPath = Find-HostGcc
+            if ($foundGccPath) {
+                $gccDir = Split-Path -Parent $foundGccPath
+                if ($env:Path -notlike "*$gccDir*") { $env:Path = "$gccDir;$env:Path" }
+            } elseif (Get-Command 'winget.exe' -ErrorAction SilentlyContinue) {
                 Write-Info "MSVC linker not present - installing lightweight MinGW-w64 ('gcc.exe') via winget ..."
                 & winget.exe install -e --id BrechtSanders.WinLibs.POSIX.UCRT --silent --accept-package-agreements --accept-source-agreements
-                $foundGcc = Get-ChildItem -LiteralPath "$env:LOCALAPPDATA\Microsoft\WinGet\Packages" -Filter 'gcc.exe' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-                if ($foundGcc) {
-                    $env:Path = "$($foundGcc.DirectoryName);$env:Path"
+                $script:InstalledWinLibs = $true
+                $foundGccPath = Find-HostGcc
+                if ($foundGccPath) {
+                    $gccDir = Split-Path -Parent $foundGccPath
+                    if ($env:Path -notlike "*$gccDir*") { $env:Path = "$gccDir;$env:Path" }
                 }
             }
             $RustupDir = Split-Path -Parent $CargoCmd.Source
@@ -486,6 +568,9 @@ try {
     Copy-Item -LiteralPath $BinSource -Destination $TargetExe -Force
     try { Unblock-File -LiteralPath $TargetExe -ErrorAction SilentlyContinue } catch {}
     Write-Ok "Installed native single-binary '$TargetExe'"
+    if ($KeepToolchain -and -not $HadExistingCargo) {
+        Write-Ok "Rust toolchain kept under $HOME\.cargo (as requested)."
+    }
 } finally {
     $env:RUSTUP_HOME = $OrigRustupHome
     $env:CARGO_HOME  = $OrigCargoHome
@@ -515,6 +600,16 @@ if ($PostCleanIssues.Count -eq 0) {
     Write-Ok "Post-install cleanup verified: temporary build & staging artifacts removed (Windows environment clean)."
 } else {
     Write-Warn "Post-install check noticed leftover temporary path(s): $($PostCleanIssues -join ', ')"
+}
+
+if ($RemoveToolchain -and $script:InstalledWinLibs -and (Test-Path -LiteralPath $TargetExe) -and (Get-Command 'winget.exe' -ErrorAction SilentlyContinue)) {
+    Write-Info "Removing MinGW-w64 (WinLibs) compile toolchain we installed ..."
+    try {
+        & winget.exe uninstall -e --id BrechtSanders.WinLibs.POSIX.UCRT --silent --accept-source-agreements
+        Write-Ok "MinGW-w64 compile toolchain removed. OpenVPN and other runtime components were kept."
+    } catch {
+        Write-Warn "Could not uninstall MinGW-w64 automatically ($($_.Exception.Message)). Remove it from Apps & features if desired."
+    }
 }
 
 # 2. Ensure %LOCALAPPDATA%\Programs\VPNGate is in User PATH

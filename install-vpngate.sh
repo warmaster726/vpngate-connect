@@ -17,6 +17,7 @@ MODE="install"
 PURGE_PACKAGES=0
 SKIP_DEPS=0
 KEEP_TOOLCHAIN=0
+TOOLCHAIN_POLICY=""
 REPO_SLUG="${VPNGATE_REPO:-warmaster726/vpngate-connect}"
 HOST_UNAME="$(uname -s 2>/dev/null || echo Linux)"
 HOST_MACHINE="$(uname -m 2>/dev/null || echo unknown)"
@@ -43,9 +44,15 @@ Options:
   --uninstall, -u      Disconnect active VPNs, remove binaries/launchers/caches, and verify zero residues
   --purge-packages     With --uninstall on Linux, also purge dedicated L2TP helper package (xl2tpd)
   --skip-apt           Skip system package installation step (alias: --skip-deps)
-  --keep-toolchain     If Rust (`cargo`) must be bootstrapped on a clean machine, keep `~/.rustup` & `~/.cargo` instead of auto-removing
+  --keep-toolchain     Keep compile tools (Rust toolchain and any C linker we install) after building `vpngate`
+  --remove-toolchain   Remove compile tools after building `vpngate` (default when there is no prompt)
   --repo <owner/repo>  GitHub repository slug when downloading source archive outside a local checkout
   --help, -h           Show this help message and exit
+
+When Rust (`cargo`) or a C linker (`gcc`) must be bootstrapped, an interactive
+install asks whether to keep those compile tools or delete them after `vpngate`
+is built. Pre-existing toolchains are never removed. Non-interactive runs
+default to removing tools this installer added.
 EOF
 }
 
@@ -64,6 +71,11 @@ while [ "$#" -gt 0 ]; do
       ;;
     --keep-toolchain)
       KEEP_TOOLCHAIN=1
+      TOOLCHAIN_POLICY="keep"
+      ;;
+    --remove-toolchain)
+      KEEP_TOOLCHAIN=0
+      TOOLCHAIN_POLICY="remove"
       ;;
     --repo)
       [ "$#" -gt 0 ] || { echo "[!] Missing value for --repo" >&2; exit 2; }
@@ -86,6 +98,57 @@ done
 info() { echo "[*] $*"; }
 ok()   { echo "[+] $*"; }
 warn() { echo "[!] $*"; }
+
+read_user_line() {
+  ans=""
+  if [ -t 0 ]; then
+    IFS= read -r ans || true
+  elif [ -e /dev/tty ] && [ -r /dev/tty ]; then
+    IFS= read -r ans </dev/tty || true
+  else
+    return 1
+  fi
+  REPLY_LINE="${ans}"
+  return 0
+}
+
+resolve_compile_tool_policy() {
+  tools_blob="$1"
+  if [ "${TOOLCHAIN_POLICY}" = "keep" ]; then
+    info "Compile tools will be kept after install (--keep-toolchain)."
+    return
+  fi
+  if [ "${TOOLCHAIN_POLICY}" = "remove" ]; then
+    info "Compile tools will be removed after compilation (--remove-toolchain)."
+    return
+  fi
+  echo ""
+  echo "VPN Gate Connect compiles from source and needs to install:${tools_blob}"
+  echo ""
+  echo "Keep these compile tools after VPN Gate Connect is installed?"
+  echo "  [K] Keep them on this machine"
+  echo "  [R] Remove them after compilation (default — only vpngate remains)"
+  printf "Choice [R/k]: "
+  REPLY_LINE=""
+  if read_user_line; then
+    echo ""
+    case "${REPLY_LINE}" in
+      [kK]|keep|Keep|KEEP|[yY]|yes|Yes)
+        TOOLCHAIN_POLICY="keep"
+        ok "Will keep compile tools after VPN Gate Connect is built."
+        ;;
+      *)
+        TOOLCHAIN_POLICY="remove"
+        ok "Will remove compile tools after VPN Gate Connect is built."
+        ;;
+    esac
+  else
+    echo "R"
+    TOOLCHAIN_POLICY="remove"
+    info "No interactive terminal — compile tools will be removed after the build."
+    info "Re-run with --keep-toolchain to keep them, or --remove-toolchain to skip this notice."
+  fi
+}
 
 require_native_x64() {
   case "${HOST_MACHINE}" in
@@ -430,6 +493,56 @@ fi
 # ==============================================================================
 # INSTALL / UPGRADE MODE (`sh ./install-vpngate.sh`)
 # ==============================================================================
+HAD_CC=0
+if command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1 || command -v clang >/dev/null 2>&1; then
+  HAD_CC=1
+fi
+HAD_CARGO=0
+if [ -n "${CALLER_CARGO_HOME}" ] && [ -x "${CALLER_CARGO_HOME}/bin/cargo" ]; then
+  HAD_CARGO=1
+elif [ -x "${TARGET_HOME}/.cargo/bin/cargo" ]; then
+  HAD_CARGO=1
+elif command -v cargo >/dev/null 2>&1; then
+  HAD_CARGO=1
+fi
+
+WILL_COMPILE=1
+if [ ! -f "${SCRIPT_DIR}/Cargo.toml" ] && [ -x "${SCRIPT_DIR}/vpngate" ]; then
+  WILL_COMPILE=0
+fi
+
+NEED_RUST=0
+NEED_CC_PKG=0
+if [ "${WILL_COMPILE}" -eq 1 ]; then
+  if [ "${HAD_CARGO}" -eq 0 ]; then
+    NEED_RUST=1
+  fi
+  if [ "${HAD_CC}" -eq 0 ] && [ "${SKIP_DEPS}" -eq 0 ] && [ "${HOST_UNAME}" != "Darwin" ]; then
+    NEED_CC_PKG=1
+  fi
+fi
+
+if [ "${NEED_RUST}" -eq 1 ] || [ "${NEED_CC_PKG}" -eq 1 ]; then
+  TOOLS_LIST=""
+  if [ "${NEED_RUST}" -eq 1 ]; then
+    TOOLS_LIST="${TOOLS_LIST}
+  - Rust toolchain (rustup, cargo, rustc) — used only to compile vpngate"
+  fi
+  if [ "${NEED_CC_PKG}" -eq 1 ]; then
+    TOOLS_LIST="${TOOLS_LIST}
+  - C linker (gcc) — required to link the desktop binary"
+  fi
+  resolve_compile_tool_policy "${TOOLS_LIST}"
+  if [ "${TOOLCHAIN_POLICY}" = "keep" ]; then
+    KEEP_TOOLCHAIN=1
+  else
+    KEEP_TOOLCHAIN=0
+    TOOLCHAIN_POLICY="remove"
+  fi
+fi
+
+INSTALLED_COMPILE_PKGS=""
+
 TMP_PARENT="/var/tmp"
 [ -d "${TMP_PARENT}" ] && [ -w "${TMP_PARENT}" ] || TMP_PARENT="/tmp"
 INSTALL_TMP_ROOT="$(mktemp -d "${TMP_PARENT}/vpngate-install.XXXXXX")"
@@ -452,11 +565,12 @@ else
   ok "Pre-install check clean: no legacy residues detected."
 fi
 
-# 1. Install OS tunnel, C linker (for local source build), & GNOME window dependencies
+# 1. Install OS tunnel runtime & GNOME window dependencies (not compile-only tools)
 if [ "${SKIP_DEPS}" -eq 0 ]; then
   if [ "${HOST_UNAME}" = "Darwin" ]; then
     if ! xcode-select -p >/dev/null 2>&1; then
       warn "Apple Command Line Tools ('cc' linker) not found. Launching 'xcode-select --install' ..."
+      warn "Command Line Tools stay on the Mac; this installer will not remove them."
       xcode-select --install || true
     fi
     if command -v brew >/dev/null 2>&1; then
@@ -464,7 +578,7 @@ if [ "${SKIP_DEPS}" -eq 0 ]; then
       sudo -u "${TARGET_USER}" brew list openvpn >/dev/null 2>&1 || sudo -u "${TARGET_USER}" brew install openvpn
     fi
   elif command -v apt-get >/dev/null 2>&1; then
-    info "Installing required OpenVPN, L2TP/PPP & C linker packages via apt-get ..."
+    info "Installing required OpenVPN, L2TP/PPP & runtime packages via apt-get ..."
     sudo apt-get update -qq </dev/null
     sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -o APT::Keep-Downloaded-Packages=false \
       openvpn \
@@ -473,9 +587,7 @@ if [ "${SKIP_DEPS}" -eq 0 ]; then
       iproute2 \
       curl \
       ca-certificates \
-      tar \
-      gcc \
-      libc6-dev </dev/null
+      tar </dev/null
     sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -o APT::Keep-Downloaded-Packages=false --no-install-recommends \
       python3 \
       python3-gi \
@@ -485,13 +597,40 @@ if [ "${SKIP_DEPS}" -eq 0 ]; then
       network-manager-openvpn-gnome \
       libnotify-bin </dev/null 2>/dev/null || true
   elif command -v dnf >/dev/null 2>&1; then
-    info "Installing required OpenVPN, L2TP/PPP & C linker packages via dnf ..."
-    sudo dnf install -y openvpn xl2tpd ppp iproute curl ca-certificates tar gcc glibc-devel python3 </dev/null
+    info "Installing required OpenVPN, L2TP/PPP & runtime packages via dnf ..."
+    sudo dnf install -y openvpn xl2tpd ppp iproute curl ca-certificates tar python3 </dev/null
     sudo dnf install -y NetworkManager-openvpn NetworkManager-openvpn-gnome libnotify python3-gobject gtk3 vte291 </dev/null 2>/dev/null || true
   elif command -v pacman >/dev/null 2>&1; then
-    info "Installing required OpenVPN, L2TP/PPP & C linker packages via pacman ..."
-    sudo pacman -Sy --needed --noconfirm openvpn xl2tpd ppp iproute2 curl ca-certificates tar gcc python </dev/null
+    info "Installing required OpenVPN, L2TP/PPP & runtime packages via pacman ..."
+    sudo pacman -Sy --needed --noconfirm openvpn xl2tpd ppp iproute2 curl ca-certificates tar python </dev/null
     sudo pacman -S --needed --noconfirm networkmanager-openvpn libnotify python-gobject gtk3 vte3 </dev/null 2>/dev/null || true
+  fi
+fi
+
+# 1b. Compile-only C linker — installed only if missing; removable after the build
+if [ "${NEED_CC_PKG}" -eq 1 ]; then
+  if command -v apt-get >/dev/null 2>&1; then
+    for cc_pkg in gcc libc6-dev; do
+      if ! dpkg-query -W -f='${Status}' "${cc_pkg}" 2>/dev/null | grep -q 'install ok installed'; then
+        INSTALLED_COMPILE_PKGS="${INSTALLED_COMPILE_PKGS} ${cc_pkg}"
+      fi
+    done
+    info "Installing compile-only C linker packages (gcc) ..."
+    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -o APT::Keep-Downloaded-Packages=false gcc libc6-dev </dev/null
+  elif command -v dnf >/dev/null 2>&1; then
+    for cc_pkg in gcc glibc-devel; do
+      if ! rpm -q "${cc_pkg}" >/dev/null 2>&1; then
+        INSTALLED_COMPILE_PKGS="${INSTALLED_COMPILE_PKGS} ${cc_pkg}"
+      fi
+    done
+    info "Installing compile-only C linker packages (gcc) ..."
+    sudo dnf install -y gcc glibc-devel </dev/null
+  elif command -v pacman >/dev/null 2>&1; then
+    if ! pacman -Q gcc >/dev/null 2>&1; then
+      INSTALLED_COMPILE_PKGS="${INSTALLED_COMPILE_PKGS} gcc"
+    fi
+    info "Installing compile-only C linker packages (gcc) ..."
+    sudo pacman -S --needed --noconfirm gcc </dev/null
   fi
 fi
 
@@ -543,7 +682,7 @@ if [ -f "${WORK_SRC_DIR}/Cargo.toml" ]; then
 
   if [ -z "${CARGO_BIN}" ]; then
     if [ "${KEEP_TOOLCHAIN}" -eq 1 ]; then
-      info "Rust toolchain ('cargo') not found — installing minimal stable rustup toolchain for ${TARGET_USER} (--keep-toolchain) ..."
+      info "Rust toolchain ('cargo') not found — installing minimal stable rustup toolchain for ${TARGET_USER} (kept after install) ..."
       if [ "$(id -u)" -eq 0 ] && [ "${TARGET_USER}" != "root" ]; then
         sudo -u "${TARGET_USER}" sh -c "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-host '${RUST_HOST_TRIPLE}'" </dev/null
       else
@@ -562,7 +701,7 @@ if [ -f "${WORK_SRC_DIR}/Cargo.toml" ]; then
       if [ "$(id -u)" -eq 0 ] && [ -n "${TARGET_UID}" ]; then
         chown -R "${TARGET_UID}:${TARGET_GID:-${TARGET_UID}}" "${BUILD_RUSTUP_HOME}" "${BUILD_CARGO_HOME}" 2>/dev/null || chown -R "${TARGET_USER}" "${BUILD_RUSTUP_HOME}" "${BUILD_CARGO_HOME}" 2>/dev/null || true
       fi
-      info "Rust toolchain ('cargo') not found — bootstrapping ephemeral minimal toolchain (auto-removed after build) ..."
+      info "Rust toolchain ('cargo') not found — bootstrapping ephemeral minimal toolchain (removed after compilation) ..."
       if [ "$(id -u)" -eq 0 ] && [ "${TARGET_USER}" != "root" ]; then
         sudo -u "${TARGET_USER}" env \
           RUSTUP_HOME="${BUILD_RUSTUP_HOME}" \
@@ -657,6 +796,27 @@ sudo mkdir -p /usr/local/bin
 sudo rm -f /usr/local/bin/vpngate
 info "Installing native binary to /usr/local/bin/vpngate ..."
 sudo install -m 0755 "${BIN_SRC}" /usr/local/bin/vpngate
+
+if [ "${TOOLCHAIN_POLICY}" = "remove" ] && [ -n "${INSTALLED_COMPILE_PKGS}" ]; then
+  info "Removing compile-only packages we installed:${INSTALLED_COMPILE_PKGS}"
+  # shellcheck disable=SC2086
+  if command -v apt-get >/dev/null 2>&1; then
+    sudo env DEBIAN_FRONTEND=noninteractive apt-get remove -y ${INSTALLED_COMPILE_PKGS} </dev/null 2>/dev/null || true
+    sudo env DEBIAN_FRONTEND=noninteractive apt-get autoremove -y </dev/null 2>/dev/null || true
+  elif command -v dnf >/dev/null 2>&1; then
+    sudo dnf remove -y ${INSTALLED_COMPILE_PKGS} </dev/null 2>/dev/null || true
+  elif command -v pacman >/dev/null 2>&1; then
+    sudo pacman -R --noconfirm ${INSTALLED_COMPILE_PKGS} </dev/null 2>/dev/null || true
+  fi
+  ok "Compile-only packages removed. Runtime VPN packages (OpenVPN, xl2tpd, …) were kept."
+elif [ "${TOOLCHAIN_POLICY}" = "keep" ]; then
+  if [ "${NEED_RUST}" -eq 1 ]; then
+    ok "Rust toolchain kept at ${TARGET_HOME}/.cargo (as requested)."
+  fi
+  if [ -n "${INSTALLED_COMPILE_PKGS}" ]; then
+    ok "C linker packages kept:${INSTALLED_COMPILE_PKGS}"
+  fi
+fi
 
 if [ "${HOST_UNAME}" = "Linux" ] && [ -f "${WORK_SRC_DIR}/vpngate-launcher.py" ]; then
   info "Installing GNOME GTK/VTE window launcher (/usr/local/bin/vpngate-launcher) ..."
