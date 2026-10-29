@@ -28,7 +28,7 @@ pub use country::{
     CountrySummary, lookup_country_long, normalize_country_pair, summarize_countries,
 };
 pub use desktop_tunnel::{
-    ConnectSessionConfig, GatewayInfo, NM_PROFILE_PREFIX, WIN_VPN_PROFILE_NAME,
+    ConnectSessionConfig, GatewayInfo, INTERRUPTED_EXIT, NM_PROFILE_PREFIX, WIN_VPN_PROFILE_NAME,
     cleanup_existing_vpn, cleanup_existing_vpn_with_progress, detect_host_os_label,
     engage_candidates, engage_candidates_with_progress, find_openvpn_bin, get_default_gateway,
     get_ppp_interfaces, get_running_monitor_pid, get_running_openvpn_pid, get_tun_interfaces,

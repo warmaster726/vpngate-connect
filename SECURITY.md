@@ -6,7 +6,7 @@ Security fixes are applied exclusively on the active **`main`** branch (Pure-Rus
 
 | Branch / Version | Status | Supported |
 | :--- | :--- | :--- |
-| **`main`** (Rust Workspace `0.1.x`) | Active | Yes |
+| **`main`** (Rust Workspace `0.2.x`) | Active | Yes |
 | **`PY`** (Legacy Python `v5.3`) | Inactive / Frozen Reference | No |
 
 ## Security Architecture Highlights

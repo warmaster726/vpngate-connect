@@ -25,6 +25,8 @@ use crate::server::{VpnServer, filter_by_country, filter_by_protocol, sort_serve
 
 pub const NM_PROFILE_PREFIX: &str = "vpngate-";
 pub const WIN_VPN_PROFILE_NAME: &str = "VPNGate-L2TP";
+/// Exit status when the user interrupts connect (`Ctrl+C`): rollback done, do not treat as a hard crash.
+pub const INTERRUPTED_EXIT: i32 = 130;
 const NFT_COMMENT_TAG: &str = "vpngate-l2tp";
 
 #[cfg(windows)]
@@ -848,6 +850,50 @@ fn stop_ikev1_daemon_and_xfrm(paths: &AppPaths) {
     let _ = fs::remove_file(&paths.ikev1_state);
 }
 
+/// Deletes leftover VPN Gate L2TP / OpenVPN profile files from the app cache.
+fn purge_cached_ovpn_files(paths: &AppPaths, quiet: bool, on_progress: &mut impl FnMut(ProgressEvent)) {
+    let Ok(rd) = fs::read_dir(&paths.cache_dir) else {
+        return;
+    };
+    for ent in rd.flatten() {
+        let name = ent.file_name();
+        let n = name.to_string_lossy();
+        let drop_it = n == "openvpn.log"
+            || (n.starts_with(NM_PROFILE_PREFIX) && (n.ends_with(".ovpn") || n.ends_with(".log")));
+        if drop_it {
+            if !quiet {
+                on_progress(ProgressEvent::Info(format!(
+                    "Removing leftover OpenVPN profile: {n}"
+                )));
+            }
+            let _ = fs::remove_file(ent.path());
+        }
+    }
+}
+
+/// Removes the Windows native L2TP connection object after rasdial disconnect.
+fn purge_windows_l2tp_profile(quiet: bool, on_progress: &mut impl FnMut(ProgressEvent)) {
+    if !cfg!(target_os = "windows") {
+        return;
+    }
+    if !quiet {
+        on_progress(ProgressEvent::Info(format!(
+            "Removing Windows L2TP profile '{WIN_VPN_PROFILE_NAME}' ..."
+        )));
+    }
+    let ps = format!(
+        "foreach ($scope in @($false, $true)) {{ \
+           Get-VpnConnection -Name '{WIN_VPN_PROFILE_NAME}' -AllUserConnection:$scope -ErrorAction SilentlyContinue \
+             | Remove-VpnConnection -Force -ErrorAction SilentlyContinue \
+         }}"
+    );
+    let _ = quiet_cmd("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 /// Tears down any active or partial VPN session silently.
 pub fn cleanup_existing_vpn(paths: &AppPaths, full_teardown: bool, stop_monitor: bool) {
     cleanup_existing_vpn_with_progress(paths, full_teardown, stop_monitor, true, |_| {});
@@ -895,6 +941,7 @@ pub fn cleanup_existing_vpn_with_progress(
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+        purge_windows_l2tp_profile(quiet, &mut on_progress);
         if let Some(rt) = read_json_opt::<PinnedRouteRecord>(&paths.l2tp_route) {
             let _ = quiet_cmd("route")
                 .args(["delete", &rt.server_ip])
@@ -903,6 +950,7 @@ pub fn cleanup_existing_vpn_with_progress(
                 .status();
             let _ = fs::remove_file(&paths.l2tp_route);
         }
+        purge_cached_ovpn_files(paths, quiet, &mut on_progress);
         return;
     }
 
@@ -950,6 +998,7 @@ pub fn cleanup_existing_vpn_with_progress(
         std::thread::sleep(Duration::from_millis(400));
     }
     let _ = fs::remove_file(&paths.ovpn_pid);
+    purge_cached_ovpn_files(paths, quiet, &mut on_progress);
 
     if is_root_or_admin() {
         if paths.l2tp_resolv_bak.exists() {
@@ -1790,6 +1839,9 @@ pub async fn engage_candidates(
 
 /// Attempts connection across ranked `candidates` following `L2TP/IPsec -> OVPN UDP -> OVPN TCP`
 /// with rich `ProgressEvent` reporting (`PY` branch parity).
+///
+/// `Ctrl+C` rolls back L2TP/OpenVPN residue and returns [`INTERRUPTED_EXIT`] instead of
+/// aborting the process (interactive console returns to the main menu).
 pub async fn engage_candidates_with_progress(
     paths: &AppPaths,
     candidates: &[VpnServer],
@@ -1799,7 +1851,36 @@ pub async fn engage_candidates_with_progress(
     if candidates.is_empty() {
         return 1;
     }
+    if cfg.in_monitor {
+        return engage_candidates_body(paths, candidates, cfg, on_progress).await;
+    }
+    let outcome = tokio::select! {
+        biased;
+        _ = tokio::signal::ctrl_c() => None,
+        rc = engage_candidates_body(paths, candidates, cfg, &mut on_progress) => Some(rc),
+    };
+    match outcome {
+        Some(rc) => rc,
+        None => {
+            on_progress(ProgressEvent::ClearTransient);
+            on_progress(ProgressEvent::Warn(
+                "Interrupted (Ctrl+C) — rolling back VPN Gate L2TP/OpenVPN changes ...".to_string(),
+            ));
+            cleanup_existing_vpn_with_progress(paths, true, true, false, &mut on_progress);
+            on_progress(ProgressEvent::Ok(
+                "Rolled back routes, DNS, firewall, and VPN Gate L2TP/OpenVPN profiles.".to_string(),
+            ));
+            INTERRUPTED_EXIT
+        }
+    }
+}
 
+async fn engage_candidates_body(
+    paths: &AppPaths,
+    candidates: &[VpnServer],
+    cfg: &ConnectSessionConfig,
+    mut on_progress: impl FnMut(ProgressEvent),
+) -> i32 {
     cleanup_existing_vpn(paths, false, !cfg.in_monitor);
 
     // Check pre-VPN public IP with live spinner

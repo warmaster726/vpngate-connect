@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::fs;
-use std::io;
+use std::io::{self, IsTerminal};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use vpngate_core::{
     ActiveSessionState, AppPaths, ConnectSessionConfig, CountrySummary, DiscoveryClient,
-    DiscoveryOptions, Ikev1StateInfo, MONITOR_INTERVAL_SECONDS, NM_PROFILE_PREFIX,
+    DiscoveryOptions, INTERRUPTED_EXIT, Ikev1StateInfo, MONITOR_INTERVAL_SECONDS, NM_PROFILE_PREFIX,
     OfficialMirrorSite, ProgressEvent, ProtocolFilter, ServerCacheFile, SortBy, VpnServer,
     cleanup_existing_vpn_with_progress, detect_host_os_label, engage_candidates_with_progress,
     filter_by_country, filter_by_protocol, find_openvpn_bin, get_default_gateway,
@@ -690,18 +690,23 @@ pub async fn cmd_connect(paths: &AppPaths, args: &ConnectArgs) -> io::Result<i32
 
     clear_screen_if_tty();
     let extra = parse_custom_mirrors(&args.custom_mirrors);
-    let servers = match get_servers_cached_with_progress(
-        paths,
-        args.force_refresh,
-        &extra,
-        render_progress_event,
-    )
-    .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            err(&format!("Failed fetching VPN Gate server pool: {e}"));
-            return Ok(1);
+    let servers = tokio::select! {
+        biased;
+        _ = tokio::signal::ctrl_c() => {
+            warn("Interrupted — returning without connecting.");
+            return Ok(INTERRUPTED_EXIT);
+        }
+        res = get_servers_cached_with_progress(
+            paths,
+            args.force_refresh,
+            &extra,
+            render_progress_event,
+        ) => match res {
+            Ok(s) => s,
+            Err(e) => {
+                err(&format!("Failed fetching VPN Gate server pool: {e}"));
+                return Ok(1);
+            }
         }
     };
     let mut candidates = filter_by_country(
@@ -751,6 +756,10 @@ pub async fn cmd_connect(paths: &AppPaths, args: &ConnectArgs) -> io::Result<i32
     ));
 
     let rc = engage_candidates_with_progress(paths, &candidates, &cfg, render_progress_event).await;
+    if rc == INTERRUPTED_EXIT {
+        warn("Connection interrupted. VPN Gate L2TP and OpenVPN profile residue was removed.");
+        return Ok(INTERRUPTED_EXIT);
+    }
     if rc == 0
         && let Some(st) = read_json_opt::<ActiveSessionState>(&paths.active_state)
     {
@@ -778,7 +787,7 @@ pub async fn cmd_disconnect(paths: &AppPaths) -> io::Result<i32> {
         }
         let rc = elevate_self(paths, &sub);
         if cfg!(windows) && rc == 0 {
-            ok("Disconnected from VPN Gate and restored routes, DNS, firewall, and host network settings.");
+            ok("Disconnected from VPN Gate, removed L2TP/OpenVPN profiles, and restored routes, DNS, and firewall.");
             if let Some(trace) = trace_public_ip_with_spinner(
                 "Verifying restored host public egress IP",
                 Duration::from_secs(5),
@@ -792,9 +801,9 @@ pub async fn cmd_disconnect(paths: &AppPaths) -> io::Result<i32> {
     }
 
     clear_screen_if_tty();
-    info("Tearing down active VPN tunnel and restoring host networking ...");
+    info("Tearing down active VPN tunnel and removing VPN Gate L2TP/OpenVPN profile residue ...");
     cleanup_existing_vpn_with_progress(paths, true, true, false, render_progress_event);
-    ok("Disconnected from VPN Gate and restored routes, DNS, firewall, and host network settings.");
+    ok("Disconnected from VPN Gate, removed L2TP/OpenVPN profiles, and restored routes, DNS, and firewall.");
     if let Some(trace) = trace_public_ip_with_spinner(
         "Verifying restored host public egress IP",
         Duration::from_secs(5),
@@ -1601,6 +1610,13 @@ fn local_pool_summary_line(paths: &AppPaths) -> String {
     }
 }
 
+fn pause_for_dashboard(rc: i32) {
+    if rc == INTERRUPTED_EXIT {
+        return;
+    }
+    let _ = prompt_input("\nPress Enter to return to Dashboard...");
+}
+
 pub async fn interactive_menu(paths: &AppPaths, help_text: &str) -> io::Result<i32> {
     let os_label = detect_host_os_label();
 
@@ -1712,6 +1728,10 @@ pub async fn interactive_menu(paths: &AppPaths, help_text: &str) -> io::Result<i
 
         let Some(choice) = prompt_input(&format!("\nSelect an action {BOLD}[0-9]{RESET}: ")) else {
             print_line("");
+            if io::stdin().is_terminal() {
+                warn("Interrupted — still at the main menu.");
+                continue;
+            }
             return Ok(0);
         };
 
@@ -1749,8 +1769,8 @@ pub async fn interactive_menu(paths: &AppPaths, help_text: &str) -> io::Result<i
                     auto_reconnect_override: None,
                     custom_mirrors: Vec::new(),
                 };
-                let _ = cmd_connect(paths, &cargs).await?;
-                let _ = prompt_input("\nPress Enter to return to Dashboard...");
+                let rc = cmd_connect(paths, &cargs).await?;
+                pause_for_dashboard(rc);
             }
             "2" => {
                 clear_screen_if_tty();
@@ -1815,8 +1835,8 @@ pub async fn interactive_menu(paths: &AppPaths, help_text: &str) -> io::Result<i
                     auto_reconnect_override: None,
                     custom_mirrors: Vec::new(),
                 };
-                let _ = cmd_connect(paths, &cargs).await?;
-                let _ = prompt_input("\nPress Enter to return to Dashboard...");
+                let rc = cmd_connect(paths, &cargs).await?;
+                pause_for_dashboard(rc);
             }
             "3" => {
                 let Some(proto) = prompt_protocol(true)? else {
