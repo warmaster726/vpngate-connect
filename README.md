@@ -112,7 +112,10 @@ vpngate status                 # Check live tunnel, kernel XFRM SA, watchdog & C
 vpngate watchdog on            # Arm 15s background Auto-Reconnect Watchdog
 vpngate doctor                 # Run IKEv1 crypto, L2TP/XFRM, OpenVPN & gateway diagnostics
 vpngate disconnect             # Tear down active VPN and restore host routes, DNS & firewall
+vpngate upgrade                # Scan public main for a newer desktop (no GitHub login) and replace this install
 ```
+
+The interactive `[0-9]` dashboard also scans for a newer desktop over anonymous HTTPS (`raw.githubusercontent.com` and jsDelivr — no GitHub account or 2FA). If a newer version is found you are encouraged to install it; confirming runs the public installer, which disconnects any tunnel, deletes the previous `vpngate` binary, and installs the new one. Use `--no-update-check` to skip the dashboard scan, or `vpngate upgrade -y` to install without a second prompt.
 
 ---
 

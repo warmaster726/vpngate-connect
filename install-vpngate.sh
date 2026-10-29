@@ -796,6 +796,12 @@ sudo mkdir -p /usr/local/bin
 sudo rm -f /usr/local/bin/vpngate
 info "Installing native binary to /usr/local/bin/vpngate ..."
 sudo install -m 0755 "${BIN_SRC}" /usr/local/bin/vpngate
+# Drop a leftover `cargo install` copy so PATH cannot keep serving the old binary.
+CARGO_SHADOW="${TARGET_HOME}/.cargo/bin/vpngate"
+if [ -e "${CARGO_SHADOW}" ] && [ "${CARGO_SHADOW}" != "/usr/local/bin/vpngate" ]; then
+  rm -f "${CARGO_SHADOW}" 2>/dev/null || sudo rm -f "${CARGO_SHADOW}" 2>/dev/null || true
+  info "Removed leftover previous binary ${CARGO_SHADOW}"
+fi
 
 if [ "${TOOLCHAIN_POLICY}" = "remove" ] && [ -n "${INSTALLED_COMPILE_PKGS}" ]; then
   info "Removing compile-only packages we installed:${INSTALLED_COMPILE_PKGS}"

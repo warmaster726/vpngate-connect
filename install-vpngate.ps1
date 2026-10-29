@@ -568,6 +568,11 @@ try {
     Copy-Item -LiteralPath $BinSource -Destination $TargetExe -Force
     try { Unblock-File -LiteralPath $TargetExe -ErrorAction SilentlyContinue } catch {}
     Write-Ok "Installed native single-binary '$TargetExe'"
+    $CargoShadow = Join-Path $HOME '.cargo\bin\vpngate.exe'
+    if ((Test-Path -LiteralPath $CargoShadow) -and ($CargoShadow.TrimEnd('\') -ine $TargetExe.TrimEnd('\'))) {
+        Remove-Item -LiteralPath $CargoShadow -Force -ErrorAction SilentlyContinue
+        Write-Info "Removed leftover previous binary $CargoShadow"
+    }
     if ($KeepToolchain -and -not $HadExistingCargo) {
         Write-Ok "Rust toolchain kept under $HOME\.cargo (as requested)."
     }

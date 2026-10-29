@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 
 use commands::{
     ConnectArgs, cmd_connect, cmd_countries, cmd_disconnect, cmd_doctor, cmd_list, cmd_mirrors,
-    cmd_probe, cmd_refresh, cmd_status, cmd_watchdog, interactive_menu, set_no_elevate_requested,
-    set_uac_already_attempted,
+    cmd_probe, cmd_refresh, cmd_status, cmd_upgrade, cmd_watchdog, interactive_menu,
+    set_no_elevate_requested, set_skip_update_check, set_uac_already_attempted,
 };
 use term_ui::{err, init_console, print_line, prompt_input, set_dynamic_resize, set_screen_clear};
 use vpngate_core::{
@@ -40,7 +40,8 @@ fn build_help_text() -> String {
            vpngate watchdog [on|off|status]     Manage 15s Auto-Reconnect Watchdog\n\
            vpngate doctor                       Run crypto, L2TP/XFRM, OpenVPN & network diagnostics\n\
            vpngate probe <IPv4>                 Run 1-RTT IKEv1 PSK='vpn' + TCP/443 pre-flight check\n\
-           vpngate disconnect                   Tear down active VPN & restore host DNS/routes/firewall\n\n\
+           vpngate disconnect                   Tear down active VPN & restore host DNS/routes/firewall\n\
+           vpngate upgrade [-y]                 Scan public main for a newer desktop (no GitHub login) and replace this install\n\n\
          SHORTHAND FLAGS (Python v5.3 Compatible):\n\
            -i, --interactive     Launch Interactive Console Dashboard\n\
            -L, --list-countries  Show unified countries & regions table\n\
@@ -64,6 +65,8 @@ fn build_help_text() -> String {
            -w, --window          Launch inside dedicated GNOME GTK/VTE or Windows Terminal window\n\
                --no-resize       Disable dynamic terminal window resize sequences\n\
                --no-clear        Do not clear previous screen items before command execution\n\
+               --no-update-check Skip the dashboard scan for a newer desktop\n\
+           -y, --yes             With `upgrade`, install without an extra confirmation prompt\n\
            -h, --help            Print this help message\n",
         env!("CARGO_PKG_VERSION")
     )
@@ -205,6 +208,9 @@ async fn dispatch() -> io::Result<i32> {
             "--no-elevate" | "--read-only" => {
                 set_no_elevate_requested(true);
             }
+            "--no-update-check" => {
+                set_skip_update_check(true);
+            }
             other => raw_args.push(other.to_string()),
         }
         idx += 1;
@@ -258,6 +264,7 @@ async fn dispatch_commands(paths: &AppPaths, raw_args: &[String]) -> io::Result<
     let mut flag_status = false;
     let mut flag_doctor = false;
     let mut flag_disconnect = false;
+    let mut flag_yes = false;
     let mut positional: Vec<String> = Vec::new();
 
     let mut i = 0usize;
@@ -274,6 +281,7 @@ async fn dispatch_commands(paths: &AppPaths, raw_args: &[String]) -> io::Result<
             }
             "--no-resize" => set_dynamic_resize(false),
             "--no-clear" => set_screen_clear(false),
+            "-y" | "--yes" => flag_yes = true,
             "-i" | "--interactive" => flag_interactive = true,
             "-L" | "--list-countries" => flag_countries = true,
             "-l" | "--list" => flag_list = true,
@@ -387,6 +395,9 @@ async fn dispatch_commands(paths: &AppPaths, raw_args: &[String]) -> io::Result<
             return Ok(2);
         };
         return cmd_probe(ip).await;
+    }
+    if matches!(subcmd.as_str(), "upgrade" | "self-update" | "selfupdate") {
+        return cmd_upgrade(paths, flag_yes).await;
     }
     if matches!(subcmd.as_str(), "refresh" | "update") {
         return cmd_refresh(paths, &custom_mirrors).await;

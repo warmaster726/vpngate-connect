@@ -22,13 +22,14 @@ pub mod parser;
 pub mod profile;
 pub mod protocol;
 pub mod server;
+pub mod update;
 
 pub use cache::{
     ActiveSessionState, AppPaths, CACHE_TTL_SECONDS, Ikev1StateInfo, MONITOR_INTERVAL_SECONDS,
     MirrorCacheFile, PublicIpTrace, ServerCacheFile, atomic_write_json, fix_owner,
     get_public_ip_trace, get_servers_cached, get_servers_cached_with_progress, load_cached_mirrors,
-    load_cooldowns, load_watchdog_pref, now_unix_secs, read_json_opt, save_cached_mirrors,
-    save_cooldowns, save_watchdog_pref,
+    load_cooldowns, load_watchdog_pref, now_unix_secs, read_json_opt, resolve_user_home,
+    save_cached_mirrors, save_cooldowns, save_watchdog_pref,
 };
 pub use cooldown::{CooldownStore, DEFAULT_COOLDOWN_SECS};
 pub use country::{
@@ -60,3 +61,10 @@ pub use protocol::{
     OpenVpnCompat, ProtocolFilter, SortBy, TargetPlatform, VpnProtocol, WindowsOvpnDriver,
 };
 pub use server::{VpnServer, filter_by_country, filter_by_protocol, sort_servers};
+pub use update::{
+    DesktopVersion, RemoteDesktopVersion, UpdateCheckCache, cache_is_fresh,
+    cargo_toml_check_urls, check_remote_desktop_version, default_repo_slug,
+    fetch_public_url_text, installer_script_urls, installed_desktop_version,
+    load_update_cache, parse_workspace_package_version, record_update_declined,
+    record_update_scan, should_auto_prompt,
+};

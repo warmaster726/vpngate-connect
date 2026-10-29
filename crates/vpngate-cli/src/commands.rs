@@ -2,8 +2,13 @@ use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::process::Command;
+#[cfg(windows)]
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -18,8 +23,10 @@ use vpngate_core::{
     load_cooldowns, load_watchdog_pref, normalize_mirror_base_url, now_unix_secs, probe_tcp,
     prune_stale_state_if_dead, query_windows_natt_rule, read_json_opt, run_ikev1_crypto_self_test,
     save_cached_mirrors, save_cooldowns, save_watchdog_pref, sort_servers,
-    spawn_auto_reconnect_monitor, stop_monitor_daemon, summarize_countries, verify_l2tp_psk_vpn,
-    which_bin,
+    cache_is_fresh, check_remote_desktop_version, default_repo_slug, fetch_public_url_text,
+    installer_script_urls, installed_desktop_version, load_update_cache, record_update_declined,
+    record_update_scan, resolve_user_home, should_auto_prompt, spawn_auto_reconnect_monitor,
+    stop_monitor_daemon, summarize_countries, verify_l2tp_psk_vpn, which_bin,
 };
 
 use crate::term_ui::{
@@ -32,6 +39,7 @@ use crate::term_ui::{
 
 static UAC_ALREADY_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 static NO_ELEVATE_REQUESTED: AtomicBool = AtomicBool::new(false);
+static SKIP_UPDATE_CHECK: AtomicBool = AtomicBool::new(false);
 
 pub fn set_uac_already_attempted(val: bool) {
     UAC_ALREADY_ATTEMPTED.store(val, Ordering::Relaxed);
@@ -49,6 +57,14 @@ pub fn set_no_elevate_requested(val: bool) {
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn no_elevate_requested() -> bool {
     NO_ELEVATE_REQUESTED.load(Ordering::Relaxed)
+}
+
+pub fn set_skip_update_check(val: bool) {
+    SKIP_UPDATE_CHECK.store(val, Ordering::Relaxed);
+}
+
+pub fn skip_update_check() -> bool {
+    SKIP_UPDATE_CHECK.load(Ordering::Relaxed)
 }
 
 /// Quotes a single command-line argument using standard Win32 `CommandLineToArgvW` rules.
@@ -1216,8 +1232,28 @@ pub fn cmd_doctor(paths: &AppPaths) -> io::Result<i32> {
         Some(format!(
             "CPU ISA      : {GREEN}x86_64 native{RESET} — desktop supports x64 hardware only"
         )),
-        None,
     ];
+    if let Some(uc) = load_update_cache(paths) {
+        if let Some(remote) = vpngate_core::DesktopVersion::parse(&uc.remote_version) {
+            let local = installed_desktop_version();
+            if remote > local {
+                lines.push(Some(format!(
+                    "Desktop Ver  : {YELLOW}UPDATE{RESET} — {local} installed, {GREEN}{}{RESET} on public main (`vpngate upgrade`)",
+                    uc.remote_version
+                )));
+            } else {
+                lines.push(Some(format!(
+                    "Desktop Ver  : {GREEN}{local}{RESET} — up to date vs public main"
+                )));
+            }
+        }
+    } else {
+        lines.push(Some(format!(
+            "Desktop Ver  : {} — run `{CYAN}vpngate upgrade{RESET}` to scan public main (no GitHub login)",
+            env!("CARGO_PKG_VERSION")
+        )));
+    }
+    lines.push(None);
     let mut issues = 0usize;
 
     // 1. Pure-Rust IKEv1 CBC + MODP-1024 + KEYMAT + UDP_ENCAP_ESPINUDP check
@@ -1620,6 +1656,278 @@ fn pause_for_dashboard(rc: i32) {
     let _ = prompt_input("\nPress Enter to return to Dashboard...");
 }
 
+fn is_dev_tree_binary() -> bool {
+    env::current_exe()
+        .ok()
+        .map(|p| p.components().any(|c| c.as_os_str() == "target"))
+        .unwrap_or(false)
+}
+
+fn canonical_install_binary() -> PathBuf {
+    if cfg!(windows) {
+        env::var("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| resolve_user_home().join("AppData").join("Local"))
+            .join("Programs")
+            .join("VPNGate")
+            .join("vpngate.exe")
+    } else {
+        PathBuf::from("/usr/local/bin/vpngate")
+    }
+}
+
+fn cargo_install_shadow_binary() -> PathBuf {
+    if cfg!(windows) {
+        resolve_user_home()
+            .join(".cargo")
+            .join("bin")
+            .join("vpngate.exe")
+    } else {
+        resolve_user_home().join(".cargo").join("bin").join("vpngate")
+    }
+}
+
+fn remove_shadow_desktop_binaries() {
+    if is_dev_tree_binary() {
+        return;
+    }
+    let canonical = canonical_install_binary();
+    let cargo_bin = cargo_install_shadow_binary();
+    if cargo_bin.is_file() && cargo_bin != canonical {
+        match fs::remove_file(&cargo_bin) {
+            Ok(()) => ok(&format!(
+                "Removed leftover previous binary {}",
+                cargo_bin.display()
+            )),
+            Err(e) => warn(&format!(
+                "Could not remove leftover {} ({e})",
+                cargo_bin.display()
+            )),
+        }
+    }
+}
+
+fn write_upgrade_installer_script(paths: &AppPaths, body: &str) -> io::Result<PathBuf> {
+    let _ = paths.ensure_dirs();
+    let dest = if cfg!(windows) {
+        paths.cache_dir.join("install-vpngate.ps1")
+    } else {
+        paths.cache_dir.join("install-vpngate.sh")
+    };
+    let payload = if cfg!(windows) {
+        body.to_string()
+    } else {
+        body.replace('\r', "")
+    };
+    fs::write(&dest, payload)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&dest)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&dest, perms)?;
+    }
+    Ok(dest)
+}
+
+#[cfg(windows)]
+fn spawn_windows_upgrade_installer(ps1: &Path) -> io::Result<()> {
+    const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+    let ps1_disp = ps1.display().to_string().replace('\'', "''");
+    let inner = format!(
+        "Start-Sleep -Seconds 3; powershell.exe -NoProfile -ExecutionPolicy Bypass -File '{ps1_disp}'"
+    );
+    Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &inner,
+        ])
+        .creation_flags(CREATE_NEW_CONSOLE)
+        .stdin(Stdio::null())
+        .spawn()?;
+    Ok(())
+}
+
+async fn run_desktop_installer(paths: &AppPaths) -> io::Result<i32> {
+    info("Downloading the public installer (anonymous HTTPS, no GitHub login) ...");
+    let slug = default_repo_slug();
+    let urls = installer_script_urls(&slug);
+    let (body, src) = match fetch_public_url_text(&urls).await {
+        Ok(v) => v,
+        Err(e) => {
+            err(&e);
+            return Ok(1);
+        }
+    };
+    info(&format!("Installer source: {src}"));
+    let script = write_upgrade_installer_script(paths, &body)?;
+
+    info("Disconnecting any active VPN Gate session so the old binary can be replaced ...");
+    let _ = cmd_disconnect(paths).await;
+    stop_monitor_daemon(paths);
+
+    #[cfg(windows)]
+    {
+        remove_shadow_desktop_binaries();
+        info("Launching the Windows installer in a new window, then closing this process so vpngate.exe is not locked ...");
+        spawn_windows_upgrade_installer(&script)?;
+        ok("The installer will replace this copy and remove the previous vpngate.exe.");
+        ok("After it finishes, start VPN Gate again from the Start Menu or `vpngate`.");
+        return Ok(0);
+    }
+
+    #[cfg(not(windows))]
+    {
+        info("Running the installer (it deletes /usr/local/bin/vpngate, then installs the new build) ...");
+        let status = Command::new("sh")
+            .arg(&script)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()?;
+        let rc = status.code().unwrap_or(1);
+        if rc != 0 {
+            err("Installer did not finish successfully. The previous desktop binary was left in place.");
+            return Ok(rc);
+        }
+        remove_shadow_desktop_binaries();
+        ok("Desktop update installed. The old /usr/local/bin/vpngate was replaced.");
+        ok("Exit this process and run `vpngate` to use the new version.");
+        Ok(0)
+    }
+}
+
+pub enum UpgradeOffer {
+    Continue,
+    ExitAfterInstall,
+    Failed(i32),
+}
+
+pub async fn cmd_upgrade(paths: &AppPaths, assume_yes: bool) -> io::Result<i32> {
+    clear_screen_if_tty();
+    match offer_desktop_upgrade(paths, true, assume_yes).await? {
+        UpgradeOffer::Continue => Ok(0),
+        UpgradeOffer::ExitAfterInstall => Ok(0),
+        UpgradeOffer::Failed(rc) => Ok(rc),
+    }
+}
+
+/// Scan public `main` for a newer desktop. `force` ignores the 6h cache (used by `vpngate upgrade`).
+pub async fn offer_desktop_upgrade(
+    paths: &AppPaths,
+    force: bool,
+    assume_yes: bool,
+) -> io::Result<UpgradeOffer> {
+    let installed = installed_desktop_version();
+    if !force {
+        if let Some(cache) = load_update_cache(paths)
+            && cache_is_fresh(&cache)
+        {
+            if let Some(remote) = vpngate_core::DesktopVersion::parse(&cache.remote_version)
+                && remote > installed
+                && should_auto_prompt(&cache, &remote)
+            {
+                return prompt_and_maybe_install(
+                    paths,
+                    &vpngate_core::RemoteDesktopVersion {
+                        version: remote,
+                        raw: cache.remote_version.clone(),
+                        source_url: cache.source_url.clone(),
+                    },
+                    assume_yes,
+                )
+                .await;
+            }
+            return Ok(UpgradeOffer::Continue);
+        }
+    }
+
+    info("Checking for a newer desktop on public main (anonymous HTTPS, no GitHub login) ...");
+    let remote = match check_remote_desktop_version().await {
+        Ok(v) => v,
+        Err(e) => {
+            if force {
+                err(&e);
+            } else {
+                // Dashboard stays usable if GitHub/jsDelivr is blocked.
+            }
+            return Ok(UpgradeOffer::Continue);
+        }
+    };
+    let cache = record_update_scan(paths, &remote);
+
+    if remote.version < installed {
+        if force {
+            info(&format!(
+                "This build ({installed}) is newer than public main ({}).",
+                remote.raw
+            ));
+        }
+        return Ok(UpgradeOffer::Continue);
+    }
+    if remote.version == installed {
+        if force {
+            ok(&format!(
+                "VPN Gate Connect desktop {installed} is up to date."
+            ));
+        }
+        return Ok(UpgradeOffer::Continue);
+    }
+    if !force && !should_auto_prompt(&cache, &remote.version) {
+        return Ok(UpgradeOffer::Continue);
+    }
+    prompt_and_maybe_install(paths, &remote, assume_yes).await
+}
+
+async fn prompt_and_maybe_install(
+    paths: &AppPaths,
+    remote: &vpngate_core::RemoteDesktopVersion,
+    assume_yes: bool,
+) -> io::Result<UpgradeOffer> {
+    let installed = installed_desktop_version();
+    print_line("");
+    warn("A newer VPN Gate Connect desktop is available — installing it is strongly recommended.");
+    print_line(&format!(
+        "  Installed : {YELLOW}{installed}{RESET}\n  Latest    : {GREEN}{}{RESET}  ({})",
+        remote.raw, remote.source_url
+    ));
+    print_line(&format!(
+        "  {BOLD}Updating replaces this install and removes the old binary.{RESET}"
+    ));
+    print_line("");
+
+    let accepted = if assume_yes {
+        true
+    } else if !is_stdout_tty() {
+        warn("Non-interactive session: re-run `vpngate upgrade -y` to install.");
+        false
+    } else {
+        match prompt_input("Install this update now? [Y/n]: ") {
+            None => false,
+            Some(ans) => {
+                let t = ans.trim().to_ascii_lowercase();
+                !matches!(t.as_str(), "n" | "no" | "q" | "quit" | "0")
+            }
+        }
+    };
+
+    if !accepted {
+        record_update_declined(paths, remote);
+        info("Skipped. You can install later with `vpngate upgrade`.");
+        return Ok(UpgradeOffer::Continue);
+    }
+
+    let rc = run_desktop_installer(paths).await?;
+    if rc == 0 {
+        Ok(UpgradeOffer::ExitAfterInstall)
+    } else {
+        Ok(UpgradeOffer::Failed(rc))
+    }
+}
+
 pub async fn interactive_menu(paths: &AppPaths, help_text: &str) -> io::Result<i32> {
     let os_label = detect_host_os_label();
 
@@ -1635,6 +1943,13 @@ pub async fn interactive_menu(paths: &AppPaths, help_text: &str) -> io::Result<i
             "UAC elevation was declined - continuing in Read-Only mode (Countries, List, Mirrors, Status, Doctor).",
         );
         tokio::time::sleep(Duration::from_millis(900)).await;
+    }
+
+    if is_stdout_tty() && !skip_update_check() {
+        match offer_desktop_upgrade(paths, false, false).await? {
+            UpgradeOffer::ExitAfterInstall => return Ok(0),
+            UpgradeOffer::Continue | UpgradeOffer::Failed(_) => {}
+        }
     }
 
     loop {
