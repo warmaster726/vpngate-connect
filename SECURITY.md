@@ -2,12 +2,12 @@
 
 ## Supported Versions
 
-Security fixes are applied exclusively on the active **`main`** branch (Pure-Rust x86_64 Desktop Edition). The **`PY`** branch is an inactive, frozen historical reference and receives no updates.
+Security fixes are applied exclusively on the active **`main`** branch (Pure-Rust x86_64 Desktop Edition `0.3.x`). Ongoing work lives on **`develop`** and is not a supported release line until it is merged to `main`.
 
 | Branch / Version | Status | Supported |
 | :--- | :--- | :--- |
-| **`main`** (Rust Workspace `0.2.x`) | Active | Yes |
-| **`PY`** (Legacy Python `v5.3`) | Inactive / Frozen Reference | No |
+| **`main`** (Rust Workspace `0.3.x`) | Active | Yes |
+| **`develop`** | Integration | No |
 
 ## Security Architecture Highlights
 
