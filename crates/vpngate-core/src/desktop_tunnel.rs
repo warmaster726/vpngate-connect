@@ -82,9 +82,27 @@ mod win_ffi {
         ) -> i32;
     }
 
+    #[repr(C)]
+    struct SystemInfo {
+        w_processor_architecture: u16,
+        w_reserved: u16,
+        dw_page_size: u32,
+        lp_minimum_application_address: *mut c_void,
+        lp_maximum_application_address: *mut c_void,
+        dw_active_processor_mask: usize,
+        dw_number_of_processors: u32,
+        dw_processor_type: u32,
+        dw_allocation_granularity: u32,
+        w_processor_level: u16,
+        w_processor_revision: u16,
+    }
+
+    const PROCESSOR_ARCHITECTURE_AMD64: u16 = 9;
+
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetCurrentProcess() -> *mut c_void;
+        fn GetNativeSystemInfo(lp_system_info: *mut SystemInfo);
         pub fn OpenProcess(
             desired_access: u32,
             inherit_handle: i32,
@@ -92,6 +110,27 @@ mod win_ffi {
         ) -> *mut c_void;
         pub fn GetExitCodeProcess(process: *mut c_void, exit_code: *mut u32) -> i32;
         pub fn CloseHandle(object: *mut c_void) -> i32;
+    }
+
+    pub fn native_processor_is_amd64() -> bool {
+        // SAFETY: `GetNativeSystemInfo` writes a well-defined `SYSTEM_INFO` and never fails.
+        unsafe {
+            let mut info = SystemInfo {
+                w_processor_architecture: 0,
+                w_reserved: 0,
+                dw_page_size: 0,
+                lp_minimum_application_address: null_mut(),
+                lp_maximum_application_address: null_mut(),
+                dw_active_processor_mask: 0,
+                dw_number_of_processors: 0,
+                dw_processor_type: 0,
+                dw_allocation_granularity: 0,
+                w_processor_level: 0,
+                w_processor_revision: 0,
+            };
+            GetNativeSystemInfo(&mut info);
+            info.w_processor_architecture == PROCESSOR_ARCHITECTURE_AMD64
+        }
     }
 
     pub fn is_current_process_elevated() -> bool {
@@ -225,6 +264,72 @@ pub fn detect_host_os_label() -> String {
         }
         "Linux".to_string()
     }
+}
+
+/// Refuse ARM64 (including Windows-on-ARM x64 emulation and macOS Rosetta) and 32-bit hosts.
+pub fn assert_x64_native_host() -> Result<(), String> {
+    if host_is_native_x86_64() {
+        Ok(())
+    } else {
+        Err(
+            "VPN Gate Connect desktop is x86_64-native only and does not support ARM64 or 32-bit hardware (including x64 emulation / Rosetta)."
+                .to_string(),
+        )
+    }
+}
+
+fn host_is_native_x86_64() -> bool {
+    #[cfg(windows)]
+    {
+        win_ffi::native_processor_is_amd64()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        unix_uname_is_x86_64() && !macos_has_arm64_cpu()
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        unix_uname_is_x86_64()
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        false
+    }
+}
+
+#[cfg(unix)]
+fn unix_uname_is_x86_64() -> bool {
+    // SAFETY: `uname` fills a stack `utsname`; `machine` is a NUL-terminated C string.
+    unsafe {
+        let mut u: libc::utsname = std::mem::zeroed();
+        if libc::uname(&mut u) != 0 {
+            return false;
+        }
+        let machine = std::ffi::CStr::from_ptr(u.machine.as_ptr())
+            .to_string_lossy()
+            .to_ascii_lowercase();
+        machine == "x86_64" || machine == "amd64"
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_has_arm64_cpu() -> bool {
+    let mut val: i32 = 0;
+    let mut size = std::mem::size_of::<i32>() as libc::size_t;
+    let Ok(name) = std::ffi::CString::new("hw.optional.arm64") else {
+        return true;
+    };
+    // SAFETY: `sysctlbyname` writes an i32 into `val` when the key exists.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            (&raw mut val).cast::<libc::c_void>(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    rc == 0 && val == 1
 }
 
 pub fn is_pid_alive(pid: u32) -> bool {

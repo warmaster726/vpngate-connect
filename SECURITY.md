@@ -2,7 +2,7 @@
 
 ## Supported Versions
 
-Security fixes are applied exclusively on the active **`main`** branch (Pure-Rust Cross-Platform Desktop Edition). The **`PY`** branch is an inactive, frozen historical reference and receives no updates.
+Security fixes are applied exclusively on the active **`main`** branch (Pure-Rust x86_64 Desktop Edition). The **`PY`** branch is an inactive, frozen historical reference and receives no updates.
 
 | Branch / Version | Status | Supported |
 | :--- | :--- | :--- |

@@ -1,6 +1,7 @@
 #!/bin/sh
 # install-vpngate.sh — One-step Linux & macOS Desktop Installer, Residue Cleaner & Uninstaller for `vpngate` (Rust Edition)
 # POSIX /bin/sh (dash, sh, bash, zsh) compatible — works via `sh ./install-vpngate.sh`
+# x86_64-native only (no ARM64, no 32-bit, no Rosetta).
 # Priority: Auto (L2TP/IPsec -> OpenVPN UDP -> OpenVPN TCP) | Built-In Rust IKEv1 + Kernel XFRM + xl2tpd/ppp + OpenVPN
 set -eu
 
@@ -18,6 +19,12 @@ SKIP_DEPS=0
 KEEP_TOOLCHAIN=0
 REPO_SLUG="${VPNGATE_REPO:-warmaster726/vpngate-connect}"
 HOST_UNAME="$(uname -s 2>/dev/null || echo Linux)"
+HOST_MACHINE="$(uname -m 2>/dev/null || echo unknown)"
+if [ "${HOST_UNAME}" = "Darwin" ]; then
+  RUST_HOST_TRIPLE="x86_64-apple-darwin"
+else
+  RUST_HOST_TRIPLE="x86_64-unknown-linux-gnu"
+fi
 CALLER_CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-}"
 CALLER_CARGO_HOME="${CARGO_HOME:-}"
 CALLER_RUSTUP_HOME="${RUSTUP_HOME:-}"
@@ -28,8 +35,8 @@ Usage: sh ./install-vpngate.sh [OPTIONS]
    or: ./install-vpngate.sh [OPTIONS]
 
 Installs, upgrades, or removes the single-binary Rust VPN Gate Desktop Suite
-on Linux (Kali, Debian, Ubuntu, Mint, Pop!_OS, Fedora, Arch) and macOS,
-automatically cleaning legacy residues and temporary build/staging artifacts.
+on Linux (Kali, Debian, Ubuntu, Mint, Pop!_OS, Fedora, Arch) and macOS.
+x86_64-native only (no ARM64, no 32-bit, no Rosetta). Compiles from source.
 
 Options:
   (no arguments)       Clean legacy residues, install OS packages, build/install `vpngate`, wipe temp build cache, and run `doctor`
@@ -79,6 +86,29 @@ done
 info() { echo "[*] $*"; }
 ok()   { echo "[+] $*"; }
 warn() { echo "[!] $*"; }
+
+require_native_x64() {
+  case "${HOST_MACHINE}" in
+    x86_64|amd64) ;;
+    *)
+      echo "[-] VPN Gate Connect desktop is x86_64-native only (detected CPU: ${HOST_MACHINE})." >&2
+      echo "    ARM64, 32-bit, and other architectures are not supported." >&2
+      exit 1
+      ;;
+  esac
+  if [ "${HOST_UNAME}" = "Darwin" ]; then
+    ARM64_CPU="$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)"
+    if [ "${ARM64_CPU}" = "1" ]; then
+      echo "[-] VPN Gate Connect desktop is x86_64-native only." >&2
+      echo "    This Mac has an Apple Silicon (ARM64) CPU. Rosetta is not supported." >&2
+      exit 1
+    fi
+  fi
+}
+
+if [ "${MODE}" = "install" ]; then
+  require_native_x64
+fi
 
 if [ "$(id -u)" -eq 0 ]; then
   sudo() { "$@"; }
@@ -515,9 +545,9 @@ if [ -f "${WORK_SRC_DIR}/Cargo.toml" ]; then
     if [ "${KEEP_TOOLCHAIN}" -eq 1 ]; then
       info "Rust toolchain ('cargo') not found — installing minimal stable rustup toolchain for ${TARGET_USER} (--keep-toolchain) ..."
       if [ "$(id -u)" -eq 0 ] && [ "${TARGET_USER}" != "root" ]; then
-        sudo -u "${TARGET_USER}" sh -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal' </dev/null
+        sudo -u "${TARGET_USER}" sh -c "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-host '${RUST_HOST_TRIPLE}'" </dev/null
       else
-        sh -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal' </dev/null
+        sh -c "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-host '${RUST_HOST_TRIPLE}'" </dev/null
       fi
       if [ -x "${TARGET_HOME}/.cargo/bin/cargo" ]; then
         CARGO_BIN="${TARGET_HOME}/.cargo/bin/cargo"
@@ -537,12 +567,12 @@ if [ -f "${WORK_SRC_DIR}/Cargo.toml" ]; then
         sudo -u "${TARGET_USER}" env \
           RUSTUP_HOME="${BUILD_RUSTUP_HOME}" \
           CARGO_HOME="${BUILD_CARGO_HOME}" \
-          sh -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path' </dev/null
+          sh -c "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path --default-host '${RUST_HOST_TRIPLE}'" </dev/null
       else
         env \
           RUSTUP_HOME="${BUILD_RUSTUP_HOME}" \
           CARGO_HOME="${BUILD_CARGO_HOME}" \
-          sh -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path' </dev/null
+          sh -c "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path --default-host '${RUST_HOST_TRIPLE}'" </dev/null
       fi
       if [ -x "${BUILD_CARGO_HOME}/bin/cargo" ]; then
         CARGO_BIN="${BUILD_CARGO_HOME}/bin/cargo"
@@ -566,7 +596,7 @@ if [ -f "${WORK_SRC_DIR}/Cargo.toml" ]; then
     fi
 
     CARGO_DIR_BIN="$(dirname "${CARGO_BIN}")"
-    info "Building optimized single-binary 'vpngate' from Rust workspace (${WORK_SRC_DIR}) ..."
+    info "Building optimized x86_64 'vpngate' from Rust workspace (${WORK_SRC_DIR}) ..."
     if [ "$(id -u)" -eq 0 ] && [ "${TARGET_USER}" != "root" ]; then
       # shellcheck disable=SC2086
       sudo -u "${TARGET_USER}" env \
@@ -575,6 +605,7 @@ if [ -f "${WORK_SRC_DIR}/Cargo.toml" ]; then
         ${BUILD_CARGO_HOME:+CARGO_HOME="${BUILD_CARGO_HOME}"} \
         "${CARGO_BIN}" build --release ${LOCKED_FLAG} \
         -p vpngate-cli \
+        --target "${RUST_HOST_TRIPLE}" \
         --manifest-path "${WORK_SRC_DIR}/Cargo.toml" \
         --target-dir "${EFFECTIVE_TARGET_DIR}"
     else
@@ -585,12 +616,13 @@ if [ -f "${WORK_SRC_DIR}/Cargo.toml" ]; then
         ${BUILD_CARGO_HOME:+CARGO_HOME="${BUILD_CARGO_HOME}"} \
         "${CARGO_BIN}" build --release ${LOCKED_FLAG} \
         -p vpngate-cli \
+        --target "${RUST_HOST_TRIPLE}" \
         --manifest-path "${WORK_SRC_DIR}/Cargo.toml" \
         --target-dir "${EFFECTIVE_TARGET_DIR}"
     fi
-    BIN_SRC="${EFFECTIVE_TARGET_DIR}/release/vpngate"
-  elif [ -x "${WORK_SRC_DIR}/target/release/vpngate" ]; then
-    BIN_SRC="${WORK_SRC_DIR}/target/release/vpngate"
+    BIN_SRC="${EFFECTIVE_TARGET_DIR}/${RUST_HOST_TRIPLE}/release/vpngate"
+  elif [ -x "${WORK_SRC_DIR}/target/${RUST_HOST_TRIPLE}/release/vpngate" ]; then
+    BIN_SRC="${WORK_SRC_DIR}/target/${RUST_HOST_TRIPLE}/release/vpngate"
   fi
 elif [ -x "${WORK_SRC_DIR}/vpngate" ]; then
   BIN_SRC="${WORK_SRC_DIR}/vpngate"
@@ -599,6 +631,17 @@ fi
 if [ -z "${BIN_SRC}" ] || [ ! -f "${BIN_SRC}" ]; then
   warn "Could not build or locate 'vpngate' binary."
   exit 1
+fi
+if command -v file >/dev/null 2>&1; then
+  BIN_DESC="$(file -b "${BIN_SRC}" 2>/dev/null || true)"
+  case "${BIN_DESC}" in
+    *x86-64*|*x86_64*|*X86-64*|*AMD64*|*amd64*) ;;
+    *)
+      echo "[-] Refusing non-x86_64 binary: ${BIN_SRC}" >&2
+      echo "    ${BIN_DESC}" >&2
+      exit 1
+      ;;
+  esac
 fi
 
 # Prevent boot-time L2TP/IPsec daemons from holding UDP 500, 4500, or 1701 on Linux

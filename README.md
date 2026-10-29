@@ -1,6 +1,8 @@
 # VPN Gate Connect
 
-Censorship-resilient **SoftEther VPN Gate** desktop client engineered around a **100% pure-Rust networking & cryptography core** (`rustls`, pure-Rust `AES-256/128/3DES` + `MODP-1024` IKEv1, zero OpenSSL build dependency) for **Linux, Windows 11, and macOS**.
+Censorship-resilient **SoftEther VPN Gate** desktop client engineered around a **100% pure-Rust networking & cryptography core** (`rustls`, pure-Rust `AES-256/128/3DES` + `MODP-1024` IKEv1, zero OpenSSL build dependency) for **x86_64 Linux, Windows 11, and Intel macOS**.
+
+**Architecture:** desktop is **x86_64-native only**. ARM64 (Apple Silicon, Windows-on-ARM, aarch64 Linux), 32-bit, Rosetta, and x64 emulation are not supported. The web client is unchanged.
 
 ---
 
@@ -24,14 +26,14 @@ Censorship-resilient **SoftEther VPN Gate** desktop client engineered around a *
 
 | Branch | Status | Description |
 | :--- | :--- | :--- |
-| **`main`** | **Active (Default)** | **Pure-Rust Cross-Platform Desktop Edition** (`vpngate-core`, `vpngate-cli`, Linux/macOS & Windows 11 installers, GNOME GTK/VTE launcher) |
+| **`main`** | **Active (Default)** | **Pure-Rust x86_64 Desktop Edition** (`vpngate-core`, `vpngate-cli`, Linux/macOS & Windows 11 installers, GNOME GTK/VTE launcher) |
 | **`PY`** | **Inactive (Archived Reference)** | Frozen legacy Python `v5.3` single-script edition preserved read-only for historical reference (no further updates) |
 
 ---
 
 ## Quick Installation
 
-### Linux (Kali, Debian, Ubuntu, Mint, Pop!_OS, Fedora, Arch) & macOS
+### Linux (Kali, Debian, Ubuntu, Mint, Pop!_OS, Fedora, Arch) & macOS — x86_64 only
 
 **One-liner install:**
 
@@ -55,7 +57,7 @@ sh ./install-vpngate.sh --uninstall
 
 ---
 
-### Windows 11
+### Windows 11 — x86_64 (amd64) only
 
 **One-liner install in Administrator PowerShell:**
 
@@ -74,14 +76,19 @@ irm https://raw.githubusercontent.com/warmaster726/vpngate-connect/main/install-
 Because TLS (`rustls`) and IKEv1 cryptography are implemented in pure Rust and exact crate versions are pinned in [`Cargo.lock`](Cargo.lock), **no OpenSSL headers, `pkg-config`, or `cmake` are required**—only a standard Rust toolchain (`rustup`) and a basic C linker (`gcc`/`clang` on Unix, or MSVC / MinGW-w64 `gcc.exe` on Windows):
 
 ```bash
-# Option A — Install directly from Git with Cargo (any OS with Rust installed):
-cargo install --git https://github.com/warmaster726/vpngate-connect.git --locked vpngate-cli
+# Option A — Install directly from Git with Cargo (x86_64 host with Rust installed):
+cargo install --git https://github.com/warmaster726/vpngate-connect.git --locked vpngate-cli --target x86_64-unknown-linux-gnu
+# Windows:  --target x86_64-pc-windows-msvc   (or x86_64-pc-windows-gnu)
+# macOS:    --target x86_64-apple-darwin
 
-# Option B — Clone & compile a standalone release binary manually:
+# Option B — Clone & compile a standalone x86_64 release binary:
 git clone https://github.com/warmaster726/vpngate-connect.git
 cd vpngate-connect
-cargo build --release --locked -p vpngate-cli
-# Output binary: ./target/release/vpngate  (Windows: .\target\release\vpngate.exe)
+cargo build --release --locked -p vpngate-cli --target x86_64-unknown-linux-gnu
+# Linux:  ./target/x86_64-unknown-linux-gnu/release/vpngate
+# Windows MSVC: cargo build --release --locked -p vpngate-cli --target x86_64-pc-windows-msvc
+#               .\target\x86_64-pc-windows-msvc\release\vpngate.exe
+# macOS:  cargo build --release --locked -p vpngate-cli --target x86_64-apple-darwin
 ```
 
 ---

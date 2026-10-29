@@ -1213,6 +1213,9 @@ pub fn cmd_doctor(paths: &AppPaths) -> io::Result<i32> {
             "{CYAN}{BOLD}VPN Gate v{} ({os_label}) — System Readiness & Diagnostics{RESET}",
             env!("CARGO_PKG_VERSION")
         )),
+        Some(format!(
+            "CPU ISA      : {GREEN}x86_64 native{RESET} — desktop supports x64 hardware only"
+        )),
         None,
     ];
     let mut issues = 0usize;

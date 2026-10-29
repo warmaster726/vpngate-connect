@@ -1,5 +1,11 @@
 //! `vpngate` — Single-Binary Cross-Platform Desktop CLI & Interactive Console
 //! Replicating the Python `v5.3` dual-mode CLI + `[0-9]` Console UX with 100% pure-Rust IKEv1/XFRM.
+//! x86_64-native only (no ARM64, no 32-bit).
+
+#[cfg(not(target_arch = "x86_64"))]
+compile_error!(
+    "VPN Gate Connect desktop is x86_64-only. Build with --target x86_64-unknown-linux-gnu, x86_64-pc-windows-msvc / x86_64-pc-windows-gnu, or x86_64-apple-darwin."
+);
 
 mod commands;
 mod term_ui;
@@ -16,11 +22,13 @@ use commands::{
     set_uac_already_attempted,
 };
 use term_ui::{err, init_console, print_line, prompt_input, set_dynamic_resize, set_screen_clear};
-use vpngate_core::{AppPaths, ProtocolFilter, SortBy, run_ikev1_daemon, run_monitor_daemon};
+use vpngate_core::{
+    AppPaths, ProtocolFilter, SortBy, assert_x64_native_host, run_ikev1_daemon, run_monitor_daemon,
+};
 
 fn build_help_text() -> String {
     format!(
-        "vpngate v{} — Cross-Platform SoftEther VPN Gate Client (Auto: L2TP/IPsec -> OVPN UDP -> OVPN TCP)\n\n\
+        "vpngate v{} — x86_64 SoftEther VPN Gate Client (Auto: L2TP/IPsec -> OVPN UDP -> OVPN TCP)\n\n\
          USAGE:\n\
            vpngate                              Launch Interactive Console Dashboard [0-9]\n\
            vpngate countries [-p PROTO] [-r]    List available countries & protocol counts\n\
@@ -168,6 +176,10 @@ async fn dispatch() -> io::Result<i32> {
     let raw_all: Vec<String> = env::args().skip(1).collect();
     let is_daemon = matches!(raw_all.first().map(String::as_str), Some("_monitor" | "_ikev1"));
     init_console(!is_daemon);
+    if let Err(msg) = assert_x64_native_host() {
+        err(&msg);
+        return Ok(1);
+    }
 
     // Pre-scan global `--cache-dir <DIR>`, `--hold`, and Windows UAC flags before dispatching
     let mut cache_dir_override: Option<PathBuf> = None;

@@ -1,6 +1,6 @@
 # ==============================================================================
 # vpngate-connect — Pure-Rust Cross-Platform Desktop Edition
-# Targets: Linux, Windows 11 & macOS
+# Targets: x86_64 Linux, Windows 11 & Intel macOS (no ARM64 / 32-bit)
 # ==============================================================================
 
 # --- 1. Rust & Cargo Build Artifacts ---

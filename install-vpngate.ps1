@@ -1,7 +1,8 @@
 <#
 .SYNOPSIS
-    VPN Gate Connect (Rust Single-Binary Edition) - Windows 11 Installer, Residue Cleaner & Uninstaller
+    VPN Gate Connect (Rust Single-Binary Edition) - Windows 11 x86_64 Installer, Residue Cleaner & Uninstaller
 .DESCRIPTION
+    x86_64-native only (no ARM64, no 32-bit, no x64 emulation).
     - Install / Upgrade (default):
         Cleans legacy Python/Rust residues, builds or installs native `vpngate.exe` into
         `%LOCALAPPDATA%\Programs\VPNGate\vpngate.exe` using an isolated temporary build root,
@@ -61,7 +62,8 @@ function Show-Usage {
 Usage: .\install-vpngate.ps1 [OPTIONS]
 
 Installs, upgrades, or removes single-binary Rust `vpngate.exe` on Windows 11
-(zero Python dependency), configuring L2TP/IPsec NAT-T and headless OpenVPN Community
+x86_64 (amd64) hardware only (no ARM64, no 32-bit, no x64 emulation).
+Zero Python dependency. Configures L2TP/IPsec NAT-T and headless OpenVPN Community
 while keeping the host environment free of temporary build caches.
 
 Options:
@@ -106,6 +108,32 @@ if ($RemainingArgs) {
 if ($Help) {
     Show-Usage
     exit 0
+}
+
+function Assert-NativeX64 {
+    $osArch = $null
+    try {
+        $osArch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+    } catch {
+        $osArch = $null
+    }
+    if ($osArch -eq 'X64') { return }
+    if ($osArch -eq 'Arm64' -or $osArch -eq 'Arm' -or $osArch -eq 'X86') {
+        Write-Err "VPN Gate Connect desktop is x86_64-native only (OS architecture: $osArch)."
+        Write-Err "ARM64, 32-bit, and x64 emulation are not supported."
+        exit 1
+    }
+    $cimArch = $null
+    try { $cimArch = [string](Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).OSArchitecture } catch { $cimArch = '' }
+    $procArch = [string]$env:PROCESSOR_ARCHITECTURE
+    if ($procArch -eq 'AMD64' -and $cimArch -match '64' -and $cimArch -notmatch 'ARM') { return }
+    Write-Err "VPN Gate Connect desktop is x86_64-native only."
+    Write-Err "Detected PROCESSOR_ARCHITECTURE=$procArch OSArchitecture=$cimArch."
+    exit 1
+}
+
+if (-not $Uninstall) {
+    Assert-NativeX64
 }
 
 $IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
@@ -404,10 +432,11 @@ try {
         $BuildArgs += @('-p', 'vpngate-cli', '--manifest-path', $CargoToml, '--target-dir', $EffectiveTargetDir)
 
         if ($HasMsvc) {
-            Write-Info "Building optimized native 'vpngate.exe' via Cargo (MSVC toolchain) ..."
-            & $CargoCmd.Source @BuildArgs
+            Write-Info "Building optimized x86_64 'vpngate.exe' via Cargo (MSVC toolchain) ..."
+            $MsvcArgs = $BuildArgs + @('--target', 'x86_64-pc-windows-msvc')
+            & $CargoCmd.Source @MsvcArgs
             if ($LASTEXITCODE -ne 0) { throw "Cargo release build failed." }
-            $BinSource = Join-Path $EffectiveTargetDir 'release\vpngate.exe'
+            $BinSource = Join-Path $EffectiveTargetDir 'x86_64-pc-windows-msvc\release\vpngate.exe'
         } else {
             # Ensure gcc.exe / MinGW-w64 is present for `x86_64-pc-windows-gnu` (`ring` C objects + linking)
             if (-not (Get-Command 'gcc.exe' -ErrorAction SilentlyContinue)) {
@@ -439,7 +468,7 @@ try {
             if (Test-Path -LiteralPath $RustupExe) {
                 & $RustupExe toolchain install stable-x86_64-pc-windows-gnu --profile minimal --no-self-update
             }
-            Write-Info "Building optimized native 'vpngate.exe' via Cargo (x86_64-pc-windows-gnu toolchain) ..."
+            Write-Info "Building optimized x86_64 'vpngate.exe' via Cargo (x86_64-pc-windows-gnu toolchain) ..."
             $GnuArgs = @('+stable-x86_64-pc-windows-gnu') + $BuildArgs + @('--target', 'x86_64-pc-windows-gnu')
             & $CargoCmd.Source @GnuArgs
             if ($LASTEXITCODE -ne 0) { throw "Cargo GNU release build failed." }
