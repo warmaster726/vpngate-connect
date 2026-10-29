@@ -127,6 +127,7 @@ vpngate-connect/
 │   ├── vpngate-core/      # Pure-Rust discovery, Official Mirrors, DoH, IKEv1/XFRM & desktop tunnel engine
 │   └── vpngate-cli/       # Single-binary `vpngate` CLI & [0-9] Interactive Console
 ├── vpngate-launcher.py    # GNOME GTK3/GTK4 + VTE dynamic-resizing dark window launcher
+├── assets/                # Desktop app icon (gate mark, no VG glyph) — SVG / PNG / Windows ICO
 ├── vpngate.desktop        # XDG Desktop Entry + GNOME Dash Quick Actions
 ├── install-vpngate.sh     # POSIX /bin/sh Linux & macOS installer, residue cleaner & uninstaller
 ├── install-vpngate.ps1    # Windows 11 PowerShell installer, NAT-T & Zero-Prompt OpenVPN configurator

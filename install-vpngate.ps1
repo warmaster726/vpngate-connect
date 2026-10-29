@@ -568,6 +568,16 @@ try {
     Copy-Item -LiteralPath $BinSource -Destination $TargetExe -Force
     try { Unblock-File -LiteralPath $TargetExe -ErrorAction SilentlyContinue } catch {}
     Write-Ok "Installed native single-binary '$TargetExe'"
+    foreach ($iconCand in @(
+        (Join-Path $WorkDir 'assets\vpngate.ico'),
+        (Join-Path $SourceDir 'assets\vpngate.ico')
+    )) {
+        if ($iconCand -and (Test-Path -LiteralPath $iconCand)) {
+            Copy-Item -LiteralPath $iconCand -Destination (Join-Path $InstallDir 'vpngate.ico') -Force
+            Write-Ok "Installed app icon '$(Join-Path $InstallDir 'vpngate.ico')'"
+            break
+        }
+    }
     $CargoShadow = Join-Path $HOME '.cargo\bin\vpngate.exe'
     if ((Test-Path -LiteralPath $CargoShadow) -and ($CargoShadow.TrimEnd('\') -ine $TargetExe.TrimEnd('\'))) {
         Remove-Item -LiteralPath $CargoShadow -Force -ErrorAction SilentlyContinue
@@ -726,6 +736,10 @@ try {
     $Shortcut.TargetPath = $TargetExe
     $Shortcut.WorkingDirectory = $InstallDir
     $Shortcut.Description = 'VPN Gate Connect Console'
+    $IconLnk = Join-Path $InstallDir 'vpngate.ico'
+    if (Test-Path -LiteralPath $IconLnk) {
+        $Shortcut.IconLocation = "$IconLnk,0"
+    }
     $Shortcut.Save()
     if (-not $UserOnly -and (Test-Path -LiteralPath $StartMenuLnk)) {
         $LnkBytes = [System.IO.File]::ReadAllBytes($StartMenuLnk)

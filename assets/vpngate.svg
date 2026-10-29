@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="VPN Gate Connect">
+  <!-- Dark console tile + portal gate. No VG / VPNGate glyph. -->
+  <rect x="24" y="24" width="464" height="464" rx="108" fill="#070B14"/>
+  <rect x="24" y="24" width="464" height="464" rx="108" fill="none" stroke="#1E3A5F" stroke-width="10"/>
+  <path d="M142 394 V198 L256 130 L370 198 V394" fill="none" stroke="#38BDF8" stroke-width="28" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M208 394 V237 L256 208 L304 237 V394" fill="none" stroke="#34D399" stroke-width="24" stroke-linejoin="round" stroke-linecap="round"/>
+  <circle cx="256" cy="280" r="28" fill="#7DD3FC"/>
+</svg>

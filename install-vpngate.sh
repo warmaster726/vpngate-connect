@@ -430,6 +430,28 @@ if [ "${MODE}" = "uninstall" ]; then
   if command -v update-desktop-database >/dev/null 2>&1; then
     sudo update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
   fi
+  ICON_REMOVED=0
+  if [ -e /usr/share/icons/hicolor/scalable/apps/vpngate.svg ] || [ -L /usr/share/icons/hicolor/scalable/apps/vpngate.svg ]; then
+    sudo rm -f /usr/share/icons/hicolor/scalable/apps/vpngate.svg
+    ICON_REMOVED=1
+  fi
+  for sz in 16 24 32 48 64 128 256 512; do
+    ico_png="/usr/share/icons/hicolor/${sz}x${sz}/apps/vpngate.png"
+    if [ -e "${ico_png}" ] || [ -L "${ico_png}" ]; then
+      sudo rm -f "${ico_png}"
+      ICON_REMOVED=1
+    fi
+  done
+  if [ -e /usr/share/pixmaps/vpngate.png ] || [ -L /usr/share/pixmaps/vpngate.png ]; then
+    sudo rm -f /usr/share/pixmaps/vpngate.png
+    ICON_REMOVED=1
+  fi
+  if [ "${ICON_REMOVED}" -eq 1 ]; then
+    record_cleaned "Removed VPN Gate Connect app icon"
+    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+      sudo gtk-update-icon-cache -f /usr/share/icons/hicolor >/dev/null 2>&1 || true
+    fi
+  fi
 
   for dir_target in \
     "${USER_CACHE_DIR}" \
@@ -471,6 +493,8 @@ if [ "${MODE}" = "uninstall" ]; then
     /usr/local/bin/vpngate-launcher \
     /usr/local/bin/vpngate-launcher.py \
     /usr/share/applications/vpngate.desktop \
+    /usr/share/icons/hicolor/scalable/apps/vpngate.svg \
+    /usr/share/pixmaps/vpngate.png \
     /run/vpngate-l2tp \
     "${USER_CACHE_DIR}" \
     "/root/.cache/vpngate"; do
@@ -835,6 +859,31 @@ if [ "${HOST_UNAME}" = "Linux" ] && [ -f "${WORK_SRC_DIR}/vpngate-launcher.py" ]
     install_lf_file "${WORK_SRC_DIR}/vpngate.desktop" /usr/share/applications/vpngate.desktop 0644
     if command -v update-desktop-database >/dev/null 2>&1; then
       sudo update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
+    fi
+  fi
+fi
+
+if [ "${HOST_UNAME}" = "Linux" ]; then
+  ICON_ROOT="${WORK_SRC_DIR}/assets"
+  if [ -f "${ICON_ROOT}/vpngate.svg" ]; then
+    info "Installing VPN Gate Connect app icon ..."
+    sudo mkdir -p /usr/share/icons/hicolor/scalable/apps
+    sudo install -m 0644 "${ICON_ROOT}/vpngate.svg" /usr/share/icons/hicolor/scalable/apps/vpngate.svg
+    for sz in 16 24 32 48 64 128 256 512; do
+      png="${ICON_ROOT}/icons/hicolor/${sz}x${sz}/apps/vpngate.png"
+      if [ -f "${png}" ]; then
+        sudo mkdir -p "/usr/share/icons/hicolor/${sz}x${sz}/apps"
+        sudo install -m 0644 "${png}" "/usr/share/icons/hicolor/${sz}x${sz}/apps/vpngate.png"
+      fi
+    done
+    if [ -f "${ICON_ROOT}/vpngate-256.png" ]; then
+      sudo mkdir -p /usr/share/pixmaps
+      sudo install -m 0644 "${ICON_ROOT}/vpngate-256.png" /usr/share/pixmaps/vpngate.png
+    fi
+    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+      sudo gtk-update-icon-cache -f /usr/share/icons/hicolor >/dev/null 2>&1 || true
+    elif command -v update-icon-caches >/dev/null 2>&1; then
+      sudo update-icon-caches /usr/share/icons/hicolor >/dev/null 2>&1 || true
     fi
   fi
 fi

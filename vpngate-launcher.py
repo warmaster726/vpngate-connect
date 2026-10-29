@@ -27,6 +27,7 @@ import sys
 import tempfile
 import termios
 from pathlib import Path
+from typing import Optional
 
 
 INITIAL_COLS = 88
@@ -35,6 +36,43 @@ PADDING_X = 24
 PADDING_Y = 20
 HEADERBAR_EST_H = 44
 DEFAULT_FONT_PT = 11
+
+
+def resolve_app_icon_file() -> Optional[Path]:
+    here = Path(os.path.realpath(sys.argv[0])).parent
+    cands = [
+        Path("/usr/share/icons/hicolor/256x256/apps/vpngate.png"),
+        Path("/usr/share/pixmaps/vpngate.png"),
+        Path("/usr/local/share/icons/hicolor/256x256/apps/vpngate.png"),
+        here / "vpngate-256.png",
+        here / "assets" / "vpngate-256.png",
+        here.parent / "assets" / "vpngate-256.png",
+        here.parent / "assets" / "icons" / "hicolor" / "256x256" / "apps" / "vpngate.png",
+    ]
+    for cand in cands:
+        if cand.is_file():
+            return cand
+    return None
+
+
+def apply_window_icon(win) -> None:
+    icon_file = resolve_app_icon_file()
+    if icon_file is not None:
+        setter = getattr(win, "set_icon_from_file", None)
+        if callable(setter):
+            try:
+                setter(str(icon_file))
+                return
+            except Exception:
+                pass
+    for name in ("vpngate", "network-vpn"):
+        setter = getattr(win, "set_icon_name", None)
+        if callable(setter):
+            try:
+                setter(name)
+                return
+            except Exception:
+                continue
 
 
 def resolve_vpngate_bin() -> str:
@@ -234,7 +272,7 @@ def run_gtk3_vte(child_argv: list) -> bool:
     )
 
     win = Gtk.Window(title="VPN Gate")
-    win.set_icon_name("network-vpn")
+    apply_window_icon(win)
     win.set_position(Gtk.WindowPosition.CENTER)
 
     hbar = Gtk.HeaderBar()
@@ -514,7 +552,7 @@ def run_gtk4_vte(child_argv: list) -> bool:
             settings.set_property("gtk-application-prefer-dark-theme", True)
 
         win = Gtk.ApplicationWindow(application=application, title="VPN Gate")
-        win.set_icon_name("network-vpn")
+        apply_window_icon(win)
 
         hbar = Gtk.HeaderBar()
         status_lbl = Gtk.Label(label="○ DISCONNECTED")
