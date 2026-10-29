@@ -7,7 +7,7 @@ members = [
 
 [workspace.package]
 # Product version for the desktop crates. Patch may exceed 9 (0.3.10, 0.3.15, …).
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/warmaster726/vpngate-connect"

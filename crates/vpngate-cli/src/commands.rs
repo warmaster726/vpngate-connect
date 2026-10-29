@@ -1895,6 +1895,46 @@ pub async fn offer_desktop_upgrade(
     prompt_and_maybe_install(paths, &remote, assume_yes).await
 }
 
+async fn live_check_desktop_update(paths: &AppPaths) {
+    info("Checking for a newer desktop on public main (anonymous HTTPS, no GitHub login) ...");
+    if let Err(e) = refresh_update_cache(paths, true).await {
+        warn(&e);
+        warn("Desktop update check failed — retry with `vpngate update`.");
+    }
+}
+
+/// `None` if nothing was shown. Snooze is skipped when `respect_snooze` is false (mode 9 / doctor).
+async fn maybe_prompt_if_newer(
+    paths: &AppPaths,
+    respect_snooze: bool,
+) -> io::Result<Option<UpgradeOffer>> {
+    let Some(cache) = load_update_cache(paths) else {
+        return Ok(None);
+    };
+    let Some(remote) = cached_newer_than_installed(&cache) else {
+        return Ok(None);
+    };
+    if respect_snooze && !should_auto_prompt(&cache, &remote.version) {
+        return Ok(None);
+    }
+    Ok(Some(prompt_and_maybe_install(paths, &remote, false).await?))
+}
+
+pub async fn cmd_doctor_with_update(paths: &AppPaths) -> io::Result<(i32, UpgradeOffer)> {
+    if is_stdout_tty() && !skip_update_check() {
+        live_check_desktop_update(paths).await;
+    }
+    let rc = cmd_doctor(paths)?;
+    let offer = if is_stdout_tty() && !skip_update_check() {
+        maybe_prompt_if_newer(paths, false)
+            .await?
+            .unwrap_or(UpgradeOffer::Continue)
+    } else {
+        UpgradeOffer::Continue
+    };
+    Ok((rc, offer))
+}
+
 async fn prompt_and_maybe_install(
     paths: &AppPaths,
     remote: &vpngate_core::RemoteDesktopVersion,
@@ -1959,11 +1999,7 @@ pub async fn interactive_menu(paths: &AppPaths, help_text: &str) -> io::Result<i
     }
 
     if is_stdout_tty() && !skip_update_check() {
-        info("Checking for a newer desktop on public main (anonymous HTTPS, no GitHub login) ...");
-        if let Err(e) = refresh_update_cache(paths, false).await {
-            warn(&e);
-            warn("Desktop update check failed — the dashboard still works. Retry with `vpngate update`.");
-        }
+        live_check_desktop_update(paths).await;
     }
 
     loop {
@@ -2063,15 +2099,10 @@ pub async fn interactive_menu(paths: &AppPaths, help_text: &str) -> io::Result<i
             && !skip_update_check()
             && !UPDATE_PROMPT_DONE.swap(true, Ordering::Relaxed)
         {
-            if let Some(cache) = load_update_cache(paths)
-                && let Some(remote) = cached_newer_than_installed(&cache)
-                && should_auto_prompt(&cache, &remote.version)
-            {
-                match prompt_and_maybe_install(paths, &remote, false).await? {
-                    UpgradeOffer::ExitAfterInstall => return Ok(0),
-                    UpgradeOffer::Continue | UpgradeOffer::Failed(_) => {}
-                }
-                continue;
+            match maybe_prompt_if_newer(paths, true).await? {
+                Some(UpgradeOffer::ExitAfterInstall) => return Ok(0),
+                Some(UpgradeOffer::Continue | UpgradeOffer::Failed(_)) => continue,
+                None => {}
             }
         }
 
@@ -2221,7 +2252,11 @@ pub async fn interactive_menu(paths: &AppPaths, help_text: &str) -> io::Result<i
                 }
             }
             "9" => {
-                let _ = cmd_doctor(paths)?;
+                let (_rc, offer) = cmd_doctor_with_update(paths).await?;
+                match offer {
+                    UpgradeOffer::ExitAfterInstall => return Ok(0),
+                    UpgradeOffer::Failed(_) | UpgradeOffer::Continue => {}
+                }
                 if let Some(ans) = prompt_input(&format!(
                     "\nPress {BOLD}H{RESET} to also view CLI command reference (`--help`), or {BOLD}Enter{RESET} for Dashboard: "
                 )) && ans.eq_ignore_ascii_case("h")

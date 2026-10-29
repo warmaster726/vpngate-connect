@@ -116,7 +116,7 @@ vpngate update                 # Scan public main for a newer desktop (no GitHub
 vpngate upgrade                # Same as `vpngate update`
 ```
 
-The interactive `[0-9]` dashboard also scans for a newer desktop over anonymous HTTPS (`raw.githubusercontent.com` and jsDelivr — no GitHub account or 2FA). The dashboard shows whether you are up to date, a newer version is available, or the check failed. If a newer version is found you are encouraged to install it; confirming runs the public installer, which disconnects any tunnel, deletes the previous `vpngate` binary, and installs the new one. Use `--no-update-check` to skip the dashboard scan, or `vpngate update -y` to install without a second prompt. Pool refresh stays `vpngate refresh`.
+The interactive `[0-9]` dashboard live-checks for a newer desktop at **startup** and again when you select **`[9]`** (`doctor`), over anonymous HTTPS (`raw.githubusercontent.com` and jsDelivr — no GitHub account or 2FA). The newest version among those sources is used, so a stale CDN cannot hide a GitHub update. If a newer version is found you are prompted to install it; confirming runs the public installer, which disconnects any tunnel, deletes the previous `vpngate` binary, and installs the new one. Use `--no-update-check` to skip those scans, or `vpngate update -y` to install without a second prompt. Pool refresh stays `vpngate refresh`.
 
 ---
 

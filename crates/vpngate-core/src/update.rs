@@ -238,7 +238,13 @@ async fn send_get(
         builder = builder.resolve(&host, addr);
     }
     let client = builder.build().ok()?;
-    let resp = client.get(url).send().await.ok()?;
+    let resp = client
+        .get(url)
+        .header("Cache-Control", "no-cache")
+        .header("Pragma", "no-cache")
+        .send()
+        .await
+        .ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -278,42 +284,44 @@ async fn fetch_public_text(url: &str) -> Option<String> {
     None
 }
 
+/// Prefer URL order (GitHub raw first). Do not race CDNs for installer bodies.
 pub async fn fetch_public_url_text(urls: &[String]) -> Result<(String, String), String> {
-    match first_successful_fetch(urls).await {
-        Some((text, url)) => Ok((text, url)),
-        None => Err(
-            "Could not read the public desktop version (raw.githubusercontent.com / jsDelivr). No GitHub login is used."
-                .to_string(),
-        ),
-    }
-}
-
-async fn first_successful_fetch(urls: &[String]) -> Option<(String, String)> {
-    let mut set = tokio::task::JoinSet::new();
-    for url in urls.iter().cloned() {
-        set.spawn(async move {
-            fetch_public_text(&url)
-                .await
-                .map(|text| (text, url))
-        });
-    }
-    let deadline = tokio::time::sleep(OVERALL_CHECK_TIMEOUT);
-    tokio::pin!(deadline);
-    loop {
-        tokio::select! {
-            _ = &mut deadline => return None,
-            joined = set.join_next() => {
-                match joined {
-                    Some(Ok(Some(pair))) => return Some(pair),
-                    Some(_) => continue,
-                    None => return None,
-                }
-            }
+    for url in urls {
+        if let Some(text) = fetch_public_text(url).await {
+            return Ok((text, url.clone()));
         }
     }
+    Err(
+        "Could not read the public desktop version (raw.githubusercontent.com / jsDelivr). No GitHub login is used."
+            .to_string(),
+    )
 }
 
-async fn first_successful_version(urls: &[String]) -> Option<(String, String)> {
+/// Keep the highest SemVer. A stale CDN (jsDelivr still on 0.2.20) must not hide GitHub 0.3.x.
+pub fn pick_highest_version(hits: &[(String, String)]) -> Option<RemoteDesktopVersion> {
+    let mut best: Option<RemoteDesktopVersion> = None;
+    for (raw, source_url) in hits {
+        let Some(version) = DesktopVersion::parse(raw) else {
+            continue;
+        };
+        let cand = RemoteDesktopVersion {
+            version,
+            raw: raw.clone(),
+            source_url: source_url.clone(),
+        };
+        if best
+            .as_ref()
+            .is_none_or(|b| cand.version > b.version)
+        {
+            best = Some(cand);
+        }
+    }
+    best
+}
+
+const VERSION_GRACE_AFTER_FIRST: Duration = Duration::from_secs(3);
+
+async fn collect_public_versions(urls: &[String]) -> Vec<(String, String)> {
     let mut set = tokio::task::JoinSet::new();
     for url in urls.iter().cloned() {
         set.spawn(async move {
@@ -322,34 +330,46 @@ async fn first_successful_version(urls: &[String]) -> Option<(String, String)> {
             Some((raw, url))
         });
     }
-    let deadline = tokio::time::sleep(OVERALL_CHECK_TIMEOUT);
-    tokio::pin!(deadline);
+    let overall = tokio::time::sleep(OVERALL_CHECK_TIMEOUT);
+    tokio::pin!(overall);
+    let grace = tokio::time::sleep(Duration::from_secs(3600));
+    tokio::pin!(grace);
+    let mut grace_armed = false;
+    let mut hits = Vec::new();
     loop {
+        if set.is_empty() {
+            break;
+        }
         tokio::select! {
-            _ = &mut deadline => return None,
+            _ = &mut overall => break,
+            _ = &mut grace, if grace_armed => break,
             joined = set.join_next() => {
                 match joined {
-                    Some(Ok(Some(pair))) => return Some(pair),
-                    Some(_) => continue,
-                    None => return None,
+                    Some(Ok(Some(pair))) => {
+                        hits.push(pair);
+                        if !grace_armed {
+                            grace.as_mut().reset(
+                                tokio::time::Instant::now() + VERSION_GRACE_AFTER_FIRST,
+                            );
+                            grace_armed = true;
+                        }
+                    }
+                    Some(_) => {}
+                    None => break,
                 }
             }
         }
     }
+    hits
 }
 
 pub async fn check_remote_desktop_version() -> Result<RemoteDesktopVersion, String> {
     let slug = default_repo_slug();
     let urls = version_check_urls(&slug);
-    let (raw, source_url) = first_successful_version(&urls).await.ok_or_else(|| {
+    let hits = collect_public_versions(&urls).await;
+    pick_highest_version(&hits).ok_or_else(|| {
         "Could not read the public desktop version (raw.githubusercontent.com / jsDelivr). No GitHub login is used."
             .to_string()
-    })?;
-    let version = DesktopVersion::parse(&raw).ok_or_else(|| format!("Invalid version '{raw}'"))?;
-    Ok(RemoteDesktopVersion {
-        version,
-        raw,
-        source_url,
     })
 }
 
@@ -456,9 +476,35 @@ mod tests {
         let a = DesktopVersion::parse("0.2.9").unwrap();
         let b = DesktopVersion::parse("0.2.10").unwrap();
         let c = DesktopVersion::parse("0.2.17").unwrap();
+        let d = DesktopVersion::parse("0.2.20").unwrap();
+        let e = DesktopVersion::parse("0.3.0").unwrap();
         assert!(a < b);
         assert!(b < c);
         assert!(c > a);
+        assert!(e > d);
+        assert!(d > c);
+    }
+
+    #[test]
+    fn highest_version_ignores_stale_cdn_hits() {
+        let hits = vec![
+            (
+                "0.2.20".to_string(),
+                "https://cdn.jsdelivr.net/gh/example@main/assets/desktop-version.txt".to_string(),
+            ),
+            (
+                "0.2.19".to_string(),
+                "https://cdn.jsdelivr.net/gh/example@main/Cargo.toml".to_string(),
+            ),
+            (
+                "0.3.0".to_string(),
+                "https://raw.githubusercontent.com/example/main/assets/desktop-version.txt"
+                    .to_string(),
+            ),
+        ];
+        let best = pick_highest_version(&hits).unwrap();
+        assert_eq!(best.raw, "0.3.0");
+        assert!(best.source_url.contains("raw.githubusercontent.com"));
     }
 
     #[test]
