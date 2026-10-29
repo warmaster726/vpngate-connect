@@ -41,7 +41,8 @@ fn build_help_text() -> String {
            vpngate doctor                       Run crypto, L2TP/XFRM, OpenVPN & network diagnostics\n\
            vpngate probe <IPv4>                 Run 1-RTT IKEv1 PSK='vpn' + TCP/443 pre-flight check\n\
            vpngate disconnect                   Tear down active VPN & restore host DNS/routes/firewall\n\
-           vpngate upgrade [-y]                 Scan public main for a newer desktop (no GitHub login) and replace this install\n\n\
+           vpngate update [-y]                  Scan public main for a newer desktop (no GitHub login) and replace this install\n\
+           vpngate upgrade [-y]                 Same as `vpngate update`\n\n\
          SHORTHAND FLAGS (Python v5.3 Compatible):\n\
            -i, --interactive     Launch Interactive Console Dashboard\n\
            -L, --list-countries  Show unified countries & regions table\n\
@@ -66,7 +67,7 @@ fn build_help_text() -> String {
                --no-resize       Disable dynamic terminal window resize sequences\n\
                --no-clear        Do not clear previous screen items before command execution\n\
                --no-update-check Skip the dashboard scan for a newer desktop\n\
-           -y, --yes             With `upgrade`, install without an extra confirmation prompt\n\
+           -y, --yes             With `update`/`upgrade`, install without an extra confirmation prompt\n\
            -h, --help            Print this help message\n",
         env!("CARGO_PKG_VERSION")
     )
@@ -396,10 +397,13 @@ async fn dispatch_commands(paths: &AppPaths, raw_args: &[String]) -> io::Result<
         };
         return cmd_probe(ip).await;
     }
-    if matches!(subcmd.as_str(), "upgrade" | "self-update" | "selfupdate") {
+    if matches!(
+        subcmd.as_str(),
+        "update" | "upgrade" | "self-update" | "selfupdate"
+    ) {
         return cmd_upgrade(paths, flag_yes).await;
     }
-    if matches!(subcmd.as_str(), "refresh" | "update") {
+    if matches!(subcmd.as_str(), "refresh") {
         return cmd_refresh(paths, &custom_mirrors).await;
     }
     if flag_countries || matches!(subcmd.as_str(), "countries" | "regions" | "c") {

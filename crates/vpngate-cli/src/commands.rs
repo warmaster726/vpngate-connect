@@ -23,9 +23,9 @@ use vpngate_core::{
     load_cooldowns, load_watchdog_pref, normalize_mirror_base_url, now_unix_secs, probe_tcp,
     prune_stale_state_if_dead, query_windows_natt_rule, read_json_opt, run_ikev1_crypto_self_test,
     save_cached_mirrors, save_cooldowns, save_watchdog_pref, sort_servers,
-    cache_is_fresh, check_remote_desktop_version, default_repo_slug, fetch_public_url_text,
-    installer_script_urls, installed_desktop_version, load_update_cache, record_update_declined,
-    record_update_scan, resolve_user_home, should_auto_prompt, spawn_auto_reconnect_monitor,
+    cached_newer_than_installed, default_repo_slug, fetch_public_url_text, installer_script_urls,
+    installed_desktop_version, load_update_cache, record_update_declined, refresh_update_cache,
+    resolve_user_home, should_auto_prompt, spawn_auto_reconnect_monitor,
     stop_monitor_daemon, summarize_countries, verify_l2tp_psk_vpn, which_bin,
 };
 
@@ -40,6 +40,7 @@ use crate::term_ui::{
 static UAC_ALREADY_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 static NO_ELEVATE_REQUESTED: AtomicBool = AtomicBool::new(false);
 static SKIP_UPDATE_CHECK: AtomicBool = AtomicBool::new(false);
+static UPDATE_PROMPT_DONE: AtomicBool = AtomicBool::new(false);
 
 pub fn set_uac_already_attempted(val: bool) {
     UAC_ALREADY_ATTEMPTED.store(val, Ordering::Relaxed);
@@ -1238,7 +1239,7 @@ pub fn cmd_doctor(paths: &AppPaths) -> io::Result<i32> {
             let local = installed_desktop_version();
             if remote > local {
                 lines.push(Some(format!(
-                    "Desktop Ver  : {YELLOW}UPDATE{RESET} — {local} installed, {GREEN}{}{RESET} on public main (`vpngate upgrade`)",
+                    "Desktop Ver  : {YELLOW}UPDATE{RESET} — {local} installed, {GREEN}{}{RESET} on public main (`vpngate update`)",
                     uc.remote_version
                 )));
             } else {
@@ -1246,10 +1247,19 @@ pub fn cmd_doctor(paths: &AppPaths) -> io::Result<i32> {
                     "Desktop Ver  : {GREEN}{local}{RESET} — up to date vs public main"
                 )));
             }
+        } else if !uc.last_error.is_empty() {
+            lines.push(Some(format!(
+                "Desktop Ver  : {YELLOW}CHECK FAILED{RESET} — retry `{CYAN}vpngate update{RESET}` (anonymous HTTPS, no GitHub login)"
+            )));
+        } else {
+            lines.push(Some(format!(
+                "Desktop Ver  : {} — run `{CYAN}vpngate update{RESET}` to scan public main (no GitHub login)",
+                env!("CARGO_PKG_VERSION")
+            )));
         }
     } else {
         lines.push(Some(format!(
-            "Desktop Ver  : {} — run `{CYAN}vpngate upgrade{RESET}` to scan public main (no GitHub login)",
+            "Desktop Ver  : {} — run `{CYAN}vpngate update{RESET}` to scan public main (no GitHub login)",
             env!("CARGO_PKG_VERSION")
         )));
     }
@@ -1815,49 +1825,48 @@ pub async fn cmd_upgrade(paths: &AppPaths, assume_yes: bool) -> io::Result<i32> 
     }
 }
 
-/// Scan public `main` for a newer desktop. `force` ignores the 6h cache (used by `vpngate upgrade`).
+fn desktop_update_status_line(paths: &AppPaths) -> String {
+    let local = installed_desktop_version();
+    match load_update_cache(paths) {
+        Some(cache) if !cache.last_error.is_empty() && cache.remote_version.is_empty() => {
+            format!("Update   : {YELLOW}CHECK FAILED{RESET} — run `{BOLD}vpngate update{RESET}` (anonymous HTTPS, no GitHub login)")
+        }
+        Some(cache) => {
+            if let Some(remote) = vpngate_core::DesktopVersion::parse(&cache.remote_version) {
+                if remote > local {
+                    format!(
+                        "Update   : {YELLOW}{BOLD}{} available{RESET} — you have {local}. Installing is strongly recommended.",
+                        cache.remote_version
+                    )
+                } else if remote < local {
+                    format!("Update   : {CYAN}{local}{RESET} — newer than public main ({})", cache.remote_version)
+                } else {
+                    format!("Update   : {GREEN}up to date{RESET} — public main is {local}")
+                }
+            } else {
+                format!("Update   : {DIM}not checked yet{RESET}")
+            }
+        }
+        None => format!("Update   : {DIM}not checked yet{RESET}"),
+    }
+}
+
+/// Scan public `main` for a newer desktop. `force` ignores the 6h cache (used by `vpngate update`).
 pub async fn offer_desktop_upgrade(
     paths: &AppPaths,
     force: bool,
     assume_yes: bool,
 ) -> io::Result<UpgradeOffer> {
     let installed = installed_desktop_version();
-    if !force {
-        if let Some(cache) = load_update_cache(paths)
-            && cache_is_fresh(&cache)
-        {
-            if let Some(remote) = vpngate_core::DesktopVersion::parse(&cache.remote_version)
-                && remote > installed
-                && should_auto_prompt(&cache, &remote)
-            {
-                return prompt_and_maybe_install(
-                    paths,
-                    &vpngate_core::RemoteDesktopVersion {
-                        version: remote,
-                        raw: cache.remote_version.clone(),
-                        source_url: cache.source_url.clone(),
-                    },
-                    assume_yes,
-                )
-                .await;
-            }
-            return Ok(UpgradeOffer::Continue);
-        }
-    }
-
     info("Checking for a newer desktop on public main (anonymous HTTPS, no GitHub login) ...");
-    let remote = match check_remote_desktop_version().await {
+    let remote = match refresh_update_cache(paths, force).await {
         Ok(v) => v,
         Err(e) => {
-            if force {
-                err(&e);
-            } else {
-                // Dashboard stays usable if GitHub/jsDelivr is blocked.
-            }
+            err(&e);
+            warn("Could not see public main. Retry with `vpngate update`.");
             return Ok(UpgradeOffer::Continue);
         }
     };
-    let cache = record_update_scan(paths, &remote);
 
     if remote.version < installed {
         if force {
@@ -1876,8 +1885,12 @@ pub async fn offer_desktop_upgrade(
         }
         return Ok(UpgradeOffer::Continue);
     }
-    if !force && !should_auto_prompt(&cache, &remote.version) {
-        return Ok(UpgradeOffer::Continue);
+    if !force {
+        if let Some(cache) = load_update_cache(paths)
+            && !should_auto_prompt(&cache, &remote.version)
+        {
+            return Ok(UpgradeOffer::Continue);
+        }
     }
     prompt_and_maybe_install(paths, &remote, assume_yes).await
 }
@@ -1902,7 +1915,7 @@ async fn prompt_and_maybe_install(
     let accepted = if assume_yes {
         true
     } else if !is_stdout_tty() {
-        warn("Non-interactive session: re-run `vpngate upgrade -y` to install.");
+        warn("Non-interactive session: re-run `vpngate update -y` to install.");
         false
     } else {
         match prompt_input("Install this update now? [Y/n]: ") {
@@ -1916,7 +1929,7 @@ async fn prompt_and_maybe_install(
 
     if !accepted {
         record_update_declined(paths, remote);
-        info("Skipped. You can install later with `vpngate upgrade`.");
+        info("Skipped. You can install later with `vpngate update`.");
         return Ok(UpgradeOffer::Continue);
     }
 
@@ -1946,9 +1959,10 @@ pub async fn interactive_menu(paths: &AppPaths, help_text: &str) -> io::Result<i
     }
 
     if is_stdout_tty() && !skip_update_check() {
-        match offer_desktop_upgrade(paths, false, false).await? {
-            UpgradeOffer::ExitAfterInstall => return Ok(0),
-            UpgradeOffer::Continue | UpgradeOffer::Failed(_) => {}
+        info("Checking for a newer desktop on public main (anonymous HTTPS, no GitHub login) ...");
+        if let Err(e) = refresh_update_cache(paths, false).await {
+            warn(&e);
+            warn("Desktop update check failed — the dashboard still works. Retry with `vpngate update`.");
         }
     }
 
@@ -2004,6 +2018,7 @@ pub async fn interactive_menu(paths: &AppPaths, help_text: &str) -> io::Result<i
             )),
             Some(status_line),
             Some(local_pool_summary_line(paths)),
+            Some(desktop_update_status_line(paths)),
             None,
             Some(format!(
                 " {CYAN}[1]{RESET} Quick Connect by Region (Recommended Auto: L2TP -> OVPN UDP -> TCP)"
@@ -2043,6 +2058,22 @@ pub async fn interactive_menu(paths: &AppPaths, help_text: &str) -> io::Result<i
             )),
         ];
         render_dynamic_box(&menu_lines, 5, 76)?;
+
+        if is_stdout_tty()
+            && !skip_update_check()
+            && !UPDATE_PROMPT_DONE.swap(true, Ordering::Relaxed)
+        {
+            if let Some(cache) = load_update_cache(paths)
+                && let Some(remote) = cached_newer_than_installed(&cache)
+                && should_auto_prompt(&cache, &remote.version)
+            {
+                match prompt_and_maybe_install(paths, &remote, false).await? {
+                    UpgradeOffer::ExitAfterInstall => return Ok(0),
+                    UpgradeOffer::Continue | UpgradeOffer::Failed(_) => {}
+                }
+                continue;
+            }
+        }
 
         let Some(choice) = prompt_input(&format!("\nSelect an action {BOLD}[0-9]{RESET}: ")) else {
             print_line("");

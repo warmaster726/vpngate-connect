@@ -63,8 +63,10 @@ pub use protocol::{
 pub use server::{VpnServer, filter_by_country, filter_by_protocol, sort_servers};
 pub use update::{
     DesktopVersion, RemoteDesktopVersion, UpdateCheckCache, cache_is_fresh,
-    cargo_toml_check_urls, check_remote_desktop_version, default_repo_slug,
-    fetch_public_url_text, installer_script_urls, installed_desktop_version,
-    load_update_cache, parse_workspace_package_version, record_update_declined,
-    record_update_scan, should_auto_prompt,
+    cached_newer_than_installed, cached_remote_version, cargo_toml_check_urls,
+    check_remote_desktop_version, default_repo_slug, fetch_public_url_text,
+    installer_script_urls, installed_desktop_version, load_update_cache,
+    parse_version_payload, parse_workspace_package_version, record_update_declined,
+    record_update_failure, record_update_scan, refresh_update_cache, should_auto_prompt,
+    version_check_urls,
 };

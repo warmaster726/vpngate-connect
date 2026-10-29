@@ -18,7 +18,8 @@ pub const UPDATE_DECLINE_SNOOZE_SECS: u64 = 24 * 3600;
 /// Re-use a successful scan for this long on the interactive dashboard.
 pub const UPDATE_CACHE_TTL_SECS: u64 = 6 * 3600;
 
-const FETCH_TIMEOUT: Duration = Duration::from_secs(8);
+const FETCH_TIMEOUT: Duration = Duration::from_secs(12);
+const OVERALL_CHECK_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DesktopVersion {
@@ -88,6 +89,8 @@ pub struct UpdateCheckCache {
     pub declined_version: String,
     #[serde(default)]
     pub declined_at: u64,
+    #[serde(default)]
+    pub last_error: String,
 }
 
 pub fn installed_desktop_version() -> DesktopVersion {
@@ -119,10 +122,31 @@ pub fn default_repo_slug() -> String {
 }
 
 pub fn cargo_toml_check_urls(slug: &str) -> Vec<String> {
-    vec![
-        format!("https://raw.githubusercontent.com/{slug}/main/Cargo.toml"),
-        format!("https://cdn.jsdelivr.net/gh/{slug}@main/Cargo.toml"),
-    ]
+    version_check_urls(slug)
+        .into_iter()
+        .filter(|u| u.ends_with("Cargo.toml"))
+        .collect()
+}
+
+/// Anonymous HTTPS endpoints only (no GitHub API, no tokens, no 2FA).
+pub fn version_check_urls(slug: &str) -> Vec<String> {
+    let mut urls = Vec::new();
+    for file in ["assets/desktop-version.txt", "Cargo.toml"] {
+        urls.push(format!(
+            "https://raw.githubusercontent.com/{slug}/main/{file}"
+        ));
+        urls.push(format!(
+            "https://raw.githubusercontent.com/{slug}/refs/heads/main/{file}"
+        ));
+        urls.push(format!("https://cdn.jsdelivr.net/gh/{slug}@main/{file}"));
+        urls.push(format!(
+            "https://fastly.jsdelivr.net/gh/{slug}@main/{file}"
+        ));
+        urls.push(format!(
+            "https://github.com/{slug}/raw/main/{file}"
+        ));
+    }
+    urls
 }
 
 pub fn installer_script_urls(slug: &str) -> Vec<String> {
@@ -137,6 +161,26 @@ pub fn installer_script_urls(slug: &str) -> Vec<String> {
             format!("https://cdn.jsdelivr.net/gh/{slug}@main/install-vpngate.sh"),
         ]
     }
+}
+
+/// Parse a tiny `desktop-version.txt` (`0.2.20`) or `[workspace.package] version`.
+pub fn parse_version_payload(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || looks_like_html(trimmed) {
+        return None;
+    }
+    if let Some(line) = trimmed.lines().next() {
+        let line = line.trim().trim_start_matches('v');
+        if DesktopVersion::parse(line).is_some() {
+            return Some(line.to_string());
+        }
+    }
+    parse_workspace_package_version(text)
+}
+
+fn looks_like_html(text: &str) -> bool {
+    let t = text.trim_start().to_ascii_lowercase();
+    t.starts_with("<!doctype") || t.starts_with("<html") || t.starts_with("<head")
 }
 
 /// Parse `[workspace.package] version = "x.y.z"` (patch may exceed 9).
@@ -162,53 +206,72 @@ pub fn parse_workspace_package_version(toml: &str) -> Option<String> {
     None
 }
 
-fn user_agent() -> String {
-    format!(
-        "VPNGate-CLI/{} (+https://github.com/warmaster726/vpngate-connect)",
-        env!("CARGO_PKG_VERSION")
-    )
+fn user_agents() -> [String; 2] {
+    [
+        format!(
+            "VPNGate-CLI/{} (+https://github.com/warmaster726/vpngate-connect)",
+            env!("CARGO_PKG_VERSION")
+        ),
+        "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0".to_string(),
+    ]
+}
+
+fn acceptable_body(text: &str) -> bool {
+    let t = text.trim();
+    t.len() >= 5 && !looks_like_html(t)
+}
+
+async fn send_get(
+    url: &str,
+    ua: &str,
+    http1_only: bool,
+    pinned: Option<(String, SocketAddr)>,
+) -> Option<String> {
+    let mut builder = reqwest::Client::builder()
+        .user_agent(ua)
+        .timeout(FETCH_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::limited(5));
+    if http1_only {
+        builder = builder.http1_only();
+    }
+    if let Some((host, addr)) = pinned {
+        builder = builder.resolve(&host, addr);
+    }
+    let client = builder.build().ok()?;
+    let resp = client.get(url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let text = resp.text().await.ok()?;
+    if acceptable_body(&text) {
+        Some(text)
+    } else {
+        None
+    }
 }
 
 async fn fetch_public_text(url: &str) -> Option<String> {
-    let ua = user_agent();
-    let client = reqwest::Client::builder()
-        .user_agent(&ua)
-        .timeout(FETCH_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .build()
-        .ok()?;
-    if let Ok(resp) = client.get(url).send().await
-        && resp.status().is_success()
-        && let Ok(text) = resp.text().await
-        && text.len() > 16
-    {
-        return Some(text);
+    for ua in user_agents() {
+        for http1 in [false, true] {
+            if let Some(text) = send_get(url, &ua, http1, None).await {
+                return Some(text);
+            }
+        }
     }
 
     let parsed = reqwest::Url::parse(url).ok()?;
-    let host = parsed.host_str()?;
+    let host = parsed.host_str()?.to_string();
     if host.parse::<std::net::Ipv4Addr>().is_ok() {
         return None;
     }
     let port = parsed.port_or_known_default()?;
-    let ips = resolve_ipv4_via_cloudflare_doh(host, Duration::from_secs(4))
+    let ips = resolve_ipv4_via_cloudflare_doh(&host, Duration::from_secs(4))
         .await
         .ok()?;
+    let ua = user_agents()[0].clone();
     for ip in ips.into_iter().take(2) {
-        let Ok(pinned) = reqwest::Client::builder()
-            .user_agent(&ua)
-            .timeout(FETCH_TIMEOUT)
-            .resolve(host, SocketAddr::new(IpAddr::V4(ip), port))
-            .redirect(reqwest::redirect::Policy::limited(5))
-            .build()
-        else {
-            continue;
-        };
-        if let Ok(resp) = pinned.get(url).send().await
-            && resp.status().is_success()
-            && let Ok(text) = resp.text().await
-            && text.len() > 16
-        {
+        let addr = SocketAddr::new(IpAddr::V4(ip), port);
+        if let Some(text) = send_get(url, &ua, true, Some((host.clone(), addr))).await {
             return Some(text);
         }
     }
@@ -216,23 +279,71 @@ async fn fetch_public_text(url: &str) -> Option<String> {
 }
 
 pub async fn fetch_public_url_text(urls: &[String]) -> Result<(String, String), String> {
-    for url in urls {
-        if let Some(text) = fetch_public_text(url).await {
-            return Ok((text, url.clone()));
+    match first_successful_fetch(urls).await {
+        Some((text, url)) => Ok((text, url)),
+        None => Err(
+            "Could not read the public desktop version (raw.githubusercontent.com / jsDelivr). No GitHub login is used."
+                .to_string(),
+        ),
+    }
+}
+
+async fn first_successful_fetch(urls: &[String]) -> Option<(String, String)> {
+    let mut set = tokio::task::JoinSet::new();
+    for url in urls.iter().cloned() {
+        set.spawn(async move {
+            fetch_public_text(&url)
+                .await
+                .map(|text| (text, url))
+        });
+    }
+    let deadline = tokio::time::sleep(OVERALL_CHECK_TIMEOUT);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = &mut deadline => return None,
+            joined = set.join_next() => {
+                match joined {
+                    Some(Ok(Some(pair))) => return Some(pair),
+                    Some(_) => continue,
+                    None => return None,
+                }
+            }
         }
     }
-    Err(
-        "Could not read the public desktop version (raw.githubusercontent.com / jsDelivr). No GitHub login is used."
-            .to_string(),
-    )
+}
+
+async fn first_successful_version(urls: &[String]) -> Option<(String, String)> {
+    let mut set = tokio::task::JoinSet::new();
+    for url in urls.iter().cloned() {
+        set.spawn(async move {
+            let text = fetch_public_text(&url).await?;
+            let raw = parse_version_payload(&text)?;
+            Some((raw, url))
+        });
+    }
+    let deadline = tokio::time::sleep(OVERALL_CHECK_TIMEOUT);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = &mut deadline => return None,
+            joined = set.join_next() => {
+                match joined {
+                    Some(Ok(Some(pair))) => return Some(pair),
+                    Some(_) => continue,
+                    None => return None,
+                }
+            }
+        }
+    }
 }
 
 pub async fn check_remote_desktop_version() -> Result<RemoteDesktopVersion, String> {
     let slug = default_repo_slug();
-    let urls = cargo_toml_check_urls(&slug);
-    let (toml, source_url) = fetch_public_url_text(&urls).await?;
-    let raw = parse_workspace_package_version(&toml).ok_or_else(|| {
-        format!("Public Cargo.toml from {source_url} did not contain [workspace.package] version")
+    let urls = version_check_urls(&slug);
+    let (raw, source_url) = first_successful_version(&urls).await.ok_or_else(|| {
+        "Could not read the public desktop version (raw.githubusercontent.com / jsDelivr). No GitHub login is used."
+            .to_string()
     })?;
     let version = DesktopVersion::parse(&raw).ok_or_else(|| format!("Invalid version '{raw}'"))?;
     Ok(RemoteDesktopVersion {
@@ -255,8 +366,63 @@ pub fn record_update_scan(paths: &AppPaths, remote: &RemoteDesktopVersion) -> Up
     cache.checked_at = now_unix_secs();
     cache.remote_version = remote.raw.clone();
     cache.source_url = remote.source_url.clone();
+    cache.last_error.clear();
     save_update_cache(paths, &cache);
     cache
+}
+
+pub fn record_update_failure(paths: &AppPaths, error: &str) {
+    let mut cache = load_update_cache(paths).unwrap_or_default();
+    cache.checked_at = now_unix_secs();
+    cache.last_error = error.to_string();
+    save_update_cache(paths, &cache);
+}
+
+pub fn cached_remote_version(cache: &UpdateCheckCache) -> Option<RemoteDesktopVersion> {
+    let version = DesktopVersion::parse(&cache.remote_version)?;
+    Some(RemoteDesktopVersion {
+        version,
+        raw: cache.remote_version.clone(),
+        source_url: cache.source_url.clone(),
+    })
+}
+
+pub fn cached_newer_than_installed(cache: &UpdateCheckCache) -> Option<RemoteDesktopVersion> {
+    let remote = cached_remote_version(cache)?;
+    if remote.version > installed_desktop_version() {
+        Some(remote)
+    } else {
+        None
+    }
+}
+
+/// Live-scan unless a successful result is still within the TTL.
+pub async fn refresh_update_cache(
+    paths: &AppPaths,
+    force: bool,
+) -> Result<RemoteDesktopVersion, String> {
+    if !force && let Some(cache) = load_update_cache(paths) {
+        let age = now_unix_secs().saturating_sub(cache.checked_at);
+        let usable = cache.last_error.is_empty() && cache_is_fresh(&cache);
+        let retry_failed = !cache.last_error.is_empty() && age < 30;
+        if usable {
+            if let Some(remote) = cached_remote_version(&cache) {
+                return Ok(remote);
+            }
+        } else if retry_failed {
+            return Err(cache.last_error);
+        }
+    }
+    match check_remote_desktop_version().await {
+        Ok(remote) => {
+            record_update_scan(paths, &remote);
+            Ok(remote)
+        }
+        Err(err) => {
+            record_update_failure(paths, &err);
+            Err(err)
+        }
+    }
 }
 
 pub fn record_update_declined(paths: &AppPaths, remote: &RemoteDesktopVersion) {
@@ -310,5 +476,27 @@ edition = "2024"
             parse_workspace_package_version(toml).as_deref(),
             Some("0.2.18")
         );
+        assert_eq!(
+            parse_version_payload("0.2.20\n").as_deref(),
+            Some("0.2.20")
+        );
+        assert!(parse_version_payload("<html>404</html>").is_none());
+        assert!(parse_version_payload("<!DOCTYPE html>").is_none());
+    }
+
+    #[test]
+    fn version_urls_include_plain_text_and_cargo_toml() {
+        let urls = version_check_urls("warmaster726/vpngate-connect");
+        assert!(
+            urls.iter()
+                .any(|u| u.ends_with("/assets/desktop-version.txt"))
+        );
+        assert!(urls.iter().any(|u| u.ends_with("/Cargo.toml")));
+        assert!(
+            urls.iter()
+                .any(|u| u.contains("raw.githubusercontent.com") && u.contains("/main/"))
+        );
+        assert!(urls.iter().any(|u| u.contains("cdn.jsdelivr.net")));
+        assert!(urls.iter().any(|u| u.contains("fastly.jsdelivr.net")));
     }
 }
