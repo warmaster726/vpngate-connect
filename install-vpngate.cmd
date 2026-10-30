@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
 chcp 65001 >nul 2>&1
-title VPN Gate Connect - Windows 11 x64 Installer
+title VPN Gate Connect - Windows 11 Installer
 
 :: Detect if double-clicked from File Explorer (`cmd.exe /c ...`)
 set "VG_PAUSE_ON_EXIT=0"

@@ -1,8 +1,8 @@
 # VPN Gate Connect
 
-Censorship-resilient **SoftEther VPN Gate** desktop client engineered around a **100% pure-Rust networking & cryptography core** (`rustls`, pure-Rust `AES-256/128/3DES` + `MODP-1024` IKEv1, zero OpenSSL build dependency) for **x86_64 Linux, Windows 11, and Intel macOS**.
+Censorship-resilient **SoftEther VPN Gate** desktop client engineered around a **100% pure-Rust networking & cryptography core** (`rustls`, pure-Rust `AES-256/128/3DES` + `MODP-1024` IKEv1, zero OpenSSL build dependency) for **64-bit Linux, Windows 11, and macOS** (`x86_64` and `aarch64`).
 
-**Architecture:** desktop is **x86_64-native only**. ARM64 (Apple Silicon, Windows-on-ARM, aarch64 Linux), 32-bit, Rosetta, and x64 emulation are not supported. The web client is unchanged.
+**Architecture:** desktop is **64-bit native** — `x86_64` and ARM64 (Apple Silicon, Windows-on-ARM, aarch64 Linux). 32-bit, Rosetta, and Windows-on-ARM x64 emulation are not supported. The web client is unchanged.
 
 ---
 
@@ -26,14 +26,14 @@ Censorship-resilient **SoftEther VPN Gate** desktop client engineered around a *
 
 | Branch | Status | Description |
 | :--- | :--- | :--- |
-| **`main`** | **Active (Default)** | Public **0.3.x** Pure-Rust x86_64 Desktop Edition (`vpngate-core`, `vpngate-cli`, Linux/macOS & Windows 11 installers, GNOME GTK/VTE launcher). Version on `main` ticks when `develop` is merged. |
+| **`main`** | **Active (Default)** | Public **0.3.x** Pure-Rust 64-bit Desktop Edition (`vpngate-core`, `vpngate-cli`, Linux/macOS & Windows 11 installers, GNOME GTK/VTE launcher). Version on `main` ticks when `develop` is merged. |
 | **`develop`** | **Active (integration)** | Ongoing desktop work. Merge into `main` when you want a public version bump, so `main` does not increment on every change. |
 
 ---
 
 ## Quick Installation
 
-### Linux (Kali, Debian, Ubuntu, Mint, Pop!_OS, Fedora, Arch) & macOS — x86_64 only
+### Linux (Kali, Debian, Ubuntu, Mint, Pop!_OS, Fedora, Arch) & macOS — 64-bit (`x86_64` and ARM64)
 
 **One-liner install:**
 
@@ -59,7 +59,7 @@ sh ./install-vpngate.sh --uninstall
 
 ---
 
-### Windows 11 — x86_64 (amd64) only
+### Windows 11 — 64-bit (`x86_64` and ARM64)
 
 **One-liner install in Administrator PowerShell:**
 
@@ -80,19 +80,23 @@ Same compile-tool prompt as Linux: keep or remove Rust / MinGW after `vpngate.ex
 Because TLS (`rustls`) and IKEv1 cryptography are implemented in pure Rust and exact crate versions are pinned in [`Cargo.lock`](Cargo.lock), **no OpenSSL headers, `pkg-config`, or `cmake` are required**—only a standard Rust toolchain (`rustup`) and a basic C linker (`gcc`/`clang` on Unix, or MSVC / MinGW-w64 `gcc.exe` on Windows):
 
 ```bash
-# Option A — Install directly from Git with Cargo (x86_64 host with Rust installed):
+# Option A — Install directly from Git with Cargo (64-bit host with Rust installed):
 cargo install --git https://github.com/warmaster726/vpngate-connect.git --locked vpngate-cli --target x86_64-unknown-linux-gnu
-# Windows:  --target x86_64-pc-windows-msvc   (or x86_64-pc-windows-gnu)
-# macOS:    --target x86_64-apple-darwin
+# Linux ARM64:   --target aarch64-unknown-linux-gnu
+# Windows x64:   --target x86_64-pc-windows-msvc   (or x86_64-pc-windows-gnu)
+# Windows ARM64: --target aarch64-pc-windows-msvc
+# macOS Intel:   --target x86_64-apple-darwin
+# macOS Apple Silicon: --target aarch64-apple-darwin
 
-# Option B — Clone & compile a standalone x86_64 release binary:
+# Option B — Clone & compile a standalone 64-bit release binary:
 git clone https://github.com/warmaster726/vpngate-connect.git
 cd vpngate-connect
 cargo build --release --locked -p vpngate-cli --target x86_64-unknown-linux-gnu
-# Linux:  ./target/x86_64-unknown-linux-gnu/release/vpngate
-# Windows MSVC: cargo build --release --locked -p vpngate-cli --target x86_64-pc-windows-msvc
-#               .\target\x86_64-pc-windows-msvc\release\vpngate.exe
-# macOS:  cargo build --release --locked -p vpngate-cli --target x86_64-apple-darwin
+# Linux x64:     ./target/x86_64-unknown-linux-gnu/release/vpngate
+# Linux ARM64:   ./target/aarch64-unknown-linux-gnu/release/vpngate
+# Windows x64:   .\target\x86_64-pc-windows-msvc\release\vpngate.exe
+# Windows ARM64: .\target\aarch64-pc-windows-msvc\release\vpngate.exe
+# macOS:         cargo build --release --locked -p vpngate-cli --target aarch64-apple-darwin   # or x86_64-apple-darwin
 ```
 
 ---

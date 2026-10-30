@@ -1231,7 +1231,8 @@ pub fn cmd_doctor(paths: &AppPaths) -> io::Result<i32> {
             env!("CARGO_PKG_VERSION")
         )),
         Some(format!(
-            "CPU ISA      : {GREEN}x86_64 native{RESET} — desktop supports x64 hardware only"
+            "CPU ISA      : {GREEN}{} native{RESET} — 64-bit x86_64 and ARM64 (no 32-bit, no ISA emulation)",
+            vpngate_core::cpu_isa_label()
         )),
     ];
     if let Some(uc) = load_update_cache(paths) {

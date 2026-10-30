@@ -1,6 +1,6 @@
 [package]
 name = "vpngate-cli"
-description = "Censorship-resilient SoftEther VPN Gate desktop CLI (x86_64-native only) for Linux, Windows 11, and Intel macOS"
+description = "Censorship-resilient SoftEther VPN Gate desktop CLI (64-bit x86_64 and ARM64) for Linux, Windows 11, and macOS"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

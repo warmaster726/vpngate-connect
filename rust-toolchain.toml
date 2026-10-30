@@ -1,6 +1,6 @@
-# Desktop is x86_64-native only. Installers pass --target explicitly.
-# Do not list extra rustup targets here (that would download Windows/mac
-# toolchains onto Linux hosts).
+# Desktop is 64-bit native (x86_64 and aarch64). Installers pass --target
+# for the host ISA. Do not list extra rustup targets here (that would
+# download Windows/mac toolchains onto Linux hosts).
 [toolchain]
 channel = "stable"
 components = ["rustfmt", "clippy", "rust-src"]
