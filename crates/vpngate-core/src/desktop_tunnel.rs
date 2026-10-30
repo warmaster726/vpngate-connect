@@ -98,6 +98,7 @@ mod win_ffi {
     }
 
     const PROCESSOR_ARCHITECTURE_AMD64: u16 = 9;
+    const PROCESSOR_ARCHITECTURE_ARM64: u16 = 12;
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
@@ -112,7 +113,7 @@ mod win_ffi {
         pub fn CloseHandle(object: *mut c_void) -> i32;
     }
 
-    pub fn native_processor_is_amd64() -> bool {
+    fn native_processor_architecture() -> u16 {
         // SAFETY: `GetNativeSystemInfo` writes a well-defined `SYSTEM_INFO` and never fails.
         unsafe {
             let mut info = SystemInfo {
@@ -129,8 +130,16 @@ mod win_ffi {
                 w_processor_revision: 0,
             };
             GetNativeSystemInfo(&mut info);
-            info.w_processor_architecture == PROCESSOR_ARCHITECTURE_AMD64
+            info.w_processor_architecture
         }
+    }
+
+    pub fn native_processor_is_amd64() -> bool {
+        native_processor_architecture() == PROCESSOR_ARCHITECTURE_AMD64
+    }
+
+    pub fn native_processor_is_arm64() -> bool {
+        native_processor_architecture() == PROCESSOR_ARCHITECTURE_ARM64
     }
 
     pub fn is_current_process_elevated() -> bool {
@@ -266,30 +275,60 @@ pub fn detect_host_os_label() -> String {
     }
 }
 
-/// Refuse ARM64 (including Windows-on-ARM x64 emulation and macOS Rosetta) and 32-bit hosts.
-pub fn assert_x64_native_host() -> Result<(), String> {
-    if host_is_native_x86_64() {
+/// Native 64-bit `x86_64` or `aarch64`. Refuse 32-bit hosts and ISA emulation
+/// (Windows-on-ARM x64, macOS Rosetta).
+pub fn assert_supported_native_host() -> Result<(), String> {
+    if host_matches_binary_isa() {
         Ok(())
     } else {
-        Err(
-            "VPN Gate Connect desktop is x86_64-native only and does not support ARM64 or 32-bit hardware (including x64 emulation / Rosetta)."
-                .to_string(),
-        )
+        Err(format!(
+            "VPN Gate Connect desktop requires a native 64-bit {} process (x86_64 or ARM64). 32-bit hardware and ISA emulation (Rosetta / Windows-on-ARM x64) are not supported.",
+            cpu_isa_label()
+        ))
     }
 }
 
-fn host_is_native_x86_64() -> bool {
+pub fn cpu_isa_label() -> &'static str {
+    if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        "x86_64"
+    }
+}
+
+fn host_matches_binary_isa() -> bool {
     #[cfg(windows)]
     {
-        win_ffi::native_processor_is_amd64()
+        #[cfg(target_arch = "x86_64")]
+        {
+            win_ffi::native_processor_is_amd64()
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            win_ffi::native_processor_is_arm64()
+        }
     }
     #[cfg(target_os = "macos")]
     {
-        unix_uname_is_x86_64() && !macos_has_arm64_cpu()
+        #[cfg(target_arch = "x86_64")]
+        {
+            unix_uname_machine_is_x86_64() && !macos_has_arm64_cpu()
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            unix_uname_machine_is_aarch64() || macos_has_arm64_cpu()
+        }
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        unix_uname_is_x86_64()
+        #[cfg(target_arch = "x86_64")]
+        {
+            unix_uname_machine_is_x86_64()
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            unix_uname_machine_is_aarch64()
+        }
     }
     #[cfg(not(any(windows, unix)))]
     {
@@ -298,18 +337,35 @@ fn host_is_native_x86_64() -> bool {
 }
 
 #[cfg(unix)]
-fn unix_uname_is_x86_64() -> bool {
+fn unix_uname_machine() -> String {
     // SAFETY: `uname` fills a stack `utsname`; `machine` is a NUL-terminated C string.
     unsafe {
         let mut u: libc::utsname = std::mem::zeroed();
         if libc::uname(&mut u) != 0 {
-            return false;
+            return String::new();
         }
-        let machine = std::ffi::CStr::from_ptr(u.machine.as_ptr())
+        std::ffi::CStr::from_ptr(u.machine.as_ptr())
             .to_string_lossy()
-            .to_ascii_lowercase();
-        machine == "x86_64" || machine == "amd64"
+            .to_ascii_lowercase()
     }
+}
+
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn unix_uname_machine_is_x86_64() -> bool {
+    machine_is_x86_64(&unix_uname_machine())
+}
+
+#[cfg(all(unix, target_arch = "aarch64"))]
+fn unix_uname_machine_is_aarch64() -> bool {
+    machine_is_aarch64(&unix_uname_machine())
+}
+
+pub fn machine_is_x86_64(machine: &str) -> bool {
+    matches!(machine, "x86_64" | "amd64")
+}
+
+pub fn machine_is_aarch64(machine: &str) -> bool {
+    matches!(machine, "aarch64" | "arm64")
 }
 
 #[cfg(target_os = "macos")]
@@ -2404,5 +2460,22 @@ pub async fn run_monitor_daemon(paths: &AppPaths) -> i32 {
             in_monitor: true,
         };
         let _ = engage_candidates(paths, &cands, &cfg, |msg| append_monitor_log(paths, msg)).await;
+    }
+}
+
+#[cfg(test)]
+mod isa_tests {
+    use super::{machine_is_aarch64, machine_is_x86_64};
+
+    #[test]
+    fn classifies_64bit_machine_names() {
+        assert!(machine_is_x86_64("x86_64"));
+        assert!(machine_is_x86_64("amd64"));
+        assert!(!machine_is_x86_64("aarch64"));
+        assert!(machine_is_aarch64("aarch64"));
+        assert!(machine_is_aarch64("arm64"));
+        assert!(!machine_is_aarch64("x86_64"));
+        assert!(!machine_is_x86_64("i686"));
+        assert!(!machine_is_aarch64("armv7l"));
     }
 }

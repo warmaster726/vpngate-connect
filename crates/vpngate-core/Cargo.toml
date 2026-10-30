@@ -1,6 +1,6 @@
 [package]
 name = "vpngate-core"
-description = "Pure-Rust SoftEther VPN Gate discovery, Official Mirror failover, Cloudflare DoH, 1-RTT IKEv1/XFRM cryptography, and x86_64 desktop tunnel engine"
+description = "Pure-Rust SoftEther VPN Gate discovery, Official Mirror failover, Cloudflare DoH, 1-RTT IKEv1/XFRM cryptography, and 64-bit desktop tunnel engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

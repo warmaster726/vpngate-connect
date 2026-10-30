@@ -2,7 +2,7 @@
 
 ## Supported Versions
 
-Security fixes are applied exclusively on the active **`main`** branch (Pure-Rust x86_64 Desktop Edition `0.3.x`). Ongoing work lives on **`develop`** and is not a supported release line until it is merged to `main`.
+Security fixes are applied exclusively on the active **`main`** branch (Pure-Rust 64-bit Desktop Edition `0.3.x`, x86_64 and ARM64). Ongoing work lives on **`develop`** and is not a supported release line until it is merged to `main`.
 
 | Branch / Version | Status | Supported |
 | :--- | :--- | :--- |

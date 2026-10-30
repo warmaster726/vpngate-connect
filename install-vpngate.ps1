@@ -1,8 +1,8 @@
 <#
 .SYNOPSIS
-    VPN Gate Connect (Rust Single-Binary Edition) - Windows 11 x86_64 Installer, Residue Cleaner & Uninstaller
+    VPN Gate Connect (Rust Single-Binary Edition) - Windows 11 64-bit Installer, Residue Cleaner & Uninstaller
 .DESCRIPTION
-    x86_64-native only (no ARM64, no 32-bit, no x64 emulation).
+    64-bit native (x86_64 and ARM64). No 32-bit. No Windows-on-ARM x64 emulation.
     - Install / Upgrade (default):
         Cleans legacy Python/Rust residues, builds or installs native `vpngate.exe` into
         `%LOCALAPPDATA%\Programs\VPNGate\vpngate.exe` using an isolated temporary build root,
@@ -64,7 +64,7 @@ function Show-Usage {
 Usage: .\install-vpngate.ps1 [OPTIONS]
 
 Installs, upgrades, or removes single-binary Rust `vpngate.exe` on Windows 11
-x86_64 (amd64) hardware only (no ARM64, no 32-bit, no x64 emulation).
+64-bit hardware (x86_64 and ARM64). No 32-bit. No Windows-on-ARM x64 emulation.
 Zero Python dependency. Configures L2TP/IPsec NAT-T and headless OpenVPN Community
 while keeping the host environment free of temporary build caches.
 
@@ -119,38 +119,69 @@ if ($Help) {
     exit 0
 }
 
-function Assert-NativeX64 {
+$script:HostArch = 'x86_64'
+
+function Assert-Native64Bit {
     $osArch = $null
+    $procArchRi = $null
     try {
         $osArch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+        $procArchRi = [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString()
     } catch {
         $osArch = $null
+        $procArchRi = $null
     }
-    if ($osArch -eq 'X64') { return }
-    if ($osArch -eq 'Arm64' -or $osArch -eq 'Arm' -or $osArch -eq 'X86') {
-        Write-Err "VPN Gate Connect desktop is x86_64-native only (OS architecture: $osArch)."
-        Write-Err "ARM64, 32-bit, and x64 emulation are not supported."
+    if ($osArch -eq 'Arm' -or $osArch -eq 'X86') {
+        Write-Err "VPN Gate Connect desktop supports 64-bit x86_64 and ARM64 only (OS architecture: $osArch)."
+        Write-Err "32-bit Windows is not supported."
         exit 1
+    }
+    if ($osArch -eq 'Arm64') {
+        if ($procArchRi -and $procArchRi -ne 'Arm64') {
+            Write-Err "This PowerShell process is $procArchRi on native ARM64 Windows."
+            Write-Err "Windows-on-ARM x64 emulation is not supported. Open a native ARM64 PowerShell and re-run."
+            exit 1
+        }
+        $script:HostArch = 'aarch64'
+        return
+    }
+    if ($osArch -eq 'X64') {
+        $script:HostArch = 'x86_64'
+        return
     }
     $cimArch = $null
     try { $cimArch = [string](Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).OSArchitecture } catch { $cimArch = '' }
     $procArch = [string]$env:PROCESSOR_ARCHITECTURE
-    if ($procArch -eq 'AMD64' -and $cimArch -match '64' -and $cimArch -notmatch 'ARM') { return }
-    Write-Err "VPN Gate Connect desktop is x86_64-native only."
+    if ($procArch -eq 'ARM64' -or $cimArch -match 'ARM') {
+        $script:HostArch = 'aarch64'
+        return
+    }
+    if ($procArch -eq 'AMD64' -and $cimArch -match '64') {
+        $script:HostArch = 'x86_64'
+        return
+    }
+    Write-Err "VPN Gate Connect desktop supports 64-bit x86_64 and ARM64 only."
     Write-Err "Detected PROCESSOR_ARCHITECTURE=$procArch OSArchitecture=$cimArch."
     exit 1
 }
 
 if (-not $Uninstall) {
-    Assert-NativeX64
+    Assert-Native64Bit
 }
 
 function Test-HasMsvc {
     if (Get-Command 'cl.exe' -ErrorAction SilentlyContinue) { return $true }
     $VsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
     if (Test-Path -LiteralPath $VsWhere) {
-        $VsVc = & $VsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
+        $VcComponent = if ($script:HostArch -eq 'aarch64') {
+            'Microsoft.VisualStudio.Component.VC.Tools.ARM64'
+        } else {
+            'Microsoft.VisualStudio.Component.VC.Tools.x86.x64'
+        }
+        $VsVc = & $VsWhere -latest -products * -requires $VcComponent -property installationPath 2>$null
         if ($VsVc) { return $true }
+        $VsAny = & $VsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
+        if ($VsAny -and $script:HostArch -ne 'aarch64') { return $true }
     }
     return $false
 }
@@ -474,16 +505,20 @@ try {
         }
 
         # Detect whether Visual Studio C++ Build Tools (MSVC cl.exe/link.exe) are present;
-        # if not, use lightweight MinGW-w64 (`x86_64-pc-windows-gnu`) so users never need a 6 GB Visual Studio install.
+        # on x86_64, if not, use lightweight MinGW-w64 so users never need a 6 GB Visual Studio install.
         $HasMsvc = [bool](Test-HasMsvc)
+        $IsArm64 = ($script:HostArch -eq 'aarch64')
+        $MsvcTriple = if ($IsArm64) { 'aarch64-pc-windows-msvc' } else { 'x86_64-pc-windows-msvc' }
+        $GnuTriple = if ($IsArm64) { 'aarch64-pc-windows-gnu' } else { 'x86_64-pc-windows-gnu' }
+        $RustupDist = if ($IsArm64) { 'https://win.rustup.rs/aarch64' } else { 'https://win.rustup.rs/x86_64' }
 
         $CargoCmd = Get-Command 'cargo.exe' -ErrorAction SilentlyContinue
         if ($CargoCmd) {
             $HadExistingCargo = $true
         } else {
             $RustupInit = Join-Path $TempInstallRoot 'rustup-init.exe'
-            $DefaultHost = if ($HasMsvc) { 'x86_64-pc-windows-msvc' } else { 'x86_64-pc-windows-gnu' }
-            Invoke-WebRequest -Uri 'https://win.rustup.rs/x86_64' -UseBasicParsing -OutFile $RustupInit
+            $DefaultHost = if ($HasMsvc -or $IsArm64) { $MsvcTriple } else { $GnuTriple }
+            Invoke-WebRequest -Uri $RustupDist -UseBasicParsing -OutFile $RustupInit
 
             if ($KeepToolchain) {
                 Write-Info "Rust toolchain not found - installing minimal Rust ($DefaultHost) via rustup.rs (kept after install) ..."
@@ -523,12 +558,15 @@ try {
         }
         $BuildArgs += @('-p', 'vpngate-cli', '--manifest-path', $CargoToml, '--target-dir', $EffectiveTargetDir)
 
-        if ($HasMsvc) {
-            Write-Info "Building optimized x86_64 'vpngate.exe' via Cargo (MSVC toolchain) ..."
-            $MsvcArgs = $BuildArgs + @('--target', 'x86_64-pc-windows-msvc')
+        if ($HasMsvc -or $IsArm64) {
+            if (-not $HasMsvc -and $IsArm64) {
+                throw "Windows ARM64 builds need Visual Studio C++ ARM64 tools (cl.exe). x86_64 MinGW cannot link a native ARM64 vpngate.exe."
+            }
+            Write-Info "Building optimized $($script:HostArch) 'vpngate.exe' via Cargo (MSVC $MsvcTriple) ..."
+            $MsvcArgs = $BuildArgs + @('--target', $MsvcTriple)
             & $CargoCmd.Source @MsvcArgs
             if ($LASTEXITCODE -ne 0) { throw "Cargo release build failed." }
-            $BinSource = Join-Path $EffectiveTargetDir 'x86_64-pc-windows-msvc\release\vpngate.exe'
+            $BinSource = Join-Path $EffectiveTargetDir "$MsvcTriple\release\vpngate.exe"
         } else {
             # Ensure gcc.exe / MinGW-w64 is present for `x86_64-pc-windows-gnu` (`ring` C objects + linking)
             $foundGccPath = Find-HostGcc
@@ -548,13 +586,13 @@ try {
             $RustupDir = Split-Path -Parent $CargoCmd.Source
             $RustupExe = Join-Path $RustupDir 'rustup.exe'
             if (Test-Path -LiteralPath $RustupExe) {
-                & $RustupExe toolchain install stable-x86_64-pc-windows-gnu --profile minimal --no-self-update
+                & $RustupExe toolchain install "stable-$GnuTriple" --profile minimal --no-self-update
             }
-            Write-Info "Building optimized x86_64 'vpngate.exe' via Cargo (x86_64-pc-windows-gnu toolchain) ..."
-            $GnuArgs = @('+stable-x86_64-pc-windows-gnu') + $BuildArgs + @('--target', 'x86_64-pc-windows-gnu')
+            Write-Info "Building optimized $($script:HostArch) 'vpngate.exe' via Cargo ($GnuTriple toolchain) ..."
+            $GnuArgs = @("+stable-$GnuTriple") + $BuildArgs + @('--target', $GnuTriple)
             & $CargoCmd.Source @GnuArgs
             if ($LASTEXITCODE -ne 0) { throw "Cargo GNU release build failed." }
-            $BinSource = Join-Path $EffectiveTargetDir 'x86_64-pc-windows-gnu\release\vpngate.exe'
+            $BinSource = Join-Path $EffectiveTargetDir "$GnuTriple\release\vpngate.exe"
         }
     } elseif (Test-Path -LiteralPath $LocalPrebuilt) {
         $BinSource = $LocalPrebuilt

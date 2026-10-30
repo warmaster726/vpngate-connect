@@ -1,7 +1,7 @@
 #!/bin/sh
 # install-vpngate.sh — One-step Linux & macOS Desktop Installer, Residue Cleaner & Uninstaller for `vpngate` (Rust Edition)
 # POSIX /bin/sh (dash, sh, bash, zsh) compatible — works via `sh ./install-vpngate.sh`
-# x86_64-native only (no ARM64, no 32-bit, no Rosetta).
+# 64-bit native (x86_64 and aarch64/ARM64). No 32-bit. No Rosetta / ISA emulation.
 # Priority: Auto (L2TP/IPsec -> OpenVPN UDP -> OpenVPN TCP) | Built-In Rust IKEv1 + Kernel XFRM + xl2tpd/ppp + OpenVPN
 set -eu
 
@@ -21,11 +21,8 @@ TOOLCHAIN_POLICY=""
 REPO_SLUG="${VPNGATE_REPO:-warmaster726/vpngate-connect}"
 HOST_UNAME="$(uname -s 2>/dev/null || echo Linux)"
 HOST_MACHINE="$(uname -m 2>/dev/null || echo unknown)"
-if [ "${HOST_UNAME}" = "Darwin" ]; then
-  RUST_HOST_TRIPLE="x86_64-apple-darwin"
-else
-  RUST_HOST_TRIPLE="x86_64-unknown-linux-gnu"
-fi
+HOST_ARCH=""
+RUST_HOST_TRIPLE=""
 CALLER_CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-}"
 CALLER_CARGO_HOME="${CARGO_HOME:-}"
 CALLER_RUSTUP_HOME="${RUSTUP_HOME:-}"
@@ -37,7 +34,7 @@ Usage: sh ./install-vpngate.sh [OPTIONS]
 
 Installs, upgrades, or removes the single-binary Rust VPN Gate Desktop Suite
 on Linux (Kali, Debian, Ubuntu, Mint, Pop!_OS, Fedora, Arch) and macOS.
-x86_64-native only (no ARM64, no 32-bit, no Rosetta). Compiles from source.
+64-bit native (x86_64 and ARM64/Apple Silicon). No 32-bit. No Rosetta. Compiles from source.
 
 Options:
   (no arguments)       Clean legacy residues, install OS packages, build/install `vpngate`, wipe temp build cache, and run `doctor`
@@ -150,27 +147,45 @@ resolve_compile_tool_policy() {
   fi
 }
 
-require_native_x64() {
+detect_native_64bit() {
   case "${HOST_MACHINE}" in
-    x86_64|amd64) ;;
+    x86_64|amd64) HOST_ARCH="x86_64" ;;
+    aarch64|arm64) HOST_ARCH="aarch64" ;;
     *)
-      echo "[-] VPN Gate Connect desktop is x86_64-native only (detected CPU: ${HOST_MACHINE})." >&2
-      echo "    ARM64, 32-bit, and other architectures are not supported." >&2
+      echo "[-] VPN Gate Connect desktop supports 64-bit x86_64 and ARM64 only (detected CPU: ${HOST_MACHINE})." >&2
+      echo "    32-bit and other architectures are not supported." >&2
       exit 1
       ;;
   esac
   if [ "${HOST_UNAME}" = "Darwin" ]; then
+    TRANSLATED="$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)"
+    if [ "${TRANSLATED}" = "1" ]; then
+      echo "[-] This installer is running under Rosetta (x86_64 translation)." >&2
+      echo "    On Apple Silicon run it natively:  arch -arm64 sh ./install-vpngate.sh" >&2
+      exit 1
+    fi
     ARM64_CPU="$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)"
     if [ "${ARM64_CPU}" = "1" ]; then
-      echo "[-] VPN Gate Connect desktop is x86_64-native only." >&2
-      echo "    This Mac has an Apple Silicon (ARM64) CPU. Rosetta is not supported." >&2
-      exit 1
+      HOST_ARCH="aarch64"
+    fi
+  fi
+  if [ "${HOST_UNAME}" = "Darwin" ]; then
+    if [ "${HOST_ARCH}" = "aarch64" ]; then
+      RUST_HOST_TRIPLE="aarch64-apple-darwin"
+    else
+      RUST_HOST_TRIPLE="x86_64-apple-darwin"
+    fi
+  else
+    if [ "${HOST_ARCH}" = "aarch64" ]; then
+      RUST_HOST_TRIPLE="aarch64-unknown-linux-gnu"
+    else
+      RUST_HOST_TRIPLE="x86_64-unknown-linux-gnu"
     fi
   fi
 }
 
 if [ "${MODE}" = "install" ]; then
-  require_native_x64
+  detect_native_64bit
 fi
 
 if [ "$(id -u)" -eq 0 ]; then
@@ -786,7 +801,7 @@ if [ -f "${WORK_SRC_DIR}/Cargo.toml" ]; then
     if [ "${HOST_UNAME}" = "Linux" ]; then
       LAUNCHER_PKG="-p vpngate-launcher"
     fi
-    info "Building optimized x86_64 'vpngate' from Rust workspace (${WORK_SRC_DIR}) ..."
+    info "Building optimized ${HOST_ARCH} 'vpngate' from Rust workspace (${WORK_SRC_DIR}) ..."
     if [ "$(id -u)" -eq 0 ] && [ "${TARGET_USER}" != "root" ]; then
       # shellcheck disable=SC2086
       sudo -u "${TARGET_USER}" env \
@@ -831,14 +846,21 @@ if [ -z "${BIN_SRC}" ] || [ ! -f "${BIN_SRC}" ]; then
 fi
 if command -v file >/dev/null 2>&1; then
   BIN_DESC="$(file -b "${BIN_SRC}" 2>/dev/null || true)"
-  case "${BIN_DESC}" in
-    *x86-64*|*x86_64*|*X86-64*|*AMD64*|*amd64*) ;;
-    *)
-      echo "[-] Refusing non-x86_64 binary: ${BIN_SRC}" >&2
-      echo "    ${BIN_DESC}" >&2
-      exit 1
-      ;;
-  esac
+  BIN_OK=0
+  if [ "${HOST_ARCH}" = "aarch64" ]; then
+    case "${BIN_DESC}" in
+      *ARM\ aarch64*|*AArch64*|*aarch64*|*ARM64*|*arm64*) BIN_OK=1 ;;
+    esac
+  else
+    case "${BIN_DESC}" in
+      *x86-64*|*x86_64*|*X86-64*|*AMD64*|*amd64*) BIN_OK=1 ;;
+    esac
+  fi
+  if [ "${BIN_OK}" -ne 1 ]; then
+    echo "[-] Refusing binary that does not match host ISA ${HOST_ARCH}: ${BIN_SRC}" >&2
+    echo "    ${BIN_DESC}" >&2
+    exit 1
+  fi
 fi
 
 # Prevent boot-time L2TP/IPsec daemons from holding UDP 500, 4500, or 1701 on Linux
