@@ -17,8 +17,9 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 
 use commands::{
-    ConnectArgs, cmd_connect, cmd_countries, cmd_disconnect, cmd_doctor, cmd_list, cmd_mirrors,
-    cmd_probe, cmd_refresh, cmd_status, cmd_upgrade, cmd_watchdog, interactive_menu,
+    ConnectArgs, UpgradeOffer, cmd_connect, cmd_countries, cmd_disconnect, cmd_doctor_with_update,
+    cmd_list, cmd_mirrors, cmd_probe, cmd_refresh, cmd_status, cmd_upgrade, cmd_watchdog,
+    interactive_menu,
     set_no_elevate_requested, set_skip_update_check, set_uac_already_attempted,
 };
 use term_ui::{err, init_console, print_line, prompt_input, set_dynamic_resize, set_screen_clear};
@@ -378,7 +379,12 @@ async fn dispatch_commands(paths: &AppPaths, raw_args: &[String]) -> io::Result<
         return cmd_disconnect(paths).await;
     }
     if flag_doctor || matches!(subcmd.as_str(), "doctor" | "check" | "diag") {
-        return cmd_doctor(paths);
+        let (rc, offer) = cmd_doctor_with_update(paths).await?;
+        return Ok(match offer {
+            UpgradeOffer::ExitAfterInstall => 0,
+            UpgradeOffer::Failed(n) => n,
+            UpgradeOffer::Continue => rc,
+        });
     }
     if flag_status || matches!(subcmd.as_str(), "status" | "st") {
         return cmd_status(paths).await;
