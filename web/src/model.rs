@@ -1,13 +1,13 @@
 use serde::{Deserialize, Serialize};
 
-pub const APP_VERSION: &str = "0.2.15";
+pub const APP_VERSION: &str = "0.3.4";
 pub const POOL_CACHE_TTL_MS: u64 = 180_000;
 pub const POOL_CACHE_KEY_URL: &str = "https://vpngate-edge-cache.internal/v1/pool-snapshot";
 pub const VERIFY_MEM_CACHE_URL: &str = "https://vpngate-edge-cache.internal/v1/verify-memory";
 pub const VERIFY_IP_CACHE_PREFIX: &str = "https://vpngate-edge-cache.internal/v1/verify-ip/";
 pub const HANDSHAKE_TIMEOUT_MS: u64 = 17_600;
 pub const DEAD_PENALTY_MS: u64 = 15 * 60 * 1000;
-pub const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) VPNGate-WebWorker/0.2";
+pub const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) VPNGate-WebWorker/0.3";
 pub const MAX_OFFICIAL_MIRROR_CSV: usize = 12;
 pub const VERIFY_OK_TTL_MS: u64 = 180_000;
 pub const VERIFY_FAIL_TTL_MS: u64 = DEAD_PENALTY_MS;

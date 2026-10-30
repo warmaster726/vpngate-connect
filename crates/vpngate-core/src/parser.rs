@@ -97,7 +97,7 @@ pub fn parse_vpngate_mirror_sites_html(html: &str, source_label: &str) -> Vec<Of
         };
         let loc_clean = raw_loc
             .map(|s| {
-                let s = s.replace("&nbsp;", " ");
+                let s = strip_markup(s);
                 let before_local = s.split("(LOCAL").next().unwrap_or(&s);
                 before_local.trim().trim_end_matches(')').trim().to_string()
             })
@@ -185,6 +185,58 @@ fn extract_ovpn_transport_and_ports(b64: &str) -> (bool, u16, u16) {
     (true, tcp_port, udp_port)
 }
 
+fn strip_tags(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut in_tag = false;
+    for c in raw.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn decode_basic_entities(raw: &str) -> String {
+    raw.replace("&nbsp;", " ")
+        .replace("&#160;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+}
+
+/// VPN Gate HTML/CSV cells sometimes wrap values in `<span style='font-size: 9pt;'>`.
+fn strip_markup(raw: &str) -> String {
+    let decoded = decode_basic_entities(&strip_tags(raw));
+    strip_tags(&decoded)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn clean_hostname(raw: &str, ip: &str) -> String {
+    let host = strip_markup(raw);
+    if host.is_empty() {
+        ip.to_string()
+    } else {
+        host
+    }
+}
+
+fn strip_opengw_suffix(host: &str) -> String {
+    let low = host.to_ascii_lowercase();
+    if let Some(stripped) = low.strip_suffix(".opengw.net") {
+        host[..stripped.len()].trim().to_string()
+    } else {
+        host.to_string()
+    }
+}
+
 /// Parses official VPN Gate `/api/iphone/` & mirror CSV feeds into `servers_by_ip`.
 pub fn parse_vpngate_csv_into(csv_raw: &str, servers_by_ip: &mut BTreeMap<String, VpnServer>) {
     for raw_line in csv_raw.lines() {
@@ -219,16 +271,17 @@ pub fn parse_vpngate_csv_into(csv_raw: &str, servers_by_ip: &mut BTreeMap<String
         let speed_bps = parse_u64_clean(&row[4], 0);
         let sessions = parse_u32_clean(&row[7], 0);
         let uptime_ms = parse_u64_clean(&row[8], 0);
-        let (country_long, country_short) = normalize_country_pair(&row[5], &row[6]);
-        let hostname = {
-            let h = row[0].trim();
-            if h.is_empty() {
-                ip.clone()
+        let (country_long, country_short) =
+            normalize_country_pair(&strip_markup(&row[5]), &strip_markup(&row[6]));
+        let hostname = clean_hostname(&row[0], &ip);
+        let operator = {
+            let op = strip_markup(&row[12]);
+            if op.is_empty() {
+                String::new()
             } else {
-                h.to_string()
+                op
             }
         };
-        let operator = row[12].trim().to_string();
 
         if let Some(existing) = servers_by_ip.get_mut(&ip) {
             if ovpn_ok {
@@ -301,17 +354,12 @@ pub fn parse_sdise_csv_into(csv_raw: &str, target_by_ip: &mut BTreeMap<String, V
             continue;
         }
 
-        let (country_long, country_short) = normalize_country_pair(&rec[0], "");
-        let raw_host = rec[1].trim();
-        let host = raw_host
-            .strip_suffix(".opengw.net")
-            .or_else(|| raw_host.strip_suffix(".OPENGW.NET"))
-            .unwrap_or(raw_host)
-            .trim();
+        let (country_long, country_short) = normalize_country_pair(&strip_markup(&rec[0]), "");
+        let host = strip_opengw_suffix(&strip_markup(&rec[1]));
         let hostname = if host.is_empty() {
             ip.clone()
         } else {
-            host.to_string()
+            host
         };
         let speed_bps = rec[3]
             .trim()
@@ -418,11 +466,12 @@ pub fn parse_vpngate_html_into(html_raw: &str, servers_by_ip: &mut BTreeMap<Stri
             .and_then(|c| c.get(1))
             .map(|m| m.as_str())
             .unwrap_or("");
-        let (country_long, country_short) = normalize_country_pair(raw_cname, raw_flag);
+        let (country_long, country_short) =
+            normalize_country_pair(&strip_markup(raw_cname), &strip_markup(raw_flag));
 
         let hostname = re_host
             .captures(chunk)
-            .map(|c| c[1].trim().to_string())
+            .map(|c| strip_opengw_suffix(&strip_markup(&c[1])))
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| ip.clone());
 
@@ -556,6 +605,7 @@ mod tests {
         parse_vpngate_html_into(html, &mut map);
         let kr = map.get("211.200.10.25").expect("HTML server parsed");
         assert_eq!(kr.country_short, "KR");
+        assert_eq!(kr.hostname, "public-vpn-77");
         assert!(kr.l2tp);
         assert_eq!(kr.tcp_port, 443);
         assert_eq!(kr.udp_port, 1195);
@@ -589,5 +639,32 @@ mod tests {
             "http://ns374305.ip-178-32-222.eu:18609"
         );
         assert_eq!(mirrors[1].location, "France");
+    }
+
+    #[test]
+    fn strips_html_from_csv_and_styled_html_hostname() {
+        let csv_data = "*vpn_servers\n#HostName,IP,Score,Ping,Speed,CountryLong,CountryShort,NumVpnSessions,Uptime,TotalUsers,TotalTraffic,LogType,Operator,Message,OpenVPN_ConfigData_Base64\n\
+<span style='font-size: 9pt;'>public-vpn-213</span>,219.100.37.200,1000,14,167000000,Japan,JP,1,0,0,0,2,<b>Tsukuba</b>,,\n";
+        let mut map = BTreeMap::new();
+        parse_vpngate_csv_into(csv_data, &mut map);
+        let csv_srv = map.get("219.100.37.200").expect("csv server");
+        assert_eq!(csv_srv.hostname, "public-vpn-213");
+        assert_eq!(csv_srv.operator, "Tsukuba");
+
+        let html = r#"
+        <table>
+        <tr><td class='vg_table_row_1'><img src='../images/flags/JP.png' width='32' height='32' /><br>Japan</td>
+        <td class='vg_table_row_1'><b><span style='font-size: 9pt;'>public-vpn-213.opengw.net</span></b><br><span style='font-size: 9pt;'>219.100.37.201</span></td>
+        <td class='vg_table_row_1'><b><span style='font-size: 9pt;'>12 VPN sessions</span></b></td>
+        <td class='vg_table_row_1'><b><span style='font-size: 9pt;'>167.7 Mbps</span></b><br>Ping: <b>14 ms</b></td>
+        <td class='vg_table_row_1'><a href='do_openvpn.aspx?fqdn=x&ip=219.100.37.201&tcp=443&udp=1195'>OpenVPN</a></td>
+        <td class='vg_table_row_1'><a href='howto_l2tp.aspx'>L2TP/IPsec</a></td>
+        <td class='vg_table_row_1'><b><span style='font-size: 9pt;'>1,890,500</span></b></td></tr>
+        </table>"#;
+        parse_vpngate_html_into(html, &mut map);
+        let html_srv = map.get("219.100.37.201").expect("styled html server");
+        assert_eq!(html_srv.hostname, "public-vpn-213");
+        assert!(!html_srv.hostname.contains('<'));
+        assert_eq!(html_srv.country_short, "JP");
     }
 }
