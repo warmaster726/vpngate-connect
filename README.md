@@ -18,7 +18,7 @@ Censorship-resilient **SoftEther VPN Gate** desktop client engineered around a *
   - **IP-Pinned Cloudflare DoH (`1.1.1.1:443`) & Leak Protection**: Bypasses ISP DNS poisoning, enforces tunnel DNS (`1.1.1.1`, `1.0.0.1`), and restores host routes, `/etc/resolv.conf` / `systemd-resolved`, and IPv6 state cleanly on teardown.
 - **Interactive `[0-9]` Console + Native Dark GNOME GTK/VTE Window**
   - Screen-cleared step-by-step live execution progress with in-place spinners, dynamically resizing Unicode boxes/tables, 30-minute per-protocol dead-server cooldowns, and an optional 15-second background Auto-Reconnect Watchdog (`vpngate _monitor`).
-  - On Linux/GNOME, includes `vpngate-launcher` (`GTK3/VTE-2.91` -> `GTK4/VTE-3.91`) with a dark CSD HeaderBar live tunnel status badge and one-click Egress IP copy chip.
+  - On Linux/GNOME, includes `vpngate-launcher` (`GTK4` + `VTE-2.91-gtk4`) with a dark CSD HeaderBar live tunnel status badge and one-click Egress IP copy chip.
 
 ---
 
@@ -126,8 +126,8 @@ The interactive `[0-9]` dashboard live-checks for a newer desktop at **startup**
 vpngate-connect/
 ├── crates/
 │   ├── vpngate-core/      # Pure-Rust discovery, Official Mirrors, DoH, IKEv1/XFRM & desktop tunnel engine
-│   └── vpngate-cli/       # Single-binary `vpngate` CLI & [0-9] Interactive Console
-├── vpngate-launcher.py    # GNOME GTK3/GTK4 + VTE dynamic-resizing dark window launcher
+│   ├── vpngate-cli/       # Single-binary `vpngate` CLI & [0-9] Interactive Console
+│   └── vpngate-launcher/  # Linux GNOME GTK4/VTE dark window host (`vpngate -w`)
 ├── assets/                # Desktop app icon (gate mark, no VG glyph) — SVG / PNG / Windows ICO
 ├── vpngate.desktop        # XDG Desktop Entry + GNOME Dash Quick Actions
 ├── install-vpngate.sh     # POSIX /bin/sh Linux & macOS installer, residue cleaner & uninstaller
@@ -136,7 +136,7 @@ vpngate-connect/
 └── web/                   # Isolated Cloudflare Workers Web Profile Portal (.mobileconfig & .ovpn export)
 ```
 
-> **Isolation Note:** `web/` is a standalone zero-dependency Cloudflare Worker (`wrangler.toml` + `src/worker.js`) for browser-based iOS/Android `.mobileconfig` and `.ovpn` profile provisioning. Desktop installers (`install-vpngate.sh`, `install-vpngate.ps1`, `install-vpngate.cmd`) compile strictly `-p vpngate-cli` inside a temporary build root and never build, run, or copy `web/`.
+> **Isolation Note:** `web/` is a standalone Cloudflare Worker (`workers-rs` + the 4-tab HTML/JS console in `web/assets/`). Desktop installers (`install-vpngate.sh`, `install-vpngate.ps1`, `install-vpngate.cmd`) compile `-p vpngate-cli` (and on Linux `-p vpngate-launcher`) inside a temporary build root and never build, run, or copy `web/`. The root Cargo workspace **excludes** `web/`.
 
 ---
 

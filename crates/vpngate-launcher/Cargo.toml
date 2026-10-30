@@ -1,0 +1,28 @@
+[package]
+name = "vpngate-launcher"
+description = "GNOME GTK4/VTE dark window host for the vpngate desktop CLI (Linux)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "vpngate-launcher"
+path = "src/main.rs"
+
+[dependencies]
+serde_json.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk4 = { version = "0.9", default-features = true }
+vte4 = "0.8"
+glib = "0.20"
+gio = "0.20"
+pango = "0.20"
+gdk4 = "0.9"
+
+[lints]
+workspace = true

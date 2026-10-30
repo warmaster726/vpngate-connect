@@ -53,10 +53,7 @@ servers_cache*.json
 mirrors_cache*.json
 cooldowns*.json
 
-# --- 4. Editor & Python Launcher Scratch Files ---
-__pycache__/
-**/__pycache__/
-*.py[cod]
+# --- 4. Editor scratch files ---
 .idea/
 *.swp
 *.swo
@@ -72,3 +69,4 @@ web/.wrangler/
 web/.dev.vars
 web/.dev.vars.*
 web/node_modules/
+web/build/

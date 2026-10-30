@@ -1369,17 +1369,13 @@ pub fn cmd_doctor(paths: &AppPaths) -> io::Result<i32> {
             .ok()
             .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
         let launcher_ok = which_bin("vpngate-launcher").is_some()
-            || which_bin("vpngate-launcher.py").is_some()
             || std::path::Path::new("/usr/local/bin/vpngate-launcher").is_file()
-            || self_dir.as_ref().is_some_and(|d| {
-                d.join("vpngate-launcher.py").is_file()
-                    || d.parent()
-                        .and_then(|p| p.parent())
-                        .is_some_and(|r| r.join("vpngate-launcher.py").is_file())
-            });
+            || self_dir
+                .as_ref()
+                .is_some_and(|d| d.join("vpngate-launcher").is_file());
         if launcher_ok {
             lines.push(Some(format!(
-                "GNOME Window : {GREEN}READY{RESET} — `vpngate-launcher` dynamic GTK/VTE dark window"
+                "GNOME Window : {GREEN}READY{RESET} — `vpngate-launcher` GTK4/VTE dark window"
             )));
         } else {
             lines.push(Some(format!(

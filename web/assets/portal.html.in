@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#070B14">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="color-scheme" content="dark">
+  <title>VPN Gate Connect — Live Profile Console</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" type="image/svg+xml" href="/icon.svg">
+  <style>${PORTAL_CSS}</style>
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-icon" aria-hidden="true" title="VPN Gate Connect">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none">
+            <path d="M6.5 27.5V11.2L16 5.5l9.5 5.7v16.3" stroke="#38BDF8" stroke-width="2.3" stroke-linejoin="round" stroke-linecap="round"/>
+            <path d="M12 27.5V14.4L16 12l4 2.4v13.1" stroke="#34D399" stroke-width="2.1" stroke-linejoin="round" stroke-linecap="round"/>
+            <circle cx="16" cy="18" r="2.35" fill="#7DD3FC"/>
+          </svg>
+        </div>
+        <div>
+          <div class="brand-title">VPN Gate Connect</div>
+          <div class="brand-sub" id="detected-device">Cloudflare Edge Profile Console</div>
+        </div>
+      </div>
+      <div class="topbar-right">
+        <div class="status-pill syncing" id="status-pill" aria-live="polite">
+          <span class="dot"></span>
+          <span id="status-text">BOOTING</span>
+        </div>
+        <button type="button" class="btn btn-sm" id="btn-refresh" title="Refresh live server pool">Sync</button>
+      </div>
+    </header>
+
+    <section class="tab-panel active" id="tab-connect">
+      <div class="stepper" aria-label="Connection pipeline">
+        <div class="step on" data-step="pool"><b>1. Pool</b>Discover</div>
+        <div class="step" data-step="probe"><b>2. Probe</b>TCP path</div>
+        <div class="step" data-step="handshake"><b>3. Handshake</b>OpenVPN</div>
+        <div class="step" data-step="profile"><b>4. Profile</b>Unlock</div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">Target &amp; protocol</div>
+            <div class="card-subtitle">Profiles are issued only after a live OpenVPN handshake succeeds on the chosen relay.</div>
+          </div>
+        </div>
+        <div class="grid-2">
+          <div>
+            <label class="field-label" for="connect-country">Target country</label>
+            <select id="connect-country"><option value="ALL">Loading countries...</option></select>
+          </div>
+          <div>
+            <label class="field-label" for="connect-proto">Protocol priority</label>
+            <select id="connect-proto">
+              <option value="auto">Auto (L2TP → OVPN UDP → OVPN TCP)</option>
+              <option value="l2tp">Apple native L2TP/IPsec</option>
+              <option value="openvpn">OpenVPN (UDP + TCP)</option>
+              <option value="udp">OpenVPN UDP</option>
+              <option value="tcp">OpenVPN TCP</option>
+            </select>
+          </div>
+        </div>
+        <div class="pill-row scroll" id="quick-country-pills"></div>
+        <label class="field-label" style="margin-top:10px">Server priority</label>
+        <div class="pill-row scroll" id="connect-sort-pills" style="margin-top:4px">
+          <button type="button" class="chip active" data-csort="recommended">Score</button>
+          <button type="button" class="chip" data-csort="speed">Speed</button>
+          <button type="button" class="chip" data-csort="ping">Ping</button>
+        </div>
+        <details class="adv">
+          <summary>Advanced · cipher profile &amp; tunnel DNS</summary>
+          <div class="grid-2" style="margin-top:10px">
+            <div>
+              <label class="field-label" for="connect-compat">OpenVPN cipher profile</label>
+              <select id="connect-compat">
+                <option value="mobile3">MobileCore3 (iOS / Android OpenVPN Connect)</option>
+                <option value="ovpn26">OpenVPN 2.6 desktop</option>
+                <option value="ovpn25">OpenVPN 2.5</option>
+                <option value="ovpn24">OpenVPN 2.4 legacy</option>
+              </select>
+            </div>
+            <div>
+              <label class="field-label" for="connect-dns">Tunnel DNS</label>
+              <select id="connect-dns">
+                <option value="1.1.1.1,1.0.0.1">Cloudflare DNS (1.1.1.1, 1.0.0.1)</option>
+                <option value="9.9.9.9,149.112.112.112">Quad9 (9.9.9.9)</option>
+                <option value="94.140.14.14,94.140.15.15">AdGuard DNS (94.140.14.14)</option>
+              </select>
+            </div>
+          </div>
+        </details>
+      </div>
+
+      <div id="hero-container">
+        <div class="hero-relay testing">
+          <div class="skeleton" style="width:55%;height:18px"></div>
+          <div class="skeleton" style="width:72%;height:12px"></div>
+          <div class="progress-track"><div class="progress-fill"></div></div>
+          <div class="progress-label">Discovering volunteer relays…</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <details class="adv" style="margin-top:0;border-top:0;padding-top:0">
+          <summary>Device setup · iOS / Android / desktop</summary>
+          <div class="card-subtitle" style="margin-top:8px">
+            <strong>iPhone / iPad:</strong> Safari only. Wait for <em>LIVE HANDSHAKE</em>, tap <strong>Install Apple L2TP</strong> → Allow → Settings → Profile Downloaded → Install. OpenVPN: tap <strong>Open in OpenVPN Connect</strong> (install that app first) — the profile is handed to the app, not opened as a page.<br>
+            <strong>Android / OpenVPN:</strong> After handshake, tap <strong>Open in OpenVPN Connect</strong>. If the app is missing you will be offered Play Store, then share/download.<br>
+            <strong>Linux &amp; Windows 11:</strong> Linux command is shown by default. Windows devices switch automatically. Tap a command to copy.
+          </div>
+          <div class="pill-row" id="install-os-pills" style="margin-top:8px">
+            <button type="button" class="chip active" data-install-os="linux">Linux</button>
+            <button type="button" class="chip" data-install-os="windows">Windows</button>
+          </div>
+          <div class="card-subtitle" id="install-os-hint" style="margin-top:8px">Linux / macOS · POSIX sh</div>
+          <div class="code-copy-label">Install · tap to copy</div>
+          <button type="button" class="code-copy" id="install-copy" title="Tap to copy">curl -fsSL https://raw.githubusercontent.com/warmaster726/vpngate-connect/main/install-vpngate.sh | sh -s --</button>
+          <div class="code-copy-label">Uninstall · same one-liner + --uninstall</div>
+          <button type="button" class="code-copy" id="uninstall-copy" title="Tap to copy">curl -fsSL https://raw.githubusercontent.com/warmaster726/vpngate-connect/main/install-vpngate.sh | sh -s -- --uninstall</button>
+        </details>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">Live edge console</div>
+          <button type="button" class="btn btn-sm" id="btn-clear-log">Clear</button>
+        </div>
+        <div class="console-box" id="console-log" aria-live="polite"></div>
+      </div>
+    </section>
+
+    <section class="tab-panel" id="tab-relays">
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">Live volunteer relay matrix</div>
+            <div class="card-subtitle" id="relays-meta">Loading relays...</div>
+          </div>
+        </div>
+        <input type="text" id="relay-search" placeholder="Filter by ISO (JP, KR, US) or country / hostname / IP" autocomplete="off" spellcheck="false">
+        <div class="pill-row scroll" id="relay-proto-pills">
+          <button type="button" class="chip active" data-rproto="all">All protocols</button>
+          <button type="button" class="chip" data-rproto="l2tp">L2TP/IPsec</button>
+          <button type="button" class="chip" data-rproto="openvpn">OpenVPN</button>
+          <button type="button" class="chip" data-rproto="udp">OVPN UDP</button>
+          <button type="button" class="chip" data-rproto="tcp">OVPN TCP</button>
+        </div>
+        <div class="pill-row scroll" id="relay-sort-pills">
+          <button type="button" class="chip active" data-rsort="recommended">Recommended</button>
+          <button type="button" class="chip" data-rsort="speed">Speed</button>
+          <button type="button" class="chip" data-rsort="ping">Lowest ping</button>
+          <button type="button" class="chip" data-rsort="score">Score</button>
+        </div>
+      </div>
+      <div class="relay-list" id="relays-list"></div>
+    </section>
+
+    <section class="tab-panel" id="tab-mirrors">
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">Official VPNGate mirror portals</div>
+            <div class="card-subtitle" id="mirrors-count">All listed portals are merged into the live pool automatically</div>
+          </div>
+          <button type="button" class="btn btn-sm" id="btn-probe-mirrors">Re-probe reachability</button>
+        </div>
+        <div class="card-subtitle" style="margin-bottom:8px">Discovery already pulls <code>/api/iphone/</code> from every official portal plus all HTTPS CSV feeds. Add an extra portal only if you have a URL that is not in the directory.</div>
+        <label class="field-label" for="custom-mirror-input">Extra portal to merge (optional)</label>
+        <div class="inline-row">
+          <input type="text" id="custom-mirror-input" placeholder="http://host:port/en/" autocomplete="off" spellcheck="false">
+          <button type="button" class="btn btn-sm" id="btn-apply-mirror">Merge extra</button>
+        </div>
+      </div>
+      <div class="relay-list" id="mirrors-list"></div>
+    </section>
+
+    <section class="tab-panel" id="tab-doctor">
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">System, DoH &amp; handshake diagnostics</div>
+            <div class="card-subtitle">Verifies egress, Cloudflare DoH, relay pool, live OpenVPN HARD_RESET, and gated profile builders</div>
+          </div>
+          <button type="button" class="btn btn-sm" id="btn-run-doctor">Re-run checks</button>
+        </div>
+        <div class="relay-list" id="doctor-results"></div>
+      </div>
+    </section>
+  </div>
+
+  <nav class="bottom-nav" aria-label="Primary console navigation">
+    <div class="bottom-nav-inner">
+      <button type="button" class="nav-tab active" data-tab="connect"><span class="nav-ico">⚡</span><span>1. Connect</span></button>
+      <button type="button" class="nav-tab" data-tab="relays"><span class="nav-ico">🛰️</span><span>2. Relays</span></button>
+      <button type="button" class="nav-tab" data-tab="mirrors"><span class="nav-ico">🪞</span><span>3. Mirrors</span></button>
+      <button type="button" class="nav-tab" data-tab="doctor"><span class="nav-ico">🩺</span><span>4. Doctor</span></button>
+    </div>
+  </nav>
+
+  <script>${PORTAL_JS}</script>
+</body>
+</html>
