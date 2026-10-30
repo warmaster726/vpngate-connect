@@ -19,7 +19,8 @@ pub const UPDATE_DECLINE_SNOOZE_SECS: u64 = 24 * 3600;
 pub const UPDATE_CACHE_TTL_SECS: u64 = 6 * 3600;
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(12);
-const OVERALL_CHECK_TIMEOUT: Duration = Duration::from_secs(20);
+const GITHUB_CHECK_TIMEOUT: Duration = Duration::from_secs(12);
+const CDN_CHECK_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DesktopVersion {
@@ -128,7 +129,14 @@ pub fn cargo_toml_check_urls(slug: &str) -> Vec<String> {
         .collect()
 }
 
+pub fn is_github_version_url(url: &str) -> bool {
+    let u = url.to_ascii_lowercase();
+    u.contains("raw.githubusercontent.com/")
+        || (u.contains("github.com/") && u.contains("/raw/"))
+}
+
 /// Anonymous HTTPS endpoints only (no GitHub API, no tokens, no 2FA).
+/// GitHub raw is authoritative; jsDelivr/Fastly are fallbacks when GitHub is unreachable.
 pub fn version_check_urls(slug: &str) -> Vec<String> {
     let mut urls = Vec::new();
     for file in ["assets/desktop-version.txt", "Cargo.toml"] {
@@ -138,12 +146,12 @@ pub fn version_check_urls(slug: &str) -> Vec<String> {
         urls.push(format!(
             "https://raw.githubusercontent.com/{slug}/refs/heads/main/{file}"
         ));
+        urls.push(format!(
+            "https://github.com/{slug}/raw/main/{file}"
+        ));
         urls.push(format!("https://cdn.jsdelivr.net/gh/{slug}@main/{file}"));
         urls.push(format!(
             "https://fastly.jsdelivr.net/gh/{slug}@main/{file}"
-        ));
-        urls.push(format!(
-            "https://github.com/{slug}/raw/main/{file}"
         ));
     }
     urls
@@ -297,7 +305,7 @@ pub async fn fetch_public_url_text(urls: &[String]) -> Result<(String, String), 
     )
 }
 
-/// Keep the highest SemVer. A stale CDN (jsDelivr still on 0.2.20) must not hide GitHub 0.3.x.
+/// Keep the highest SemVer. Used for CDN fallbacks that may be stale relative to each other.
 pub fn pick_highest_version(hits: &[(String, String)]) -> Option<RemoteDesktopVersion> {
     let mut best: Option<RemoteDesktopVersion> = None;
     for (raw, source_url) in hits {
@@ -309,19 +317,47 @@ pub fn pick_highest_version(hits: &[(String, String)]) -> Option<RemoteDesktopVe
             raw: raw.clone(),
             source_url: source_url.clone(),
         };
-        if best
-            .as_ref()
-            .is_none_or(|b| cand.version > b.version)
-        {
+        if best.as_ref().is_none_or(|b| cand.version > b.version) {
             best = Some(cand);
         }
     }
     best
 }
 
-const VERSION_GRACE_AFTER_FIRST: Duration = Duration::from_secs(3);
+async fn first_parsed_version(
+    urls: &[String],
+    timeout: Duration,
+) -> Option<RemoteDesktopVersion> {
+    let mut set = tokio::task::JoinSet::new();
+    for url in urls.iter().cloned() {
+        set.spawn(async move {
+            let text = fetch_public_text(&url).await?;
+            let raw = parse_version_payload(&text)?;
+            let version = DesktopVersion::parse(&raw)?;
+            Some(RemoteDesktopVersion {
+                version,
+                raw,
+                source_url: url,
+            })
+        });
+    }
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = &mut deadline => return None,
+            joined = set.join_next() => {
+                match joined {
+                    Some(Ok(Some(remote))) => return Some(remote),
+                    Some(_) => continue,
+                    None => return None,
+                }
+            }
+        }
+    }
+}
 
-async fn collect_public_versions(urls: &[String]) -> Vec<(String, String)> {
+async fn collect_public_versions(urls: &[String], timeout: Duration) -> Vec<(String, String)> {
     let mut set = tokio::task::JoinSet::new();
     for url in urls.iter().cloned() {
         set.spawn(async move {
@@ -330,30 +366,18 @@ async fn collect_public_versions(urls: &[String]) -> Vec<(String, String)> {
             Some((raw, url))
         });
     }
-    let overall = tokio::time::sleep(OVERALL_CHECK_TIMEOUT);
-    tokio::pin!(overall);
-    let grace = tokio::time::sleep(Duration::from_secs(3600));
-    tokio::pin!(grace);
-    let mut grace_armed = false;
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
     let mut hits = Vec::new();
     loop {
         if set.is_empty() {
             break;
         }
         tokio::select! {
-            _ = &mut overall => break,
-            _ = &mut grace, if grace_armed => break,
+            _ = &mut deadline => break,
             joined = set.join_next() => {
                 match joined {
-                    Some(Ok(Some(pair))) => {
-                        hits.push(pair);
-                        if !grace_armed {
-                            grace.as_mut().reset(
-                                tokio::time::Instant::now() + VERSION_GRACE_AFTER_FIRST,
-                            );
-                            grace_armed = true;
-                        }
-                    }
+                    Some(Ok(Some(pair))) => hits.push(pair),
                     Some(_) => {}
                     None => break,
                 }
@@ -366,7 +390,23 @@ async fn collect_public_versions(urls: &[String]) -> Vec<(String, String)> {
 pub async fn check_remote_desktop_version() -> Result<RemoteDesktopVersion, String> {
     let slug = default_repo_slug();
     let urls = version_check_urls(&slug);
-    let hits = collect_public_versions(&urls).await;
+    let github: Vec<String> = urls
+        .iter()
+        .cloned()
+        .filter(|u| is_github_version_url(u))
+        .collect();
+    let cdn: Vec<String> = urls
+        .iter()
+        .cloned()
+        .filter(|u| !is_github_version_url(u))
+        .collect();
+
+    // GitHub raw is the source of truth for public main. Do not let a stale
+    // jsDelivr/Fastly copy (still on 0.2.20) win a race against 0.3.x.
+    if let Some(remote) = first_parsed_version(&github, GITHUB_CHECK_TIMEOUT).await {
+        return Ok(remote);
+    }
+    let hits = collect_public_versions(&cdn, CDN_CHECK_TIMEOUT).await;
     pick_highest_version(&hits).ok_or_else(|| {
         "Could not read the public desktop version (raw.githubusercontent.com / jsDelivr). No GitHub login is used."
             .to_string()
@@ -544,5 +584,19 @@ edition = "2024"
         );
         assert!(urls.iter().any(|u| u.contains("cdn.jsdelivr.net")));
         assert!(urls.iter().any(|u| u.contains("fastly.jsdelivr.net")));
+        assert!(is_github_version_url(
+            "https://raw.githubusercontent.com/warmaster726/vpngate-connect/main/Cargo.toml"
+        ));
+        assert!(is_github_version_url(
+            "https://github.com/warmaster726/vpngate-connect/raw/main/assets/desktop-version.txt"
+        ));
+        assert!(!is_github_version_url(
+            "https://cdn.jsdelivr.net/gh/warmaster726/vpngate-connect@main/Cargo.toml"
+        ));
+        let github: Vec<_> = urls.iter().filter(|u| is_github_version_url(u)).collect();
+        let cdn: Vec<_> = urls.iter().filter(|u| !is_github_version_url(u)).collect();
+        assert!(!github.is_empty());
+        assert!(!cdn.is_empty());
+        assert!(github.iter().all(|u| !u.contains("jsdelivr")));
     }
 }
