@@ -1019,7 +1019,7 @@
     qs.set("ip", srv.ip);
     if (force) qs.set("force", "1");
     var ctrl = new AbortController();
-    var timer = setTimeout(function () { ctrl.abort(); }, ${VERIFY_CLIENT_ABORT_MS});
+    var timer = setTimeout(function () { ctrl.abort(); }, 21000);
     function onWalkAbort() { ctrl.abort(); }
     if (signal) {
       if (signal.aborted) ctrl.abort();
