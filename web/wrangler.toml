@@ -1,20 +1,21 @@
-# ==============================================================================
+# =============================================================================
 # VPN Gate Connect — Isolated Cloudflare Workers Web Profile Portal (Option A)
-# ==============================================================================
-# Zero-dependency ES Module Worker (`no_bundle = true`):
-# - Requires NO `package.json`, `node_modules`, or build command.
-# - Completely isolated from root `Cargo.toml`, `Cargo.lock`, and desktop
-#   installers (`install-vpngate.sh`, `install-vpngate.ps1`, `install-vpngate.cmd`).
-# - Deploy via Cloudflare Workers Builds (Root directory: `web`, Build command: empty,
-#   Deploy command: `npx wrangler deploy`, Watch paths: `web/**`) or locally via:
-#     cd web && npx wrangler deploy
-# ==============================================================================
+# =============================================================================
+# Rust Worker (`workers-rs`). Browser console stays HTML/CSS/JS in web/assets/.
+# Completely isolated from root Cargo.toml / desktop installers.
+#
+# Deploy via Cloudflare Workers Builds (Root directory: `web`,
+# Deploy command: `npx wrangler deploy`, Watch paths: `web/**`) or locally:
+#   cd web && npx wrangler deploy
+# =============================================================================
 
 name = "vpngate-connect"
-main = "src/worker.js"
+main = "build/index.js"
 compatibility_date = "2026-10-26"
-no_bundle = true
 workers_dev = true
+
+[build]
+command = "if ! command -v rustc >/dev/null 2>&1; then curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y; fi; . \"$HOME/.cargo/env\"; rustup target add wasm32-unknown-unknown; cargo install -q worker-build@^0.8; worker-build --release"
 
 [observability]
 enabled = true

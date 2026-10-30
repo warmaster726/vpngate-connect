@@ -144,16 +144,9 @@ fn delegate_to_window_launcher(paths: &AppPaths, raw_args: &[String]) -> i32 {
         let mut cands = Vec::new();
         if let Some(d) = self_dir {
             cands.push(d.join("vpngate-launcher"));
-            cands.push(d.join("vpngate-launcher.py"));
-            if let Some(repo_root) = d.parent().and_then(|p| p.parent()) {
-                cands.push(repo_root.join("vpngate-launcher.py"));
-            }
         }
         cands.push(PathBuf::from("/usr/local/bin/vpngate-launcher"));
-        cands.push(PathBuf::from("/usr/local/bin/vpngate-launcher.py"));
-        if let Some(w) = vpngate_core::which_bin("vpngate-launcher")
-            .or_else(|| vpngate_core::which_bin("vpngate-launcher.py"))
-        {
+        if let Some(w) = vpngate_core::which_bin("vpngate-launcher") {
             cands.push(w);
         }
 
@@ -162,13 +155,7 @@ fn delegate_to_window_launcher(paths: &AppPaths, raw_args: &[String]) -> i32 {
             return 1;
         };
 
-        let py_bin = if Path::new("/usr/bin/python3").is_file() {
-            "/usr/bin/python3"
-        } else {
-            "python3"
-        };
-        let mut cmd = std::process::Command::new(py_bin);
-        cmd.arg(launcher);
+        let mut cmd = std::process::Command::new(launcher);
         if !filtered.is_empty() {
             cmd.arg("--hold");
         }

@@ -236,7 +236,7 @@ install_lf_file() {
 cleanup_previous_residues() {
   info "Scanning system for active sessions and residues from previous vpngate installations ..."
 
-  # 1. Gracefully disconnect via installed Rust `vpngate` or legacy Python `vpngate.py`
+  # 1. Gracefully disconnect via installed Rust `vpngate`
   for cache_cand in "${USER_CACHE_DIR}" "/root/.cache/vpngate"; do
     sudo test -d "${cache_cand}" || continue
     if sudo test -f "${cache_cand}/active_state.json" ||
@@ -246,67 +246,68 @@ cleanup_previous_residues() {
       if [ -x /usr/local/bin/vpngate ] && [ ! -L /usr/local/bin/vpngate ]; then
         sudo env VPNGATE_CACHE_DIR="${cache_cand}" /usr/local/bin/vpngate disconnect --no-resize >/dev/null 2>&1 || true
         record_cleaned "Disconnected active/stale Rust vpngate session (${cache_cand})"
-      elif [ -f /usr/local/bin/vpngate.py ] && command -v python3 >/dev/null 2>&1; then
-        sudo env PYTHONDONTWRITEBYTECODE=1 VPNGATE_CACHE_DIR="${cache_cand}" python3 -B /usr/local/bin/vpngate.py disconnect --no-resize >/dev/null 2>&1 || true
-        record_cleaned "Disconnected legacy Python vpngate.py session (${cache_cand})"
       fi
     fi
   done
 
   # 2. Terminate orphaned background daemons (_monitor, _ikev1, vpngate-launcher, openvpn, xl2tpd, pppd) on Linux
-  if [ -d /proc ] && command -v python3 >/dev/null 2>&1; then
-    vg_killed_procs="$(sudo env PYTHONDONTWRITEBYTECODE=1 python3 -B - "$$" "${PPID:-0}" <<'PY' || true
-import os, signal, sys, time
-
-ignore = {os.getpid(), os.getppid()}
-for a in sys.argv[1:]:
-    if a.isdigit():
-        ignore.add(int(a))
-
-targets = []
-for entry in os.listdir("/proc"):
-    if not entry.isdigit():
-        continue
-    pid = int(entry)
-    if pid in ignore:
-        continue
-    try:
-        raw = open(f"/proc/{pid}/cmdline", "rb").read()
-    except Exception:
-        continue
-    argv = [p.decode("utf-8", "ignore") for p in raw.split(b"\x00") if p]
-    if not argv:
-        continue
-    joined = " ".join(argv)
-    if "install-vpngate" in joined:
-        continue
-    exe_base = os.path.basename(argv[0])
-    hit = None
-    if any("vpngate-launcher" in a for a in argv):
-        hit = f"vpngate-launcher(pid={pid})"
-    elif any("vpngate" in os.path.basename(a) for a in argv) and any(a in ("_monitor", "_ikev1") for a in argv):
-        hit = f"vpngate-daemon(pid={pid})"
-    elif exe_base == "openvpn" and ("vpngate-" in joined or "/vpngate/" in joined):
-        hit = f"openvpn(pid={pid})"
-    elif exe_base in ("xl2tpd", "pppd") and "/run/vpngate-l2tp" in joined:
-        hit = f"{exe_base}(pid={pid})"
-    if hit:
-        targets.append((pid, hit))
-
-for pid, _ in targets:
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except Exception:
-        pass
-if targets:
-    time.sleep(0.35)
-    for pid, _ in targets:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except Exception:
-            pass
-    print(", ".join(lbl for _, lbl in targets))
-PY
+  if [ -d /proc ]; then
+    vg_killed_procs="$(
+      sudo VG_SELF="$$" VG_PPID="${PPID:-0}" /bin/sh -c '
+        vg_killed=""
+        vg_term_pids=""
+        for vg_proc in /proc/[0-9]*; do
+          vg_pid="${vg_proc#/proc/}"
+          [ "${vg_pid}" = "${VG_SELF}" ] && continue
+          [ "${vg_pid}" = "${VG_PPID}" ] && continue
+          [ -r "${vg_proc}/cmdline" ] || continue
+          vg_cmd="$(tr "\0" " " < "${vg_proc}/cmdline" 2>/dev/null || true)"
+          [ -n "${vg_cmd}" ] || continue
+          case "${vg_cmd}" in
+            *install-vpngate*) continue ;;
+          esac
+          vg_exe="${vg_cmd%% *}"
+          vg_base="${vg_exe##*/}"
+          vg_hit=""
+          case "${vg_cmd}" in
+            *vpngate-launcher*) vg_hit="vpngate-launcher(pid=${vg_pid})" ;;
+          esac
+          if [ -z "${vg_hit}" ]; then
+            case " ${vg_cmd} " in
+              *" _monitor "*|*" _ikev1 "*)
+                case "${vg_cmd}" in
+                  *vpngate*) vg_hit="vpngate-daemon(pid=${vg_pid})" ;;
+                esac
+                ;;
+            esac
+          fi
+          if [ -z "${vg_hit}" ] && [ "${vg_base}" = "openvpn" ]; then
+            case "${vg_cmd}" in
+              *vpngate-*|*"/vpngate/"*) vg_hit="openvpn(pid=${vg_pid})" ;;
+            esac
+          fi
+          if [ -z "${vg_hit}" ] && { [ "${vg_base}" = "xl2tpd" ] || [ "${vg_base}" = "pppd" ]; }; then
+            case "${vg_cmd}" in
+              *"/run/vpngate-l2tp"*) vg_hit="${vg_base}(pid=${vg_pid})" ;;
+            esac
+          fi
+          [ -n "${vg_hit}" ] || continue
+          kill -TERM "${vg_pid}" 2>/dev/null || true
+          vg_term_pids="${vg_term_pids} ${vg_pid}"
+          if [ -n "${vg_killed}" ]; then
+            vg_killed="${vg_killed}, ${vg_hit}"
+          else
+            vg_killed="${vg_hit}"
+          fi
+        done
+        if [ -n "${vg_term_pids}" ]; then
+          sleep 1
+          for vg_pid in ${vg_term_pids}; do
+            kill -KILL "${vg_pid}" 2>/dev/null || true
+          done
+          printf "%s" "${vg_killed}"
+        fi
+      ' 2>/dev/null || true
     )"
     if [ -n "${vg_killed_procs}" ]; then
       record_cleaned "Stopped orphaned background process(es): ${vg_killed_procs}"
@@ -613,21 +614,19 @@ if [ "${SKIP_DEPS}" -eq 0 ]; then
       ca-certificates \
       tar </dev/null
     sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -o APT::Keep-Downloaded-Packages=false --no-install-recommends \
-      python3 \
-      python3-gi \
-      gir1.2-gtk-3.0 \
-      gir1.2-vte-2.91 \
+      libgtk-4-1 \
+      libvte-2.91-gtk4-0 \
       network-manager-openvpn \
       network-manager-openvpn-gnome \
       libnotify-bin </dev/null 2>/dev/null || true
   elif command -v dnf >/dev/null 2>&1; then
     info "Installing required OpenVPN, L2TP/PPP & runtime packages via dnf ..."
-    sudo dnf install -y openvpn xl2tpd ppp iproute curl ca-certificates tar python3 </dev/null
-    sudo dnf install -y NetworkManager-openvpn NetworkManager-openvpn-gnome libnotify python3-gobject gtk3 vte291 </dev/null 2>/dev/null || true
+    sudo dnf install -y openvpn xl2tpd ppp iproute curl ca-certificates tar </dev/null
+    sudo dnf install -y NetworkManager-openvpn NetworkManager-openvpn-gnome libnotify gtk4 vte291-gtk4 </dev/null 2>/dev/null || true
   elif command -v pacman >/dev/null 2>&1; then
     info "Installing required OpenVPN, L2TP/PPP & runtime packages via pacman ..."
-    sudo pacman -Sy --needed --noconfirm openvpn xl2tpd ppp iproute2 curl ca-certificates tar python </dev/null
-    sudo pacman -S --needed --noconfirm networkmanager-openvpn libnotify python-gobject gtk3 vte3 </dev/null 2>/dev/null || true
+    sudo pacman -Sy --needed --noconfirm openvpn xl2tpd ppp iproute2 curl ca-certificates tar </dev/null
+    sudo pacman -S --needed --noconfirm networkmanager-openvpn libnotify gtk4 vte4 </dev/null 2>/dev/null || true
   fi
 fi
 
@@ -658,9 +657,33 @@ if [ "${NEED_CC_PKG}" -eq 1 ]; then
   fi
 fi
 
+# 1c. Linux GTK4/VTE headers — compile-only, needed to build vpngate-launcher
+if [ "${HOST_UNAME}" = "Linux" ] && [ "${SKIP_DEPS}" -eq 0 ]; then
+  if command -v apt-get >/dev/null 2>&1; then
+    for gtk_pkg in libgtk-4-dev libvte-2.91-gtk4-dev pkg-config; do
+      if ! dpkg-query -W -f='${Status}' "${gtk_pkg}" 2>/dev/null | grep -q 'install ok installed'; then
+        INSTALLED_COMPILE_PKGS="${INSTALLED_COMPILE_PKGS} ${gtk_pkg}"
+      fi
+    done
+    info "Installing compile-only GTK4/VTE headers for vpngate-launcher ..."
+    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -o APT::Keep-Downloaded-Packages=false \
+      libgtk-4-dev libvte-2.91-gtk4-dev pkg-config </dev/null
+  elif command -v dnf >/dev/null 2>&1; then
+    for gtk_pkg in gtk4-devel vte291-gtk4-devel pkgconf-pkg-config; do
+      if ! rpm -q "${gtk_pkg}" >/dev/null 2>&1; then
+        INSTALLED_COMPILE_PKGS="${INSTALLED_COMPILE_PKGS} ${gtk_pkg}"
+      fi
+    done
+    sudo dnf install -y gtk4-devel vte291-gtk4-devel pkgconf-pkg-config </dev/null 2>/dev/null || true
+  elif command -v pacman >/dev/null 2>&1; then
+    sudo pacman -S --needed --noconfirm gtk4 vte4 pkgconf </dev/null 2>/dev/null || true
+  fi
+fi
+
 # 2. Locate local workspace / prebuilt binary, or fetch `main` source archive from GitHub (Release-free!)
 WORK_SRC_DIR="${SCRIPT_DIR}"
 BIN_SRC=""
+LAUNCHER_SRC=""
 HAD_LOCAL_TARGET=0
 if [ -e "${WORK_SRC_DIR}/target" ]; then
   HAD_LOCAL_TARGET=1
@@ -759,6 +782,10 @@ if [ -f "${WORK_SRC_DIR}/Cargo.toml" ]; then
     fi
 
     CARGO_DIR_BIN="$(dirname "${CARGO_BIN}")"
+    LAUNCHER_PKG=""
+    if [ "${HOST_UNAME}" = "Linux" ]; then
+      LAUNCHER_PKG="-p vpngate-launcher"
+    fi
     info "Building optimized x86_64 'vpngate' from Rust workspace (${WORK_SRC_DIR}) ..."
     if [ "$(id -u)" -eq 0 ] && [ "${TARGET_USER}" != "root" ]; then
       # shellcheck disable=SC2086
@@ -767,7 +794,7 @@ if [ -f "${WORK_SRC_DIR}/Cargo.toml" ]; then
         ${BUILD_RUSTUP_HOME:+RUSTUP_HOME="${BUILD_RUSTUP_HOME}"} \
         ${BUILD_CARGO_HOME:+CARGO_HOME="${BUILD_CARGO_HOME}"} \
         "${CARGO_BIN}" build --release ${LOCKED_FLAG} \
-        -p vpngate-cli \
+        -p vpngate-cli ${LAUNCHER_PKG} \
         --target "${RUST_HOST_TRIPLE}" \
         --manifest-path "${WORK_SRC_DIR}/Cargo.toml" \
         --target-dir "${EFFECTIVE_TARGET_DIR}"
@@ -778,17 +805,24 @@ if [ -f "${WORK_SRC_DIR}/Cargo.toml" ]; then
         ${BUILD_RUSTUP_HOME:+RUSTUP_HOME="${BUILD_RUSTUP_HOME}"} \
         ${BUILD_CARGO_HOME:+CARGO_HOME="${BUILD_CARGO_HOME}"} \
         "${CARGO_BIN}" build --release ${LOCKED_FLAG} \
-        -p vpngate-cli \
+        -p vpngate-cli ${LAUNCHER_PKG} \
         --target "${RUST_HOST_TRIPLE}" \
         --manifest-path "${WORK_SRC_DIR}/Cargo.toml" \
         --target-dir "${EFFECTIVE_TARGET_DIR}"
     fi
     BIN_SRC="${EFFECTIVE_TARGET_DIR}/${RUST_HOST_TRIPLE}/release/vpngate"
+    LAUNCHER_SRC="${EFFECTIVE_TARGET_DIR}/${RUST_HOST_TRIPLE}/release/vpngate-launcher"
   elif [ -x "${WORK_SRC_DIR}/target/${RUST_HOST_TRIPLE}/release/vpngate" ]; then
     BIN_SRC="${WORK_SRC_DIR}/target/${RUST_HOST_TRIPLE}/release/vpngate"
+    if [ -x "${WORK_SRC_DIR}/target/${RUST_HOST_TRIPLE}/release/vpngate-launcher" ]; then
+      LAUNCHER_SRC="${WORK_SRC_DIR}/target/${RUST_HOST_TRIPLE}/release/vpngate-launcher"
+    fi
   fi
 elif [ -x "${WORK_SRC_DIR}/vpngate" ]; then
   BIN_SRC="${WORK_SRC_DIR}/vpngate"
+  if [ -x "${WORK_SRC_DIR}/vpngate-launcher" ]; then
+    LAUNCHER_SRC="${WORK_SRC_DIR}/vpngate-launcher"
+  fi
 fi
 
 if [ -z "${BIN_SRC}" ] || [ ! -f "${BIN_SRC}" ]; then
@@ -848,10 +882,10 @@ elif [ "${TOOLCHAIN_POLICY}" = "keep" ]; then
   fi
 fi
 
-if [ "${HOST_UNAME}" = "Linux" ] && [ -f "${WORK_SRC_DIR}/vpngate-launcher.py" ]; then
-  info "Installing GNOME GTK/VTE window launcher (/usr/local/bin/vpngate-launcher) ..."
-  install_lf_file "${WORK_SRC_DIR}/vpngate-launcher.py" /usr/local/bin/vpngate-launcher.py 0755
-  sudo ln -sf /usr/local/bin/vpngate-launcher.py /usr/local/bin/vpngate-launcher
+if [ "${HOST_UNAME}" = "Linux" ] && [ -x "${LAUNCHER_SRC:-}" ]; then
+  info "Installing GNOME GTK4/VTE window launcher (/usr/local/bin/vpngate-launcher) ..."
+  sudo rm -f /usr/local/bin/vpngate-launcher /usr/local/bin/vpngate-launcher.py
+  sudo install -m 0755 "${LAUNCHER_SRC}" /usr/local/bin/vpngate-launcher
 
   if [ -f "${WORK_SRC_DIR}/vpngate.desktop" ]; then
     info "Installing GNOME Desktop Entry (/usr/share/applications/vpngate.desktop) ..."
