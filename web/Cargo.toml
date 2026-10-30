@@ -2,7 +2,7 @@
 
 [package]
 name = "vpngate-connect-worker"
-version = "0.2.15"
+version = "0.3.4"
 edition = "2021"
 license = "MIT"
 publish = false

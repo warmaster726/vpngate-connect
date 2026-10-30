@@ -9,7 +9,7 @@ exclude = ["web"]
 
 [workspace.package]
 # Product version for the desktop crates. Patch may exceed 9 (0.3.10, 0.3.15, …).
-version = "0.3.2"
+version = "0.3.4"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/warmaster726/vpngate-connect"

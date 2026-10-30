@@ -71,6 +71,58 @@ pub fn valid_public_ipv4(raw: &str) -> Option<String> {
     Some(format!("{}.{}.{}.{}", o[0], o[1], o[2], o[3]))
 }
 
+fn strip_tags(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut in_tag = false;
+    for c in raw.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn decode_basic_entities(raw: &str) -> String {
+    raw.replace("&nbsp;", " ")
+        .replace("&#160;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+}
+
+/// VPN Gate HTML/CSV cells sometimes wrap values in `<span style='font-size: 9pt;'>`.
+fn strip_markup(raw: &str) -> String {
+    let decoded = decode_basic_entities(&strip_tags(raw));
+    strip_tags(&decoded)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn clean_hostname(raw: &str, ip: &str) -> String {
+    let host = strip_markup(raw);
+    if host.is_empty() {
+        ip.to_string()
+    } else {
+        host
+    }
+}
+
+fn strip_opengw_suffix(host: &str) -> String {
+    let low = host.to_ascii_lowercase();
+    if let Some(stripped) = low.strip_suffix(".opengw.net") {
+        host[..stripped.len()].trim().to_string()
+    } else {
+        host.to_string()
+    }
+}
+
 pub fn normalize_mirror_base_url(raw: &str) -> Option<(String, String)> {
     let trimmed = raw
         .trim()
@@ -258,16 +310,16 @@ pub fn parse_vpngate_csv_into(csv_raw: &str, servers: &mut HashMap<String, Serve
         let speed_bps = parse_uint_clean(&row[4], 0);
         let sessions = parse_uint_clean(&row[7], 0);
         let uptime_ms = parse_uint_clean(&row[8], 0);
-        let (country_long, country_short) = normalize_country_pair(&row[5], &row[6]);
-        let hostname = if row[0].trim().is_empty() {
-            ip.clone()
-        } else {
-            row[0].trim().to_string()
-        };
-        let operator = if row[12].trim().is_empty() {
-            "VPNGate Volunteer".to_string()
-        } else {
-            row[12].trim().to_string()
+        let (country_long, country_short) =
+            normalize_country_pair(&strip_markup(&row[5]), &strip_markup(&row[6]));
+        let hostname = clean_hostname(&row[0], &ip);
+        let operator = {
+            let op = strip_markup(&row[12]);
+            if op.is_empty() {
+                "VPNGate Volunteer".to_string()
+            } else {
+                op
+            }
         };
         if let Some(existing) = servers.get_mut(&ip) {
             if ovpn_ok {
@@ -346,11 +398,8 @@ pub fn parse_sdise_csv_into(csv_raw: &str, servers: &mut HashMap<String, Server>
         if servers.contains_key(&ip) {
             continue;
         }
-        let (country_long, country_short) = normalize_country_pair(&row[0], "");
-        let mut host = row[1].trim().to_string();
-        if host.to_ascii_lowercase().ends_with(".opengw.net") {
-            host.truncate(host.len() - ".opengw.net".len());
-        }
+        let (country_long, country_short) = normalize_country_pair(&strip_markup(&row[0]), "");
+        let mut host = strip_opengw_suffix(&strip_markup(&row[1]));
         if host.is_empty() {
             host = ip.clone();
         }
@@ -436,12 +485,8 @@ pub fn parse_vpngate_html_into(html_raw: &str, servers: &mut HashMap<String, Ser
         let flag = capture_after(chunk, "../images/flags/")
             .and_then(|r| r.get(..2))
             .filter(|s| s.bytes().all(|b| b.is_ascii_uppercase()));
-        let cname = capture_after(chunk, "width='32' height='32'/>")
-            .and_then(|r| r.split("<br>").nth(1))
-            .and_then(|r| r.split("</td>").next())
-            .map(str::trim)
-            .unwrap_or("");
-        let (country_long, country_short) = normalize_country_pair(cname, flag.unwrap_or(""));
+        let cname = extract_country_name(chunk);
+        let (country_long, country_short) = normalize_country_pair(&cname, flag.unwrap_or(""));
         let hostname = extract_hostname(chunk).unwrap_or_else(|| ip.clone());
         let parsed_score = extract_last_bold_number(chunk);
         let parsed_ping = capture_after(chunk, "Ping:")
@@ -546,14 +591,38 @@ fn query_param<'a>(qs: &'a str, key: &str) -> Option<&'a str> {
     None
 }
 
+fn extract_country_name(chunk: &str) -> String {
+    let Some(i) = chunk
+        .find("height='32'")
+        .or_else(|| chunk.find("height=\"32\""))
+    else {
+        return String::new();
+    };
+    let Some(slash) = chunk[i..].find("/>") else {
+        return String::new();
+    };
+    let after_img = &chunk[i + slash + 2..];
+    let after_br = if let Some(b) = after_img.find("<br") {
+        match after_img[b..].find('>') {
+            Some(gt) => &after_img[b + gt + 1..],
+            None => after_img,
+        }
+    } else {
+        after_img
+    };
+    strip_markup(after_br.split("</td>").next().unwrap_or("").trim())
+}
+
 fn extract_hostname(chunk: &str) -> Option<String> {
-    let i = chunk.find("<b><span")?;
-    let after = chunk[i..].find('>')? + i + 1;
-    let end = chunk[after..].find("</span>")? + after;
-    let mut host = chunk[after..end].trim().to_string();
-    if let Some(stripped) = host.strip_suffix(".opengw.net") {
-        host = stripped.to_string();
-    }
+    // `<b><span style='font-size: 9pt;'>host</span></b>` — skip past the
+    // span tag, not the `>` that closes `<b>`.
+    let marker = "<b><span";
+    let i = chunk.find(marker)?;
+    let rest = &chunk[i + marker.len()..];
+    let gt = rest.find('>')?;
+    let inner = &rest[gt + 1..];
+    let end = inner.find("</span>")?;
+    let host = strip_opengw_suffix(&strip_markup(&inner[..end]));
     if host.is_empty() { None } else { Some(host) }
 }
 
@@ -608,7 +677,7 @@ pub fn parse_mirror_sites_html(html: &str, source_label: &str) -> Vec<Mirror> {
                 }
             }
             if !s.is_empty() {
-                loc_clean = s;
+                loc_clean = strip_markup(&s);
             }
         }
         let mut search = line;
@@ -827,5 +896,38 @@ vpn123,8.8.8.8,1000,20,1000000,Japan,JP,1,0,0,0,2,op,,QUJDRA==\n";
         let s = &map["8.8.8.8"];
         assert_eq!(s.country_short, "JP");
         assert_eq!(s.hostname, "vpn123");
+    }
+
+    #[test]
+    fn strips_html_from_csv_hostname_and_operator() {
+        let csv = "#HostName,IP,Score,Ping,Speed,CountryLong,CountryShort,NumVpnSessions,Uptime,TotalUsers,TotalTraffic,LogType,Operator,Message,OpenVPN_ConfigData_Base64\n\
+<span style='font-size: 9pt;'>public-vpn-213</span>,219.100.37.200,1000,20,1000000,Japan,JP,1,0,0,0,2,<b>Tsukuba</b>,,QUJDRA==\n";
+        let mut map = HashMap::new();
+        parse_vpngate_csv_into(csv, &mut map);
+        let s = &map["219.100.37.200"];
+        assert_eq!(s.hostname, "public-vpn-213");
+        assert_eq!(s.operator, "Tsukuba");
+    }
+
+    #[test]
+    fn html_hostname_ignores_font_size_span() {
+        let html = r#"
+        <table>
+        <tr><td class='vg_table_row_1'><img src='../images/flags/JP.png' width='32' height='32' /><br>Japan</td>
+        <td class='vg_table_row_1'><b><span style='font-size: 9pt;'>public-vpn-213.opengw.net</span></b><br><span style='font-size: 9pt;'>219.100.37.200</span></td>
+        <td class='vg_table_row_1'><b><span style='font-size: 9pt;'>12 VPN sessions</span></b></td>
+        <td class='vg_table_row_1'><b><span style='font-size: 9pt;'>167.7 Mbps</span></b><br>Ping: <b>14 ms</b></td>
+        <td class='vg_table_row_1'><a href='do_openvpn.aspx?fqdn=x&ip=219.100.37.200&tcp=443&udp=1195'>OpenVPN</a></td>
+        <td class='vg_table_row_1'><a href='howto_l2tp.aspx'>L2TP/IPsec</a></td>
+        <td class='vg_table_row_1'><b><span style='font-size: 9pt;'>1,890,500</span></b></td></tr>
+        </table>"#;
+        let mut map = HashMap::new();
+        parse_vpngate_html_into(html, &mut map);
+        let s = map.get("219.100.37.200").expect("html server");
+        assert_eq!(s.hostname, "public-vpn-213");
+        assert_eq!(s.country_short, "JP");
+        assert!(s.l2tp);
+        assert_eq!(s.tcp_port, 443);
+        assert_eq!(s.udp_port, 1195);
     }
 }

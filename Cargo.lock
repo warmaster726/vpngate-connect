@@ -1880,7 +1880,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vpngate-cli"
-version = "0.3.2"
+version = "0.3.4"
 dependencies = [
  "libc",
  "serde_json",
@@ -1890,7 +1890,7 @@ dependencies = [
 
 [[package]]
 name = "vpngate-core"
-version = "0.3.2"
+version = "0.3.4"
 dependencies = [
  "aes",
  "base64 0.22.1",
@@ -1915,7 +1915,7 @@ dependencies = [
 
 [[package]]
 name = "vpngate-launcher"
-version = "0.3.2"
+version = "0.3.4"
 dependencies = [
  "gdk4",
  "gio",

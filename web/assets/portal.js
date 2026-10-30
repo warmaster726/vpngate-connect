@@ -125,6 +125,20 @@
       .replace(/"/g, "&quot;");
   }
 
+  function stripMarkup(s) {
+    return String(s == null ? "" : s)
+      .replace(/<[^>]*>/g, " ")
+      .replace(/&nbsp;|&#160;/gi, " ")
+      .replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&quot;/g, "\"")
+      .replace(/&#39;|&apos;/g, "'")
+      .replace(/<[^>]*>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
   function fmtMbps(bps) {
     return ((Number(bps) || 0) / 1000000).toFixed(1) + " Mbps";
   }
@@ -134,7 +148,7 @@
   }
 
   function hostLabel(srv) {
-    var h = String((srv && srv.hostname) || "");
+    var h = stripMarkup((srv && srv.hostname) || "");
     var ip = String((srv && srv.ip) || "");
     if (!h || h === ip) return ip;
     if (/\.opengw\.net$/i.test(h)) return h;
@@ -905,9 +919,22 @@
       var data = await resp.json();
       if (!data || !data.ok) throw new Error((data && data.error) || "Upstream discovery error");
 
-      state.servers = data.servers || [];
-      state.countries = data.countries || [];
-      state.mirrors = data.mirrors || [];
+      state.servers = (data.servers || []).map(function (s) {
+        s.hostname = stripMarkup(s.hostname);
+        s.country_long = stripMarkup(s.country_long);
+        s.country_short = stripMarkup(s.country_short);
+        if (s.operator) s.operator = stripMarkup(s.operator);
+        return s;
+      });
+      state.countries = (data.countries || []).map(function (c) {
+        c.country_long = stripMarkup(c.country_long);
+        c.country_short = stripMarkup(c.country_short);
+        return c;
+      });
+      state.mirrors = (data.mirrors || []).map(function (m) {
+        m.location = stripMarkup(m.location);
+        return m;
+      });
       state.counts = data.counts || state.counts;
       state.selectedIndex = 0;
       state.verified = null;
