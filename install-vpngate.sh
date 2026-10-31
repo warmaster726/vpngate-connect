@@ -265,16 +265,37 @@ cleanup_previous_residues() {
     fi
   done
 
-  # 2. Terminate orphaned background daemons (_monitor, _ikev1, vpngate-launcher, openvpn, xl2tpd, pppd) on Linux
+  # 2. Terminate orphaned background daemons (_monitor, _ikev1, vpngate-launcher, openvpn, xl2tpd, pppd) on Linux.
+  # Never kill this installer or its ancestors (the GUI vpngate-launcher / VTE
+  # vpngate). Doing so SIGHUPs the in-place upgrade and the window just closes.
   if [ -d /proc ]; then
     vg_killed_procs="$(
       sudo VG_SELF="$$" VG_PPID="${PPID:-0}" /bin/sh -c '
+        vg_is_protected() {
+          vg_cand="$1"
+          [ "${vg_cand}" = "$$" ] && return 0
+          vg_walk="$$"
+          vg_hops=0
+          while [ -n "${vg_walk}" ] && [ "${vg_walk}" != "0" ] && [ "${vg_hops}" -lt 64 ]; do
+            [ "${vg_cand}" = "${vg_walk}" ] && return 0
+            [ "${vg_cand}" = "${VG_SELF}" ] && return 0
+            [ "${vg_cand}" = "${VG_PPID}" ] && return 0
+            vg_next=""
+            if [ -r "/proc/${vg_walk}/status" ]; then
+              vg_next="$(awk "/^PPid:/ {print \$2; exit}" "/proc/${vg_walk}/status" 2>/dev/null || true)"
+            fi
+            [ -n "${vg_next}" ] || break
+            [ "${vg_next}" = "${vg_walk}" ] && break
+            vg_walk="${vg_next}"
+            vg_hops=$((vg_hops + 1))
+          done
+          [ "${vg_cand}" = "${VG_SELF}" ] || [ "${vg_cand}" = "${VG_PPID}" ]
+        }
         vg_killed=""
         vg_term_pids=""
         for vg_proc in /proc/[0-9]*; do
           vg_pid="${vg_proc#/proc/}"
-          [ "${vg_pid}" = "${VG_SELF}" ] && continue
-          [ "${vg_pid}" = "${VG_PPID}" ] && continue
+          vg_is_protected "${vg_pid}" && continue
           [ -r "${vg_proc}/cmdline" ] || continue
           vg_cmd="$(tr "\0" " " < "${vg_proc}/cmdline" 2>/dev/null || true)"
           [ -n "${vg_cmd}" ] || continue

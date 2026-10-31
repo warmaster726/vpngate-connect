@@ -22,11 +22,17 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(12);
 const GITHUB_CHECK_TIMEOUT: Duration = Duration::from_secs(12);
 const CDN_CHECK_TIMEOUT: Duration = Duration::from_secs(8);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Public desktop label. Cargo crate version stays SemVer (`0.3.4`); a trailing
+/// letter (`0.3.4a`) is a revision *after* that patch, used for update prompts.
+pub const PRODUCT_VERSION: &str = "0.3.4a";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DesktopVersion {
     pub major: u64,
     pub minor: u64,
     pub patch: u64,
+    /// `0` = plain `x.y.z`; `b'a'`..=`b'z'` = `x.y.za` (newer than `x.y.z`).
+    pub letter: u8,
 }
 
 impl DesktopVersion {
@@ -35,20 +41,45 @@ impl DesktopVersion {
         let mut it = s.split('.');
         let major = it.next()?.parse().ok()?;
         let minor = it.next()?.parse().ok()?;
-        let patch = it.next()?.parse().ok()?;
+        let patch_raw = it.next()?;
         if it.next().is_some() {
             return None;
         }
+        let (patch, letter) = parse_patch_and_letter(patch_raw)?;
         Some(Self {
             major,
             minor,
             patch,
+            letter,
         })
     }
 
     pub fn as_str(&self) -> String {
-        format!("{}.{}.{}", self.major, self.minor, self.patch)
+        self.to_string()
     }
+}
+
+fn parse_patch_and_letter(raw: &str) -> Option<(u64, u8)> {
+    let digits = raw
+        .char_indices()
+        .take_while(|(_, c)| c.is_ascii_digit())
+        .last()
+        .map(|(i, _)| i + 1)
+        .unwrap_or(0);
+    if digits == 0 {
+        return None;
+    }
+    let patch: u64 = raw[..digits].parse().ok()?;
+    let rest = raw[digits..].strip_prefix('-').unwrap_or(&raw[digits..]);
+    if rest.is_empty() {
+        return Some((patch, 0));
+    }
+    let mut chars = rest.chars();
+    let c = chars.next()?;
+    if chars.next().is_some() || !c.is_ascii_alphabetic() {
+        return None;
+    }
+    Some((patch, c.to_ascii_lowercase() as u8))
 }
 
 impl PartialOrd for DesktopVersion {
@@ -63,12 +94,17 @@ impl Ord for DesktopVersion {
             .cmp(&other.major)
             .then(self.minor.cmp(&other.minor))
             .then(self.patch.cmp(&other.patch))
+            .then(self.letter.cmp(&other.letter))
     }
 }
 
 impl std::fmt::Display for DesktopVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)?;
+        if self.letter != 0 {
+            write!(f, "{}", self.letter as char)?;
+        }
+        Ok(())
     }
 }
 
@@ -95,11 +131,9 @@ pub struct UpdateCheckCache {
 }
 
 pub fn installed_desktop_version() -> DesktopVersion {
-    DesktopVersion::parse(env!("CARGO_PKG_VERSION")).unwrap_or(DesktopVersion {
-        major: 0,
-        minor: 0,
-        patch: 0,
-    })
+    DesktopVersion::parse(PRODUCT_VERSION)
+        .or_else(|| DesktopVersion::parse(env!("CARGO_PKG_VERSION")))
+        .unwrap_or_default()
 }
 
 pub fn default_repo_slug() -> String {
@@ -523,6 +557,25 @@ mod tests {
         assert!(c > a);
         assert!(e > d);
         assert!(d > c);
+    }
+
+    #[test]
+    fn letter_revision_is_newer_than_the_plain_patch() {
+        let plain = DesktopVersion::parse("0.3.4").unwrap();
+        let a = DesktopVersion::parse("0.3.4a").unwrap();
+        let a2 = DesktopVersion::parse("v0.3.4a").unwrap();
+        let b = DesktopVersion::parse("0.3.4b").unwrap();
+        let next = DesktopVersion::parse("0.3.5").unwrap();
+        assert!(plain < a);
+        assert_eq!(a, a2);
+        assert!(a < b);
+        assert!(a < next);
+        assert_eq!(a.to_string(), "0.3.4a");
+        assert_eq!(plain.to_string(), "0.3.4");
+        assert_eq!(
+            parse_version_payload("0.3.4a\n").as_deref(),
+            Some("0.3.4a")
+        );
     }
 
     #[test]

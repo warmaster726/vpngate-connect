@@ -62,7 +62,7 @@ pub use protocol::{
 };
 pub use server::{VpnServer, filter_by_country, filter_by_protocol, sort_servers};
 pub use update::{
-    DesktopVersion, RemoteDesktopVersion, UpdateCheckCache, cache_is_fresh,
+    DesktopVersion, RemoteDesktopVersion, UpdateCheckCache, PRODUCT_VERSION, cache_is_fresh,
     cached_newer_than_installed, cached_remote_version, cargo_toml_check_urls,
     check_remote_desktop_version, default_repo_slug, fetch_public_url_text,
     installer_script_urls, installed_desktop_version, load_update_cache,
