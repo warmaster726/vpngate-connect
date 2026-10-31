@@ -6,10 +6,10 @@ use worker::{Cache, Context, Method};
 
 use crate::fetchutil::{fetch_get, fetch_text_timeout};
 use crate::model::{
-    Counts, LogLine, Mirror, PoolSnapshot, PublicPayload, Server, APP_VERSION, DAILY_MIRROR_JSON_URLS,
-    MAX_OFFICIAL_MIRROR_CSV, MIRROR_CSV_URLS, OFFICIAL_CSV_URLS, OFFICIAL_HTML_URLS,
-    OFFICIAL_MIRROR_SITES_URLS, POOL_CACHE_KEY_URL, POOL_CACHE_TTL_MS, SDISE_CSV_URL,
-    WAYBACK_MIRROR_SITES_CDX_URL, WAYBACK_PORTAL_CDX_URLS,
+    Counts, LogLine, Mirror, PoolSnapshot, PublicPayload, Server, APP_VERSION,
+    DAILY_MIRROR_JSON_URLS, MAX_OFFICIAL_MIRROR_CSV, MIRROR_CSV_URLS, OFFICIAL_CSV_URLS,
+    OFFICIAL_HTML_URLS, OFFICIAL_MIRROR_SITES_URLS, POOL_CACHE_KEY_URL, POOL_CACHE_TTL_MS,
+    SDISE_CSV_URL, WAYBACK_MIRROR_SITES_CDX_URL, WAYBACK_PORTAL_CDX_URLS,
 };
 use crate::parse::{
     extract_aspnet_fields, merge_mirror_lists, normalize_mirror_base_url, parse_mirror_sites_html,
@@ -65,7 +65,13 @@ async fn post_protocol_filter(
         &extra_refs,
     )
     .await
-    .map(|r| if r.text.len() > 256 { r.text } else { String::new() })
+    .map(|r| {
+        if r.text.len() > 256 {
+            r.text
+        } else {
+            String::new()
+        }
+    })
     .unwrap_or_default()
 }
 
@@ -173,7 +179,9 @@ async fn fetch_fallback_mirrors() -> Vec<Mirror> {
     merge_mirror_lists(&[daily, wb])
 }
 
-async fn fetch_from_official_mirror_portal(mirror: &Mirror) -> Option<(String, String, String, String, Vec<Mirror>)> {
+async fn fetch_from_official_mirror_portal(
+    mirror: &Mirror,
+) -> Option<(String, String, String, String, Vec<Mirror>)> {
     let csv_url = format!("{}/api/iphone/", mirror.base_url);
     let sites_url = format!("{}/en/sites.aspx", mirror.base_url);
     let csv_fut = fetch_get(&csv_url, 4000);
@@ -269,21 +277,35 @@ pub async fn discover_pool_fresh(custom_mirror_raw: &str) -> PoolSnapshot {
     let mut servers_by_ip: HashMap<String, Server> = HashMap::new();
     let mut custom_mirrors = Vec::new();
     if !custom_mirror_raw.is_empty() {
-        if let Some((base_url, portal_url)) = normalize_mirror_base_url(custom_mirror_raw) {
-            custom_mirrors.push(Mirror {
-                base_url,
-                portal_url: portal_url.clone(),
-                location: "Custom Mirror".into(),
-                source: "custom".into(),
-                reachable: None,
-                rtt_ms: None,
-                servers_count: None,
-            });
-            logs.push(log_line(
-                "info",
-                format!("Seeding extra Official Mirror Portal (merged with all others): {portal_url}"),
-            ));
-        } else {
+        for part in custom_mirror_raw
+            .split(|c: char| c == ',' || c == ';' || c == '\n' || c == '\r' || c.is_whitespace())
+        {
+            if part.is_empty() || part.starts_with('#') {
+                continue;
+            }
+            if let Some((base_url, portal_url)) = normalize_mirror_base_url(part) {
+                if custom_mirrors
+                    .iter()
+                    .any(|m: &Mirror| m.base_url == base_url)
+                {
+                    continue;
+                }
+                custom_mirrors.push(Mirror {
+                    base_url,
+                    portal_url: portal_url.clone(),
+                    location: "Custom Mirror".into(),
+                    source: "custom".into(),
+                    reachable: None,
+                    rtt_ms: None,
+                    servers_count: None,
+                });
+                logs.push(log_line(
+                    "info",
+                    format!("Seeding extra Official Mirror Portal (merged with all others): {portal_url}"),
+                ));
+            }
+        }
+        if custom_mirrors.is_empty() {
             logs.push(log_line(
                 "warn",
                 "Ignored invalid or private custom mirror URL.",
@@ -375,7 +397,11 @@ pub async fn discover_pool_fresh(custom_mirror_raw: &str) -> PoolSnapshot {
     let fb_mirrors = fetch_fallback_mirrors().await;
     let mut harvested = merge_mirror_lists(&[custom_mirrors.clone(), primary_mirrors, fb_mirrors]);
 
-    let mut mirror_slice: Vec<Mirror> = harvested.iter().take(MAX_OFFICIAL_MIRROR_CSV).cloned().collect();
+    let mut mirror_slice: Vec<Mirror> = harvested
+        .iter()
+        .take(MAX_OFFICIAL_MIRROR_CSV)
+        .cloned()
+        .collect();
     if !mirror_slice.is_empty() {
         let csv_bodies = join_all(mirror_slice.iter().map(fetch_mirror_csv_only)).await;
         let mut portal_hits = 0usize;
@@ -418,7 +444,8 @@ pub async fn discover_pool_fresh(custom_mirror_raw: &str) -> PoolSnapshot {
             harvested.iter().take(2).cloned().collect()
         };
         for m in deep {
-            if let Some((csv_body, base, l2, ov, extra)) = fetch_from_official_mirror_portal(&m).await
+            if let Some((csv_body, base, l2, ov, extra)) =
+                fetch_from_official_mirror_portal(&m).await
             {
                 if !csv_body.is_empty() {
                     parse_vpngate_csv_into(&csv_body, &mut servers_by_ip);
@@ -483,7 +510,11 @@ pub async fn discover_pool_fresh(custom_mirror_raw: &str) -> PoolSnapshot {
             "ok",
             format!(
                 "Merged {hits} HTTPS CSV mirror feed(s){} ({} total relays).",
-                if sdise_text.is_empty() { "" } else { " + SDISE" },
+                if sdise_text.is_empty() {
+                    ""
+                } else {
+                    " + SDISE"
+                },
                 servers_by_ip.len()
             ),
         ));
@@ -498,7 +529,10 @@ pub async fn discover_pool_fresh(custom_mirror_raw: &str) -> PoolSnapshot {
     }
     let mut full = Vec::new();
     for mut s in servers_by_ip.into_values() {
-        if s.openvpn && s.ovpn_b64.is_empty() && !donor.is_empty() && (s.udp_port > 0 || s.tcp_port > 0)
+        if s.openvpn
+            && s.ovpn_b64.is_empty()
+            && !donor.is_empty()
+            && (s.udp_port > 0 || s.tcp_port > 0)
         {
             s.ovpn_b64 = donor.clone();
         }
@@ -648,11 +682,8 @@ pub async fn probe_mirrors(ctx: &Context) -> (usize, Vec<Mirror>) {
     combined.sort_by(|a, b| {
         let ar = i32::from(a.reachable == Some(true));
         let br = i32::from(b.reachable == Some(true));
-        br.cmp(&ar).then(
-            a.rtt_ms
-                .unwrap_or(99_999)
-                .cmp(&b.rtt_ms.unwrap_or(99_999)),
-        )
+        br.cmp(&ar)
+            .then(a.rtt_ms.unwrap_or(99_999).cmp(&b.rtt_ms.unwrap_or(99_999)))
     });
     combined.extend(rest);
     (online, combined)
@@ -664,5 +695,3 @@ pub async fn fetch_text(url: &str, timeout_ms: u32, extra: &[(&str, &str)]) -> O
         .await
         .map(|r| r.text)
 }
-
-

@@ -51,8 +51,9 @@
     return { id: "linux", label: "Linux · Patched .ovpn + native CLI", apple: false, mobile: false };
   }
 
-  var INSTALL_SH = "https://raw.githubusercontent.com/warmaster726/vpngate-connect/main/install-vpngate.sh";
-  var INSTALL_PS1 = "https://raw.githubusercontent.com/warmaster726/vpngate-connect/main/install-vpngate.ps1";
+  var EDGE = (typeof location !== "undefined" && location.origin) ? location.origin : "";
+  var INSTALL_SH = EDGE ? (EDGE + "/install.sh") : "https://cdn.jsdelivr.net/gh/warmaster726/vpngate-connect@main/install-vpngate.sh";
+  var INSTALL_PS1 = EDGE ? (EDGE + "/install.ps1") : "https://cdn.jsdelivr.net/gh/warmaster726/vpngate-connect@main/install-vpngate.ps1";
   var INSTALL_CMDS = {
     linux: {
       hint: "Linux / macOS · POSIX sh",
@@ -870,11 +871,25 @@
     }
   }
 
+  function currentSeedText() {
+    var lines = [];
+    for (var i = 0; i < state.mirrors.length; i++) {
+      if (state.mirrors[i].portal_url) lines.push(state.mirrors[i].portal_url);
+    }
+    return "# VPN Gate Connect mirror seed\n# Tsukuba daily mail: https://www.vpngate.net/en/mail.aspx\n" + lines.join("\n");
+  }
+
+  function refreshSeedPre() {
+    var pre = document.getElementById("mirror-seed-pre");
+    if (pre) pre.textContent = currentSeedText();
+  }
+
   function renderMirrorsTab() {
     var listEl = document.getElementById("mirrors-list");
     var cntEl = document.getElementById("mirrors-count");
     if (!listEl || !cntEl) return;
     cntEl.textContent = state.mirrors.length + " portal(s) auto-merged into the live pool";
+    refreshSeedPre();
     if (state.mirrors.length === 0) {
       listEl.innerHTML = '<div class="card-subtitle">Directory empty this round — HTTPS CSV feeds were still merged.</div>';
       return;
@@ -1512,6 +1527,21 @@
       loadPool(true, val);
       switchTab("connect");
     });
+    var copySeedBtn = document.getElementById("btn-copy-seed");
+    if (copySeedBtn) {
+      copySeedBtn.addEventListener("click", function () {
+        var text = currentSeedText();
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(function () {
+            appendLog("info", "Mirror seed copied. Photograph or QR this list for later paste.");
+          }).catch(function () {
+            appendLog("warn", "Clipboard blocked — copy the seed box manually.");
+          });
+        } else {
+          appendLog("warn", "Clipboard unavailable — copy the seed box manually.");
+        }
+      });
+    }
 
     document.getElementById("btn-run-doctor").addEventListener("click", runDoctor);
     document.getElementById("btn-clear-log").addEventListener("click", function () {

@@ -1,0 +1,15 @@
+# Last-good Official VPN Gate mirror portals (volunteer http://IP:port/en/).
+# Snapshot of https://www.vpngate.net/en/sites.aspx at 2026-10-31 15:31:32 UTC.
+# IPs rotate daily. Prefer a fresh list:
+#   1. Tsukuba daily mail (use an international mailbox): https://www.vpngate.net/en/mail.aspx
+#   2. `vpngate mirrors --export` after a successful probe
+#   3. Photograph / QR this list and paste it later:
+#        vpngate mirrors --import -
+#        or the web console Mirrors tab
+# Also accepted via VPNGATE_MIRRORS (comma/space) and --mirror URL.
+http://150.40.105.11:4917/en/
+http://150.40.105.5:32536/en/
+http://78.142.193.246:33304/en/
+http://150.40.105.17:50406/en/
+http://150.40.105.4:48555/en/
+http://150.40.105.24:38827/en/

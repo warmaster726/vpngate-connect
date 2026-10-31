@@ -19,8 +19,7 @@ use std::path::{Path, PathBuf};
 use commands::{
     ConnectArgs, UpgradeOffer, cmd_connect, cmd_countries, cmd_disconnect, cmd_doctor_with_update,
     cmd_list, cmd_mirrors, cmd_probe, cmd_refresh, cmd_status, cmd_upgrade, cmd_watchdog,
-    interactive_menu,
-    set_no_elevate_requested, set_skip_update_check, set_uac_already_attempted,
+    interactive_menu, set_no_elevate_requested, set_skip_update_check, set_uac_already_attempted,
 };
 use term_ui::{err, init_console, print_line, prompt_input, set_dynamic_resize, set_screen_clear};
 use vpngate_core::{
@@ -36,7 +35,7 @@ fn build_help_text() -> String {
            vpngate countries [-p PROTO] [-r]    List available countries & protocol counts\n\
            vpngate list [-c CC] [-p PROTO] [-s SORT] [-n LIMIT] [-r]\n\
            vpngate connect -c <CC|all> [-p PROTO] [-s SORT] [-n LIMIT] [--start N] [-a]\n\
-           vpngate mirrors [--mirror URL]       Discover & live-probe Official VPNGate Mirror Sites\n\
+           vpngate mirrors [--mirror URL] [--export] [--import FILE]\n\
            vpngate status                       Show active tunnel, XFRM SA, watchdog & egress IP\n\
            vpngate refresh                      Clear 30m server cooldowns & force live pool update\n\
            vpngate watchdog [on|off|status]     Manage 15s Auto-Reconnect Watchdog\n\
@@ -59,6 +58,8 @@ fn build_help_text() -> String {
                --start <N>       1-based server index in sorted list to start connecting from\n\
            -M, --mirrors         Discover & live-probe Official VPNGate Mirror Sites\n\
                --mirror <URL>    Add/use an Official VPNGate Mirror URL (e.g. http://host:port/en/)\n\
+               --export          Print last-good mirror URLs as a paste/QR seed\n\
+               --import <FILE>   Load a mirror seed file (`-` = stdin)\n\
            -r, --refresh         Force live pool refresh from vpngate.net / mirrors\n\
            -a, --autoreconnect   Enable 15s Auto-Reconnect Watchdog for this session\n\
                --no-autoreconnect Disable Auto-Reconnect Watchdog for this session\n\
@@ -131,7 +132,13 @@ fn delegate_to_window_launcher(paths: &AppPaths, raw_args: &[String]) -> i32 {
         let mut cmd = std::process::Command::new("cmd");
         cmd.args(["/c", "start", "VPN Gate"])
             .arg(ps_bin)
-            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps_line])
+            .args([
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                &ps_line,
+            ])
             .creation_flags(0x0800_0000);
         i32::from(cmd.spawn().is_err())
     }
@@ -167,7 +174,10 @@ fn delegate_to_window_launcher(paths: &AppPaths, raw_args: &[String]) -> i32 {
 
 async fn dispatch() -> io::Result<i32> {
     let raw_all: Vec<String> = env::args().skip(1).collect();
-    let is_daemon = matches!(raw_all.first().map(String::as_str), Some("_monitor" | "_ikev1"));
+    let is_daemon = matches!(
+        raw_all.first().map(String::as_str),
+        Some("_monitor" | "_ikev1")
+    );
     init_console(!is_daemon);
     if let Err(msg) = assert_supported_native_host() {
         err(&msg);
@@ -247,6 +257,8 @@ async fn dispatch_commands(paths: &AppPaths, raw_args: &[String]) -> io::Result<
     let mut force_refresh = false;
     let mut auto_reconnect_override: Option<bool> = None;
     let mut custom_mirrors: Vec<String> = Vec::new();
+    let mut export_seed = false;
+    let mut import_path: Option<String> = None;
     let mut flag_interactive = false;
     let mut flag_countries = false;
     let mut flag_list = false;
@@ -336,6 +348,15 @@ async fn dispatch_commands(paths: &AppPaths, raw_args: &[String]) -> io::Result<
                     custom_mirrors.push(v.clone());
                 }
             }
+            "--export" => {
+                export_seed = true;
+            }
+            "--import" => {
+                i += 1;
+                if let Some(v) = raw_args.get(i) {
+                    import_path = Some(v.clone());
+                }
+            }
             other if !other.starts_with('-') && subcmd.is_empty() => {
                 subcmd = other.to_ascii_lowercase();
             }
@@ -378,7 +399,7 @@ async fn dispatch_commands(paths: &AppPaths, raw_args: &[String]) -> io::Result<
         return cmd_status(paths).await;
     }
     if flag_mirrors || matches!(subcmd.as_str(), "mirrors" | "mirror" | "sites") {
-        return cmd_mirrors(paths, &custom_mirrors).await;
+        return cmd_mirrors(paths, &custom_mirrors, export_seed, import_path.as_deref()).await;
     }
     if matches!(subcmd.as_str(), "watchdog" | "wd") {
         let mode = positional.first().map(String::as_str).unwrap_or("status");

@@ -41,6 +41,14 @@ Censorship-resilient **SoftEther VPN Gate** desktop client engineered around a *
 curl -fsSL https://raw.githubusercontent.com/warmaster726/vpngate-connect/main/install-vpngate.sh | sh
 ```
 
+If GitHub raw is blocked, try jsDelivr, then the Cloudflare Worker (same origin as the web console):
+
+```bash
+curl -fsSL https://cdn.jsdelivr.net/gh/warmaster726/vpngate-connect@main/install-vpngate.sh | sh
+# or, from the Worker console origin:
+curl -fsSL "${VPNGATE_EDGE}/install.sh" | sh
+```
+
 If a Rust toolchain or C linker must be downloaded to compile from source, the installer **asks whether to keep those compile tools** or **remove them after `vpngate` is built**. Pre-existing toolchains are left untouched. Non-interactive runs remove tools this installer added; pass `--keep-toolchain` or `--remove-toolchain` to skip the prompt.
 
 **Or from a local `git clone`:**
@@ -66,6 +74,8 @@ sh ./install-vpngate.sh --uninstall
 ```powershell
 irm https://raw.githubusercontent.com/warmaster726/vpngate-connect/main/install-vpngate.ps1 | iex
 ```
+
+GitHub-bypass fallbacks: `irm https://cdn.jsdelivr.net/gh/warmaster726/vpngate-connect@main/install-vpngate.ps1 | iex` or `irm "$env:VPNGATE_EDGE/install.ps1" | iex`.
 
 Same compile-tool prompt as Linux: keep or remove Rust / MinGW after `vpngate.exe` is built (`-KeepToolchain` / `-RemoveToolchain`).
 
@@ -111,6 +121,8 @@ vpngate list -c JP -n 15       # List top 15 servers in Japan
 vpngate connect -c JP          # Auto-connect to Japan (L2TP/IPsec -> OVPN UDP -> OVPN TCP)
 vpngate connect -c KR -p l2tp  # Connect using verified PSK='vpn' L2TP/IPsec only
 vpngate mirrors                # Discover & live-probe Official VPNGate Mirror Sites
+vpngate mirrors --export       # Print a paste/QR seed of last-good http://IP:port/en/ URLs
+vpngate mirrors --import -     # Load a seed from stdin, then probe
 vpngate --mirror http://host:port/en/ refresh
 vpngate status                 # Check live tunnel, kernel XFRM SA, watchdog & Cloudflare egress IP
 vpngate watchdog on            # Arm 15s background Auto-Reconnect Watchdog
@@ -120,7 +132,16 @@ vpngate update                 # Scan public main for a newer desktop (no GitHub
 vpngate upgrade                # Same as `vpngate update`
 ```
 
-The interactive `[0-9]` dashboard live-checks for a newer desktop at **startup** and again when you select **`[9]`** (`doctor`), over anonymous HTTPS (no GitHub account or 2FA). **GitHub raw `main` is authoritative**; jsDelivr is only a fallback if GitHub is unreachable, so a stale CDN cannot hide a newer public version. If a newer version is found you are prompted to install it; confirming runs the public installer from `main`, which disconnects any tunnel, deletes the previous `vpngate` binary, and installs the new one. Use `--no-update-check` to skip those scans, or `vpngate update -y` to install without a second prompt. Pool refresh stays `vpngate refresh`.
+The interactive `[0-9]` dashboard live-checks for a newer desktop at **startup** and again when you select **`[9]`** (`doctor`), over anonymous HTTPS (no GitHub account or 2FA). **GitHub raw `main` is authoritative**; the Cloudflare Worker and jsDelivr are fallbacks if GitHub is unreachable, so a stale CDN cannot hide a newer public version. If a newer version is found you are prompted to install it; confirming runs the public installer from `main`, which disconnects any tunnel, deletes the previous `vpngate` binary, and installs the new one. Use `--no-update-check` to skip those scans, or `vpngate update -y` to install without a second prompt. Pool refresh stays `vpngate refresh`.
+
+### Restricted networks (GitHub / `vpngate.net` blocked)
+
+The public web console is **`workers.dev` only** (no custom hostname). That origin is itself DNS-poisoned / TLS-RST in mainland China, so this client does **not** claim GFW transit. Where Cloudflare still works:
+
+1. Worker GitHub-bypass: `/install.sh`, `/install.ps1`, `/desktop-version.txt`, `/api/servers`, `/api.csv`. Set `VPNGATE_EDGE` to the `wrangler deploy` URL (and optionally paste it into `assets/edge-origins.txt`).
+2. Out-of-band mirror seed: volunteer `http://IP:port/en/` portals from Tsukuba’s [daily email](https://www.vpngate.net/en/mail.aspx) (international inbox), `vpngate mirrors --export`, or the console **Mirrors** tab. Paste/QR that list later via `--import` / `VPNGATE_MIRRORS`.
+3. DoH mesh: IP-pinned `1.1.1.1` + `8.8.8.8` + `9.9.9.9`, then Worker `/dns-query`. Poisoned A records are still dropped.
+4. Source, not prebuilts: Workers cannot host desktop binaries (~1 MB free / ~10 MB paid). `/src.tar.gz` and `/src.zip` proxy GitHub; installers try Worker then GitHub. Compile on the device.
 
 ---
 
@@ -132,7 +153,7 @@ vpngate-connect/
 │   ├── vpngate-core/      # Pure-Rust discovery, Official Mirrors, DoH, IKEv1/XFRM & desktop tunnel engine
 │   ├── vpngate-cli/       # Single-binary `vpngate` CLI & [0-9] Interactive Console
 │   └── vpngate-launcher/  # Linux GNOME GTK4/VTE dark window host (`vpngate -w`)
-├── assets/                # Desktop app icon (gate mark, no VG glyph) — SVG / PNG / Windows ICO
+├── assets/                # Icon, desktop-version.txt, edge-origins.txt, mirror-seed.txt
 ├── vpngate.desktop        # XDG Desktop Entry + GNOME Dash Quick Actions
 ├── install-vpngate.sh     # POSIX /bin/sh Linux & macOS installer, residue cleaner & uninstaller
 ├── install-vpngate.ps1    # Windows 11 PowerShell installer, NAT-T & Zero-Prompt OpenVPN configurator

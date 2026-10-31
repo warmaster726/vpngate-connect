@@ -20,8 +20,63 @@ pub struct OfficialMirrorSite {
     pub portal_url: String,
     /// Geographic mirror location label reported by VPN Gate (`Croatia`, `Japan`, `France`, etc.).
     pub location: String,
-    /// Discovery origin (`sites.aspx`, `mirror-portal`, `daily-feed`, `wayback`, `cached`, `custom`).
+    /// Discovery origin (`sites.aspx`, `mirror-portal`, `daily-feed`, `wayback`, `cached`, `custom`, `seed`).
     pub source: String,
+}
+
+const BUNDLED_MIRROR_SEED: &str = include_str!("../../../assets/mirror-seed.txt");
+
+/// Parses a paste/QR/email mirror seed (one portal URL or `host:port` per line). `#` comments ignored.
+pub fn parse_mirror_seed_text(text: &str) -> Vec<OfficialMirrorSite> {
+    let mut out = Vec::new();
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        for part in line.split(|c: char| c == ',' || c == ';' || c.is_whitespace()) {
+            if let Some((base_url, portal_url)) = normalize_mirror_base_url(part)
+                && !out
+                    .iter()
+                    .any(|m: &OfficialMirrorSite| m.base_url == base_url)
+            {
+                out.push(OfficialMirrorSite {
+                    base_url,
+                    portal_url,
+                    location: "Seed".to_string(),
+                    source: "seed".to_string(),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Last-good volunteer `http://IP:port/en/` portals shipped in `assets/mirror-seed.txt`.
+pub fn bundled_mirror_seeds() -> Vec<OfficialMirrorSite> {
+    parse_mirror_seed_text(BUNDLED_MIRROR_SEED)
+}
+
+/// Copy/QR-friendly seed (portal URL per line) plus Tsukuba mail.aspx hint.
+pub fn format_mirror_seed(mirrors: &[OfficialMirrorSite]) -> String {
+    let mut out = String::from(
+        "# VPN Gate Connect mirror seed\n# Tsukuba daily mail (international inbox): https://www.vpngate.net/en/mail.aspx\n# Import: vpngate mirrors --import -   or paste into the web console Mirrors tab\n",
+    );
+    let mut n = 0usize;
+    for m in mirrors {
+        let url = m.portal_url.trim();
+        if url.is_empty() {
+            continue;
+        }
+        out.push_str(url);
+        out.push('\n');
+        n += 1;
+    }
+    if n == 0 {
+        out.push_str(BUNDLED_MIRROR_SEED.trim_end());
+        out.push('\n');
+    }
+    out
 }
 
 /// Normalizes a raw mirror URL (`http://150.40.105.11:4917/en/` or `150.40.105.11:4917`)
@@ -276,11 +331,7 @@ pub fn parse_vpngate_csv_into(csv_raw: &str, servers_by_ip: &mut BTreeMap<String
         let hostname = clean_hostname(&row[0], &ip);
         let operator = {
             let op = strip_markup(&row[12]);
-            if op.is_empty() {
-                String::new()
-            } else {
-                op
-            }
+            if op.is_empty() { String::new() } else { op }
         };
 
         if let Some(existing) = servers_by_ip.get_mut(&ip) {
@@ -356,11 +407,7 @@ pub fn parse_sdise_csv_into(csv_raw: &str, target_by_ip: &mut BTreeMap<String, V
 
         let (country_long, country_short) = normalize_country_pair(&strip_markup(&rec[0]), "");
         let host = strip_opengw_suffix(&strip_markup(&rec[1]));
-        let hostname = if host.is_empty() {
-            ip.clone()
-        } else {
-            host
-        };
+        let hostname = if host.is_empty() { ip.clone() } else { host };
         let speed_bps = rec[3]
             .trim()
             .parse::<f64>()
@@ -666,5 +713,20 @@ mod tests {
         assert_eq!(html_srv.hostname, "public-vpn-213");
         assert!(!html_srv.hostname.contains('<'));
         assert_eq!(html_srv.country_short, "JP");
+    }
+
+    #[test]
+    fn parses_mirror_seed_lines_and_ignores_comments() {
+        let text = "# comment\nhttp://150.40.105.11:4917/en/\n150.40.105.5:32536\n";
+        let got = parse_mirror_seed_text(text);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].base_url, "http://150.40.105.11:4917");
+        assert_eq!(got[0].source, "seed");
+        assert_eq!(got[1].portal_url, "http://150.40.105.5:32536/en/");
+        let bundled = bundled_mirror_seeds();
+        assert!(bundled.len() >= 3);
+        let dumped = format_mirror_seed(&bundled);
+        assert!(dumped.contains("mail.aspx"));
+        assert!(dumped.contains("150.40.105.11:4917"));
     }
 }

@@ -1,0 +1,6 @@
+# Public Cloudflare Worker origins for VPN Gate Connect (workers.dev only).
+# After `npx wrangler deploy`, paste the printed URL here, one per line:
+#   https://vpngate-connect.<account>.workers.dev
+# Override at runtime with VPNGATE_EDGE (comma/space separated).
+# workers.dev is DNS-poisoned / TLS-RST in mainland China — these origins
+# help everywhere Cloudflare is reachable, not behind the GFW.
