@@ -25,6 +25,7 @@ use vpngate_core::{
     save_cached_mirrors, save_cooldowns, save_watchdog_pref, sort_servers,
     cached_newer_than_installed, default_repo_slug, fetch_public_url_text, installer_script_urls,
     installed_desktop_version, load_update_cache, record_update_declined, refresh_update_cache,
+    PRODUCT_VERSION,
     resolve_user_home, should_auto_prompt, spawn_auto_reconnect_monitor,
     stop_monitor_daemon, summarize_countries, verify_l2tp_psk_vpn, which_bin,
 };
@@ -1005,7 +1006,7 @@ pub async fn cmd_status(paths: &AppPaths) -> io::Result<i32> {
     let mut box_lines: Vec<Option<String>> = vec![
         Some(format!(
             "{CYAN}{BOLD}VPN Gate v{} — Live Connection Status{RESET}",
-            env!("CARGO_PKG_VERSION")
+            PRODUCT_VERSION
         )),
         None,
     ];
@@ -1228,7 +1229,7 @@ pub fn cmd_doctor(paths: &AppPaths) -> io::Result<i32> {
     let mut lines: Vec<Option<String>> = vec![
         Some(format!(
             "{CYAN}{BOLD}VPN Gate v{} ({os_label}) — System Readiness & Diagnostics{RESET}",
-            env!("CARGO_PKG_VERSION")
+            PRODUCT_VERSION
         )),
         Some(format!(
             "CPU ISA      : {GREEN}{} native{RESET} — 64-bit x86_64 and ARM64 (no 32-bit, no ISA emulation)",
@@ -1255,13 +1256,13 @@ pub fn cmd_doctor(paths: &AppPaths) -> io::Result<i32> {
         } else {
             lines.push(Some(format!(
                 "Desktop Ver  : {} — run `{CYAN}vpngate update{RESET}` to scan public main (no GitHub login)",
-                env!("CARGO_PKG_VERSION")
+                PRODUCT_VERSION
             )));
         }
     } else {
         lines.push(Some(format!(
             "Desktop Ver  : {} — run `{CYAN}vpngate update{RESET}` to scan public main (no GitHub login)",
-            env!("CARGO_PKG_VERSION")
+            PRODUCT_VERSION
         )));
     }
     lines.push(None);
@@ -1802,7 +1803,10 @@ async fn run_desktop_installer(paths: &AppPaths) -> io::Result<i32> {
         }
         remove_shadow_desktop_binaries();
         ok("Desktop update installed. The old /usr/local/bin/vpngate was replaced.");
-        ok("Exit this process and run `vpngate` to use the new version.");
+        ok("Close this window and open VPN Gate Connect again to use the new version.");
+        if is_stdout_tty() {
+            let _ = prompt_input("Press Enter to close...");
+        }
         Ok(0)
     }
 }
@@ -2047,7 +2051,7 @@ pub async fn interactive_menu(paths: &AppPaths, help_text: &str) -> io::Result<i
         let menu_lines = vec![
             Some(format!(
                 "{CYAN}{BOLD}VPN Gate Console v{}{RESET}  ·  {os_label} (Auto: L2TP/IPsec -> OVPN UDP -> OVPN TCP)",
-                env!("CARGO_PKG_VERSION")
+                PRODUCT_VERSION
             )),
             Some(status_line),
             Some(local_pool_summary_line(paths)),

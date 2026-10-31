@@ -24,8 +24,8 @@ use commands::{
 };
 use term_ui::{err, init_console, print_line, prompt_input, set_dynamic_resize, set_screen_clear};
 use vpngate_core::{
-    AppPaths, ProtocolFilter, SortBy, assert_supported_native_host, run_ikev1_daemon,
-    run_monitor_daemon,
+    AppPaths, PRODUCT_VERSION, ProtocolFilter, SortBy, assert_supported_native_host,
+    run_ikev1_daemon, run_monitor_daemon,
 };
 
 fn build_help_text() -> String {
@@ -71,7 +71,7 @@ fn build_help_text() -> String {
                --no-update-check Skip the dashboard scan for a newer desktop\n\
            -y, --yes             With `update`/`upgrade`, install without an extra confirmation prompt\n\
            -h, --help            Print this help message\n",
-        env!("CARGO_PKG_VERSION")
+        PRODUCT_VERSION
     )
 }
 
@@ -266,7 +266,7 @@ async fn dispatch_commands(paths: &AppPaths, raw_args: &[String]) -> io::Result<
                 return Ok(0);
             }
             "-v" | "-V" | "--version" | "version" => {
-                print_line(&format!("vpngate {}", env!("CARGO_PKG_VERSION")));
+                print_line(&format!("vpngate {}", PRODUCT_VERSION));
                 return Ok(0);
             }
             "--no-resize" => set_dynamic_resize(false),
