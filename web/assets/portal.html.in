@@ -172,12 +172,14 @@
           </div>
           <button type="button" class="btn btn-sm" id="btn-probe-mirrors">Re-probe reachability</button>
         </div>
-        <div class="card-subtitle" style="margin-bottom:8px">Discovery already pulls <code>/api/iphone/</code> from every official portal plus all HTTPS CSV feeds. Add an extra portal only if you have a URL that is not in the directory.</div>
-        <label class="field-label" for="custom-mirror-input">Extra portal to merge (optional)</label>
-        <div class="inline-row">
-          <input type="text" id="custom-mirror-input" placeholder="http://host:port/en/" autocomplete="off" spellcheck="false">
-          <button type="button" class="btn btn-sm" id="btn-apply-mirror">Merge extra</button>
+        <div class="card-subtitle" style="margin-bottom:8px">Discovery already pulls <code>/api/iphone/</code> from every official portal plus all HTTPS CSV feeds. When <code>vpngate.net</code> is blocked, paste last-good <code>http://IP:port/en/</code> URLs (one per line) from a friend, a QR, or Tsukuba’s <a href="https://www.vpngate.net/en/mail.aspx" target="_blank" rel="noopener noreferrer">daily mirror email</a> (use an international inbox).</div>
+        <label class="field-label" for="custom-mirror-input">Paste extra portals / seed (optional, one URL per line)</label>
+        <textarea id="custom-mirror-input" rows="3" placeholder="http://host:port/en/" autocomplete="off" spellcheck="false" style="width:100%;background:#0B1220;color:#E2E8F0;border:1px solid #1E293B;border-radius:8px;padding:8px;font:13px/1.4 ui-monospace,monospace"></textarea>
+        <div class="inline-row" style="margin-top:8px">
+          <button type="button" class="btn btn-sm" id="btn-apply-mirror">Merge seed</button>
+          <button type="button" class="btn btn-sm" id="btn-copy-seed">Copy seed</button>
         </div>
+        <pre id="mirror-seed-pre" class="card-subtitle" style="white-space:pre-wrap;margin-top:8px"></pre>
       </div>
       <div class="relay-list" id="mirrors-list"></div>
     </section>
@@ -187,7 +189,7 @@
         <div class="card-header">
           <div>
             <div class="card-title">System, DoH &amp; handshake diagnostics</div>
-            <div class="card-subtitle">Verifies egress, Cloudflare DoH, relay pool, live OpenVPN HARD_RESET, and gated profile builders</div>
+            <div class="card-subtitle">Verifies egress, DoH mesh (1.1.1.1 / 8.8.8.8 / 9.9.9.9), relay pool, live OpenVPN HARD_RESET, and gated profile builders</div>
           </div>
           <button type="button" class="btn btn-sm" id="btn-run-doctor">Re-run checks</button>
         </div>

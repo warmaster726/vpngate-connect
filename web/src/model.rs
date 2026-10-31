@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const APP_VERSION: &str = "0.3.4";
+pub const APP_VERSION: &str = "0.3.5";
 pub const POOL_CACHE_TTL_MS: u64 = 180_000;
 pub const POOL_CACHE_KEY_URL: &str = "https://vpngate-edge-cache.internal/v1/pool-snapshot";
 pub const VERIFY_MEM_CACHE_URL: &str = "https://vpngate-edge-cache.internal/v1/verify-memory";
@@ -16,10 +16,8 @@ pub const OFFICIAL_CSV_URLS: &[&str] = &[
     "https://www.vpngate.net/api/iphone/",
     "http://www.vpngate.net/api/iphone/",
 ];
-pub const OFFICIAL_HTML_URLS: &[&str] = &[
-    "https://www.vpngate.net/en/",
-    "http://www.vpngate.net/en/",
-];
+pub const OFFICIAL_HTML_URLS: &[&str] =
+    &["https://www.vpngate.net/en/", "http://www.vpngate.net/en/"];
 pub const OFFICIAL_MIRROR_SITES_URLS: &[&str] = &[
     "https://www.vpngate.net/en/sites.aspx",
     "http://www.vpngate.net/en/sites.aspx",

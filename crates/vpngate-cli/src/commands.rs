@@ -1,33 +1,33 @@
 use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::fs;
-use std::io::{self, IsTerminal};
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
+use std::io::{self, IsTerminal, Read};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 #[cfg(windows)]
-use std::path::Path;
-use std::path::PathBuf;
+use std::os::windows::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use vpngate_core::{
     ActiveSessionState, AppPaths, ConnectSessionConfig, CountrySummary, DiscoveryClient,
-    DiscoveryOptions, INTERRUPTED_EXIT, Ikev1StateInfo, MONITOR_INTERVAL_SECONDS, NM_PROFILE_PREFIX,
-    OfficialMirrorSite, ProgressEvent, ProtocolFilter, ServerCacheFile, SortBy, VpnServer,
-    cleanup_existing_vpn_with_progress, detect_host_os_label, engage_candidates_with_progress,
-    filter_by_country, filter_by_protocol, find_openvpn_bin, get_default_gateway,
-    get_ppp_interfaces, get_public_ip_trace, get_running_monitor_pid, get_running_openvpn_pid,
-    get_servers_cached_with_progress, get_tun_interfaces, is_root_or_admin, load_cached_mirrors,
-    load_cooldowns, load_watchdog_pref, normalize_mirror_base_url, now_unix_secs, probe_tcp,
-    prune_stale_state_if_dead, query_windows_natt_rule, read_json_opt, run_ikev1_crypto_self_test,
-    save_cached_mirrors, save_cooldowns, save_watchdog_pref, sort_servers,
-    cached_newer_than_installed, default_repo_slug, fetch_public_url_text, installer_script_urls,
-    installed_desktop_version, load_update_cache, record_update_declined, refresh_update_cache,
-    PRODUCT_VERSION,
-    resolve_user_home, should_auto_prompt, spawn_auto_reconnect_monitor,
-    stop_monitor_daemon, summarize_countries, verify_l2tp_psk_vpn, which_bin,
+    DiscoveryOptions, INTERRUPTED_EXIT, Ikev1StateInfo, MONITOR_INTERVAL_SECONDS,
+    NM_PROFILE_PREFIX, OfficialMirrorSite, PRODUCT_VERSION, ProgressEvent, ProtocolFilter,
+    ServerCacheFile, SortBy, VpnServer, bundled_mirror_seeds, cached_newer_than_installed,
+    cleanup_existing_vpn_with_progress, default_repo_slug, detect_host_os_label,
+    engage_candidates_with_progress, fetch_public_url_text, filter_by_country, filter_by_protocol,
+    find_openvpn_bin, format_mirror_seed, get_default_gateway, get_ppp_interfaces,
+    get_public_ip_trace, get_running_monitor_pid, get_running_openvpn_pid,
+    get_servers_cached_with_progress, get_tun_interfaces, installed_desktop_version,
+    installer_script_urls, is_root_or_admin, load_cached_mirrors, load_cooldowns,
+    load_update_cache, load_user_mirror_seed, load_watchdog_pref, normalize_mirror_base_url,
+    now_unix_secs, parse_mirror_seed_text, probe_tcp, prune_stale_state_if_dead,
+    query_windows_natt_rule, read_json_opt, record_update_declined, refresh_update_cache,
+    resolve_user_home, run_ikev1_crypto_self_test, save_cached_mirrors, save_cooldowns,
+    save_user_mirror_seed, save_watchdog_pref, should_auto_prompt, sort_servers,
+    spawn_auto_reconnect_monitor, stop_monitor_daemon, summarize_countries, verify_l2tp_psk_vpn,
+    which_bin,
 };
 
 use crate::term_ui::{
@@ -283,10 +283,8 @@ pub fn elevate_self(paths: &AppPaths, sub_args: &[String]) -> i32 {
     #[cfg(windows)]
     {
         if uac_already_attempted() {
-            err(
-                "Administrator token was not granted after UAC elevation. \
-                 Right-click PowerShell or Windows Terminal -> 'Run as Administrator' and retry.",
-            );
+            err("Administrator token was not granted after UAC elevation. \
+                 Right-click PowerShell or Windows Terminal -> 'Run as Administrator' and retry.");
             return 1;
         }
         let mut full_args = vec![
@@ -805,7 +803,9 @@ pub async fn cmd_disconnect(paths: &AppPaths) -> io::Result<i32> {
         }
         let rc = elevate_self(paths, &sub);
         if cfg!(windows) && rc == 0 {
-            ok("Disconnected from VPN Gate, removed L2TP/OpenVPN profiles, and restored routes, DNS, and firewall.");
+            ok(
+                "Disconnected from VPN Gate, removed L2TP/OpenVPN profiles, and restored routes, DNS, and firewall.",
+            );
             if let Some(trace) = trace_public_ip_with_spinner(
                 "Verifying restored host public egress IP",
                 Duration::from_secs(5),
@@ -821,7 +821,9 @@ pub async fn cmd_disconnect(paths: &AppPaths) -> io::Result<i32> {
     clear_screen_if_tty();
     info("Tearing down active VPN tunnel and removing VPN Gate L2TP/OpenVPN profile residue ...");
     cleanup_existing_vpn_with_progress(paths, true, true, false, render_progress_event);
-    ok("Disconnected from VPN Gate, removed L2TP/OpenVPN profiles, and restored routes, DNS, and firewall.");
+    ok(
+        "Disconnected from VPN Gate, removed L2TP/OpenVPN profiles, and restored routes, DNS, and firewall.",
+    );
     if let Some(trace) = trace_public_ip_with_spinner(
         "Verifying restored host public egress IP",
         Duration::from_secs(5),
@@ -888,15 +890,68 @@ pub async fn cmd_refresh(paths: &AppPaths, custom_mirrors: &[String]) -> io::Res
     Ok(0)
 }
 
-pub async fn cmd_mirrors(paths: &AppPaths, custom_mirrors: &[String]) -> io::Result<i32> {
-    clear_screen_if_tty();
-    let _ = paths.ensure_dirs();
-    let mut seeds = parse_custom_mirrors(custom_mirrors);
-    for m in load_cached_mirrors(paths) {
-        if !seeds.iter().any(|x| x.base_url == m.base_url) {
-            seeds.push(m);
+fn read_seed_source(path: &str) -> io::Result<String> {
+    if path == "-" {
+        let mut text = String::new();
+        io::stdin().read_to_string(&mut text)?;
+        Ok(text)
+    } else {
+        fs::read_to_string(path)
+    }
+}
+
+fn merge_mirror_seed(dst: &mut Vec<OfficialMirrorSite>, extra: Vec<OfficialMirrorSite>) {
+    for m in extra {
+        if !dst.iter().any(|x| x.base_url == m.base_url) {
+            dst.push(m);
         }
     }
+}
+
+pub async fn cmd_mirrors(
+    paths: &AppPaths,
+    custom_mirrors: &[String],
+    export_seed: bool,
+    import_path: Option<&str>,
+) -> io::Result<i32> {
+    if !export_seed {
+        clear_screen_if_tty();
+    }
+    let _ = paths.ensure_dirs();
+    let mut seeds = parse_custom_mirrors(custom_mirrors);
+    if let Some(path) = import_path {
+        match read_seed_source(path) {
+            Ok(text) => {
+                let imported = parse_mirror_seed_text(&text);
+                if imported.is_empty() {
+                    err("Seed contained no usable Official Mirror URLs.");
+                    return Ok(1);
+                }
+                info(&format!(
+                    "Imported {} Official Mirror URL(s) from {path}.",
+                    imported.len()
+                ));
+                merge_mirror_seed(&mut seeds, imported);
+                save_user_mirror_seed(paths, &seeds);
+            }
+            Err(e) => {
+                err(&format!("Failed to read mirror seed '{path}': {e}"));
+                return Ok(1);
+            }
+        }
+    }
+    merge_mirror_seed(&mut seeds, load_user_mirror_seed(paths));
+    merge_mirror_seed(&mut seeds, load_cached_mirrors(paths));
+    if export_seed {
+        let dump = if seeds.is_empty() {
+            format_mirror_seed(&bundled_mirror_seeds())
+        } else {
+            format_mirror_seed(&seeds)
+        };
+        print_line(&dump);
+        return Ok(0);
+    }
+    merge_mirror_seed(&mut seeds, bundled_mirror_seeds());
 
     let opts = DiscoveryOptions {
         seed_mirrors: seeds,
@@ -919,6 +974,7 @@ pub async fn cmd_mirrors(paths: &AppPaths, custom_mirrors: &[String]) -> io::Res
 
     let all_mirrors: Vec<OfficialMirrorSite> = results.iter().map(|r| r.mirror.clone()).collect();
     save_cached_mirrors(paths, &all_mirrors);
+    save_user_mirror_seed(paths, &all_mirrors);
 
     let headers = [
         "#",
@@ -1691,7 +1747,10 @@ fn cargo_install_shadow_binary() -> PathBuf {
             .join("bin")
             .join("vpngate.exe")
     } else {
-        resolve_user_home().join(".cargo").join("bin").join("vpngate")
+        resolve_user_home()
+            .join(".cargo")
+            .join("bin")
+            .join("vpngate")
     }
 }
 
@@ -1780,7 +1839,9 @@ async fn run_desktop_installer(paths: &AppPaths) -> io::Result<i32> {
     #[cfg(windows)]
     {
         remove_shadow_desktop_binaries();
-        info("Launching the Windows installer in a new window, then closing this process so vpngate.exe is not locked ...");
+        info(
+            "Launching the Windows installer in a new window, then closing this process so vpngate.exe is not locked ...",
+        );
         spawn_windows_upgrade_installer(&script)?;
         ok("The installer will replace this copy and remove the previous vpngate.exe.");
         ok("After it finishes, start VPN Gate again from the Start Menu or `vpngate`.");
@@ -1789,7 +1850,9 @@ async fn run_desktop_installer(paths: &AppPaths) -> io::Result<i32> {
 
     #[cfg(not(windows))]
     {
-        info("Running the installer (it deletes /usr/local/bin/vpngate, then installs the new build) ...");
+        info(
+            "Running the installer (it deletes /usr/local/bin/vpngate, then installs the new build) ...",
+        );
         let status = Command::new("sh")
             .arg(&script)
             .stdin(Stdio::inherit())
@@ -1798,7 +1861,9 @@ async fn run_desktop_installer(paths: &AppPaths) -> io::Result<i32> {
             .status()?;
         let rc = status.code().unwrap_or(1);
         if rc != 0 {
-            err("Installer did not finish successfully. The previous desktop binary was left in place.");
+            err(
+                "Installer did not finish successfully. The previous desktop binary was left in place.",
+            );
             return Ok(rc);
         }
         remove_shadow_desktop_binaries();
@@ -1830,7 +1895,9 @@ fn desktop_update_status_line(paths: &AppPaths) -> String {
     let local = installed_desktop_version();
     match load_update_cache(paths) {
         Some(cache) if !cache.last_error.is_empty() && cache.remote_version.is_empty() => {
-            format!("Update   : {YELLOW}CHECK FAILED{RESET} — run `{BOLD}vpngate update{RESET}` (anonymous HTTPS, no GitHub login)")
+            format!(
+                "Update   : {YELLOW}CHECK FAILED{RESET} — run `{BOLD}vpngate update{RESET}` (anonymous HTTPS, no GitHub login)"
+            )
         }
         Some(cache) => {
             if let Some(remote) = vpngate_core::DesktopVersion::parse(&cache.remote_version) {
@@ -1840,7 +1907,10 @@ fn desktop_update_status_line(paths: &AppPaths) -> String {
                         cache.remote_version
                     )
                 } else if remote < local {
-                    format!("Update   : {CYAN}{local}{RESET} — newer than public main ({})", cache.remote_version)
+                    format!(
+                        "Update   : {CYAN}{local}{RESET} — newer than public main ({})",
+                        cache.remote_version
+                    )
                 } else {
                     format!("Update   : {GREEN}up to date{RESET} — public main is {local}")
                 }
@@ -2243,12 +2313,24 @@ pub async fn interactive_menu(paths: &AppPaths, help_text: &str) -> io::Result<i
                 let _ = prompt_input("\nPress Enter to return to Dashboard...");
             }
             "8" => {
-                let _ = cmd_mirrors(paths, &[]).await?;
+                let _ = cmd_mirrors(paths, &[], false, None).await?;
                 if let Some(ans) = prompt_input(&format!(
-                    "Enter a custom Mirror URL (e.g. {CYAN}http://host:port/en/{RESET}) to add & probe, or {BOLD}Enter{RESET} for Dashboard: "
+                    "Paste a Mirror URL, a seed file path, or {BOLD}Enter{RESET} for Dashboard (Tsukuba mail: {CYAN}https://www.vpngate.net/en/mail.aspx{RESET}): "
                 )) && !ans.is_empty()
                 {
-                    let _ = cmd_mirrors(paths, &[ans]).await?;
+                    if Path::new(&ans).is_file() {
+                        let _ = cmd_mirrors(paths, &[], false, Some(ans.as_str())).await?;
+                    } else {
+                        let urls: Vec<String> = parse_mirror_seed_text(&ans)
+                            .into_iter()
+                            .map(|m| m.portal_url)
+                            .collect();
+                        if urls.is_empty() {
+                            let _ = cmd_mirrors(paths, &[ans], false, None).await?;
+                        } else {
+                            let _ = cmd_mirrors(paths, &urls, false, None).await?;
+                        }
+                    }
                     let _ = prompt_input("\nPress Enter to return to Dashboard...");
                 }
             }

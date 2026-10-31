@@ -1,6 +1,7 @@
 //! Isolated Cloudflare Worker — VPN Gate Connect profile console.
 //! Browser UI is HTML/CSS/JS; edge logic is Rust (`workers-rs`).
 
+mod bootstrap;
 mod country;
 mod model;
 mod parse;
@@ -27,19 +28,22 @@ async fn main(req: Request, _env: Env, ctx: Context) -> Result<Response> {
 #[cfg(target_arch = "wasm32")]
 mod edge {
     use super::*;
-    use crate::discover::{fetch_text, get_pool_snapshot, probe_mirrors};
-    use crate::model::{
-        Server, APP_VERSION, HANDSHAKE_TIMEOUT_MS,
+    use crate::bootstrap::{
+        format_mirror_seed, is_safe_dns_name, is_safe_git_ref, servers_to_vpngate_csv,
+        DESKTOP_VERSION, INSTALL_PS1, INSTALL_SH, REPO_SLUG,
     };
+    use crate::discover::{fetch_text, get_pool_snapshot, probe_mirrors};
+    use crate::model::{Server, APP_VERSION, HANDSHAKE_TIMEOUT_MS, USER_AGENT};
     use crate::parse::valid_public_ipv4;
     use crate::portal::{render_portal_html, ICON_SVG};
     use crate::profile::{
-        build_apple_l2tp_mobileconfig, build_patched_ovpn, patch_ovpn_text, sanitize_dns_list, OvpnOpts,
+        build_apple_l2tp_mobileconfig, build_patched_ovpn, patch_ovpn_text, sanitize_dns_list,
+        OvpnOpts,
     };
     use crate::timeutil::now_ms;
     use crate::verify::{
-        assert_verified_for_profile, decorate_servers, ensure_verify_memory, probe_openvpn_handshake,
-        recursive_verify_relays, remember_probe,
+        assert_verified_for_profile, decorate_servers, ensure_verify_memory,
+        probe_openvpn_handshake, recursive_verify_relays, remember_probe,
     };
     use serde_json::{json, Value};
 
@@ -49,7 +53,9 @@ mod edge {
         headers.set("X-Content-Type-Options", "nosniff")?;
         headers.set("Referrer-Policy", "no-referrer")?;
         headers.set("Cache-Control", "no-store")?;
-        Ok(Response::from_json(payload)?.with_status(status).with_headers(headers))
+        Ok(Response::from_json(payload)?
+            .with_status(status)
+            .with_headers(headers))
     }
 
     fn param(url: &Url, key: &str) -> String {
@@ -57,6 +63,66 @@ mod edge {
             .find(|(k, _)| k == key)
             .map(|(_, v)| v.into_owned())
             .unwrap_or_default()
+    }
+
+    fn text_response(body: &str, content_type: &str, cache: &str) -> Result<Response> {
+        let mut headers = Headers::new();
+        headers.set("Content-Type", content_type)?;
+        headers.set("X-Content-Type-Options", "nosniff")?;
+        headers.set("Cache-Control", cache)?;
+        Ok(Response::ok(body)?.with_headers(headers))
+    }
+
+    async fn fetch_bytes(url: &str, extra: &[(&str, &str)]) -> Option<(u16, Vec<u8>)> {
+        let mut headers = Headers::new();
+        let _ = headers.set("User-Agent", USER_AGENT);
+        for (k, v) in extra {
+            let _ = headers.set(*k, *v);
+        }
+        let mut init = RequestInit::new();
+        init.method = Method::Get;
+        init.headers = headers;
+        let req = Request::new_with_init(url, &init).ok()?;
+        let mut resp = Fetch::Request(req).send().await.ok()?;
+        let status = resp.status_code();
+        let bytes = resp.bytes().await.ok()?;
+        Some((status, bytes))
+    }
+
+    async fn proxy_github_archive(kind: &str, branch: &str) -> Result<Response> {
+        let (url, ctype, fname) = if kind == "zip" {
+            (
+                format!("https://codeload.github.com/{REPO_SLUG}/zip/refs/heads/{branch}"),
+                "application/zip",
+                "vpngate-connect.zip",
+            )
+        } else {
+            (
+                format!("https://codeload.github.com/{REPO_SLUG}/tar.gz/refs/heads/{branch}"),
+                "application/gzip",
+                "vpngate-connect.tar.gz",
+            )
+        };
+        let Some((status, bytes)) = fetch_bytes(&url, &[]).await else {
+            return json_response(
+                &json!({"ok": false, "error": "Upstream source archive unreachable."}),
+                502,
+            );
+        };
+        if !(200..300).contains(&status) || bytes.len() < 64 {
+            return json_response(
+                &json!({"ok": false, "error": "Upstream source archive unavailable.", "status": status}),
+                502,
+            );
+        }
+        let mut headers = Headers::new();
+        headers.set("Content-Type", ctype)?;
+        headers.set(
+            "Content-Disposition",
+            &format!("attachment; filename=\"{fname}\""),
+        )?;
+        headers.set("Cache-Control", "public, max-age=300")?;
+        Ok(Response::from_bytes(bytes)?.with_headers(headers))
     }
 
     pub async fn handle(req: Request, ctx: Context) -> Result<Response> {
@@ -68,6 +134,126 @@ mod edge {
             _ => {
                 return json_response(&json!({"ok": false, "error": "Method Not Allowed"}), 405);
             }
+        }
+
+        if path == "/install.sh" || path == "/install-vpngate.sh" {
+            return text_response(
+                INSTALL_SH,
+                "text/x-shellscript; charset=utf-8",
+                "public, max-age=300",
+            );
+        }
+        if path == "/install.ps1" || path == "/install-vpngate.ps1" {
+            return text_response(
+                INSTALL_PS1,
+                "text/plain; charset=utf-8",
+                "public, max-age=300",
+            );
+        }
+        if path == "/desktop-version.txt" {
+            return text_response(
+                DESKTOP_VERSION.trim(),
+                "text/plain; charset=utf-8",
+                "public, max-age=60",
+            );
+        }
+        if path == "/edge.json" {
+            let origin = format!("{}://{}", url.scheme(), url.host_str().unwrap_or(""));
+            return json_response(
+                &json!({
+                    "ok": true,
+                    "version": APP_VERSION,
+                    "desktop_version": DESKTOP_VERSION.trim(),
+                    "origin": origin,
+                    "workers_dev_only": true,
+                    "endpoints": {
+                        "install_sh": "/install.sh",
+                        "install_ps1": "/install.ps1",
+                        "desktop_version": "/desktop-version.txt",
+                        "api_servers": "/api/servers",
+                        "api_csv": "/api.csv",
+                        "dns_query": "/dns-query",
+                        "src_tar": "/src.tar.gz",
+                        "src_zip": "/src.zip",
+                        "seed": "/seed.txt"
+                    },
+                    "binaries": {
+                        "hosted": false,
+                        "reason": "Cloudflare Workers script limits are about 1 MB (free) / 10 MB (paid). Desktop tarballs exceed that, so this Worker proxies source (/src.tar.gz) and install scripts instead of prebuilt binaries."
+                    }
+                }),
+                200,
+            );
+        }
+        if path == "/artifact" || path == "/artifact/" || path.starts_with("/artifact/") {
+            return json_response(
+                &json!({
+                    "ok": false,
+                    "error": "Desktop binaries are not hosted on Cloudflare Workers (size limit ~1 MB free / ~10 MB paid).",
+                    "use": ["/install.sh", "/src.tar.gz"]
+                }),
+                404,
+            );
+        }
+        if path == "/src.tar.gz" || path == "/src.zip" {
+            let branch_raw = param(&url, "branch");
+            let branch = if branch_raw.is_empty() {
+                "main"
+            } else if is_safe_git_ref(&branch_raw) {
+                branch_raw.as_str()
+            } else {
+                return json_response(&json!({"ok": false, "error": "Invalid branch."}), 400);
+            };
+            let kind = if path.ends_with(".zip") { "zip" } else { "tar" };
+            return proxy_github_archive(kind, branch).await;
+        }
+        if path == "/dns-query" {
+            let name = param(&url, "name");
+            if !is_safe_dns_name(&name) {
+                return json_response(
+                    &json!({"ok": false, "error": "Valid DNS 'name' is required."}),
+                    400,
+                );
+            }
+            let qtype_raw = param(&url, "type");
+            let qtype = if qtype_raw.is_empty() {
+                "A"
+            } else {
+                qtype_raw.as_str()
+            };
+            if !qtype.chars().all(|c| c.is_ascii_alphanumeric()) || qtype.len() > 8 {
+                return json_response(&json!({"ok": false, "error": "Invalid DNS type."}), 400);
+            }
+            let upstream = format!("https://cloudflare-dns.com/dns-query?name={name}&type={qtype}");
+            let Some((status, bytes)) =
+                fetch_bytes(&upstream, &[("Accept", "application/dns-json")]).await
+            else {
+                return json_response(
+                    &json!({"ok": false, "error": "DoH upstream unreachable."}),
+                    502,
+                );
+            };
+            if !(200..300).contains(&status) {
+                return json_response(
+                    &json!({"ok": false, "error": "DoH upstream failed.", "status": status}),
+                    502,
+                );
+            }
+            let body = String::from_utf8_lossy(&bytes).into_owned();
+            let mut headers = Headers::new();
+            headers.set("Content-Type", "application/dns-json")?;
+            headers.set("Cache-Control", "no-store")?;
+            return Ok(Response::ok(body)?.with_headers(headers));
+        }
+        if path == "/seed.txt" || path == "/mirrors.txt" {
+            let snap = get_pool_snapshot(&ctx, false, "").await;
+            let body = format_mirror_seed(&snap.public_payload.mirrors);
+            return text_response(&body, "text/plain; charset=utf-8", "no-store");
+        }
+        if path == "/api.csv" || path == "/api/iphone" || path == "/api/iphone/" {
+            let snap = get_pool_snapshot(&ctx, false, "").await;
+            let csv = servers_to_vpngate_csv(&snap.public_payload.servers, &snap.ovpn_by_ip);
+            return text_response(&csv, "text/csv; charset=utf-8", "no-store");
         }
 
         if path == "/manifest.webmanifest" {
@@ -128,7 +314,8 @@ mod edge {
             return Ok(Response::ok(xml)?.with_headers(headers));
         }
 
-        if (path.starts_with("/profiles/") && path.ends_with(".ovpn")) || path == "/api/profile/ovpn"
+        if (path.starts_with("/profiles/") && path.ends_with(".ovpn"))
+            || path == "/api/profile/ovpn"
         {
             let ip = match valid_public_ipv4(&param(&url, "ip")) {
                 Some(ip) => ip,
@@ -258,10 +445,18 @@ mod edge {
             let servers = decorate_servers(&snap.public_payload.servers);
             let ip = valid_public_ipv4(&param(&url, "ip")).unwrap_or_default();
             let proto = param(&url, "proto").to_ascii_lowercase();
-            let proto = if proto.is_empty() { "auto".into() } else { proto };
+            let proto = if proto.is_empty() {
+                "auto".into()
+            } else {
+                proto
+            };
             let country = {
                 let c = param(&url, "country");
-                if c.is_empty() { "ALL".into() } else { c }
+                if c.is_empty() {
+                    "ALL".into()
+                } else {
+                    c
+                }
             };
             let sort_raw = param(&url, "sort").to_ascii_lowercase();
             let sort = match sort_raw.as_str() {
@@ -377,7 +572,12 @@ mod edge {
                 cf.tls_version(),
             )
         } else {
-            ("LOCAL".into(), "XX".into(), "HTTP/2".into(), "TLSv1.3".into())
+            (
+                "LOCAL".into(),
+                "XX".into(),
+                "HTTP/2".into(),
+                "TLSv1.3".into(),
+            )
         };
         checks.push(json!({
             "name": "Visitor Egress & Cloudflare PoP",
@@ -386,14 +586,16 @@ mod edge {
         }));
 
         let doh_start = now_ms();
-        match fetch_text(
+        let doh_upstreams = [
             "https://cloudflare-dns.com/dns-query?name=www.vpngate.net&type=A",
-            3000,
-            &[("Accept", "application/dns-json")],
-        )
-        .await
-        {
-            Some(text) => {
+            "https://dns.google/resolve?name=www.vpngate.net&type=A",
+            "https://dns.quad9.net/dns-query?name=www.vpngate.net&type=A",
+        ];
+        let mut doh_hit: Option<(String, Vec<String>)> = None;
+        for upstream in doh_upstreams {
+            if let Some(text) =
+                fetch_text(upstream, 2500, &[("Accept", "application/dns-json")]).await
+            {
                 let parsed: Value = serde_json::from_str(&text).unwrap_or(json!({}));
                 let ips: Vec<String> = parsed
                     .get("Answer")
@@ -406,29 +608,36 @@ mod edge {
                             .collect()
                     })
                     .unwrap_or_default();
-                if ips.is_empty() {
-                    checks.push(json!({
-                        "name": "Cloudflare DoH (1.1.1.1) Unpoisoned DNS",
-                        "status": "WARN",
-                        "detail": "DoH responded without unpoisoned IPv4 A records",
-                    }));
-                } else {
-                    checks.push(json!({
-                        "name": "Cloudflare DoH (1.1.1.1) Unpoisoned DNS",
-                        "status": "READY",
-                        "detail": format!(
-                            "Resolved www.vpngate.net → {} ({} ms, bogon-verified)",
-                            ips.join(", "),
-                            now_ms().saturating_sub(doh_start)
-                        ),
-                    }));
+                if !ips.is_empty() {
+                    let label = if upstream.contains("dns.google") {
+                        "Google 8.8.8.8"
+                    } else if upstream.contains("quad9") {
+                        "Quad9 9.9.9.9"
+                    } else {
+                        "Cloudflare 1.1.1.1"
+                    };
+                    doh_hit = Some((label.to_string(), ips));
+                    break;
                 }
+            }
+        }
+        match doh_hit {
+            Some((label, ips)) => {
+                checks.push(json!({
+                    "name": "DoH mesh (1.1.1.1 / 8.8.8.8 / 9.9.9.9)",
+                    "status": "READY",
+                    "detail": format!(
+                        "{label} resolved www.vpngate.net → {} ({} ms, bogon-verified)",
+                        ips.join(", "),
+                        now_ms().saturating_sub(doh_start)
+                    ),
+                }));
             }
             None => {
                 checks.push(json!({
-                    "name": "Cloudflare DoH (1.1.1.1) Unpoisoned DNS",
+                    "name": "DoH mesh (1.1.1.1 / 8.8.8.8 / 9.9.9.9)",
                     "status": "WARN",
-                    "detail": "DoH query timed out",
+                    "detail": "No DoH upstream returned unpoisoned IPv4 A records",
                 }));
             }
         }
@@ -445,9 +654,12 @@ mod edge {
         }));
 
         if let Some(tcp_candidate) = snap.public_payload.servers.iter().find(|s| s.tcp_port > 0) {
-            let p_res =
-                probe_openvpn_handshake(&tcp_candidate.ip, tcp_candidate.tcp_port, HANDSHAKE_TIMEOUT_MS)
-                    .await;
+            let p_res = probe_openvpn_handshake(
+                &tcp_candidate.ip,
+                tcp_candidate.tcp_port,
+                HANDSHAKE_TIMEOUT_MS,
+            )
+            .await;
             checks.push(json!({
                 "name": "Live OpenVPN TCP Handshake",
                 "status": if p_res.tcp_handshake { "READY" } else { "WARN" },

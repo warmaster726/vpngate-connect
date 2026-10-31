@@ -11,7 +11,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::cache::{AppPaths, atomic_write_json, now_unix_secs, read_json_opt};
-use crate::doh::resolve_ipv4_via_cloudflare_doh;
+use crate::doh::resolve_ipv4_via_doh;
+use crate::edge::{edge_path_urls, is_edge_url};
 
 /// Skip auto-prompt for this long after the user declines a given remote version.
 pub const UPDATE_DECLINE_SNOOZE_SECS: u64 = 24 * 3600;
@@ -22,9 +23,9 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(12);
 const GITHUB_CHECK_TIMEOUT: Duration = Duration::from_secs(12);
 const CDN_CHECK_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// Public desktop label. Cargo crate version stays SemVer (`0.3.4`); a trailing
-/// letter (`0.3.4a`) is a revision *after* that patch, used for update prompts.
-pub const PRODUCT_VERSION: &str = "0.3.4a";
+/// Public desktop label. Cargo crate version stays SemVer (`0.3.5`); a trailing
+/// letter (`0.3.5a`) would be a revision *after* that patch, used for update prompts.
+pub const PRODUCT_VERSION: &str = "0.3.5";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DesktopVersion {
@@ -165,12 +166,11 @@ pub fn cargo_toml_check_urls(slug: &str) -> Vec<String> {
 
 pub fn is_github_version_url(url: &str) -> bool {
     let u = url.to_ascii_lowercase();
-    u.contains("raw.githubusercontent.com/")
-        || (u.contains("github.com/") && u.contains("/raw/"))
+    u.contains("raw.githubusercontent.com/") || (u.contains("github.com/") && u.contains("/raw/"))
 }
 
 /// Anonymous HTTPS endpoints only (no GitHub API, no tokens, no 2FA).
-/// GitHub raw is authoritative; jsDelivr/Fastly are fallbacks when GitHub is unreachable.
+/// GitHub raw is authoritative; the Cloudflare Worker then jsDelivr/Fastly are fallbacks.
 pub fn version_check_urls(slug: &str) -> Vec<String> {
     let mut urls = Vec::new();
     for file in ["assets/desktop-version.txt", "Cargo.toml"] {
@@ -180,29 +180,63 @@ pub fn version_check_urls(slug: &str) -> Vec<String> {
         urls.push(format!(
             "https://raw.githubusercontent.com/{slug}/refs/heads/main/{file}"
         ));
-        urls.push(format!(
-            "https://github.com/{slug}/raw/main/{file}"
-        ));
+        urls.push(format!("https://github.com/{slug}/raw/main/{file}"));
+    }
+    urls.extend(edge_path_urls("/desktop-version.txt"));
+    for file in ["assets/desktop-version.txt", "Cargo.toml"] {
         urls.push(format!("https://cdn.jsdelivr.net/gh/{slug}@main/{file}"));
-        urls.push(format!(
-            "https://fastly.jsdelivr.net/gh/{slug}@main/{file}"
-        ));
+        urls.push(format!("https://fastly.jsdelivr.net/gh/{slug}@main/{file}"));
     }
     urls
 }
 
-pub fn installer_script_urls(slug: &str) -> Vec<String> {
-    if cfg!(windows) {
-        vec![
-            format!("https://raw.githubusercontent.com/{slug}/main/install-vpngate.ps1"),
-            format!("https://cdn.jsdelivr.net/gh/{slug}@main/install-vpngate.ps1"),
-        ]
-    } else {
-        vec![
-            format!("https://raw.githubusercontent.com/{slug}/main/install-vpngate.sh"),
-            format!("https://cdn.jsdelivr.net/gh/{slug}@main/install-vpngate.sh"),
-        ]
+fn push_unique(urls: &mut Vec<String>, url: String) {
+    if !urls.iter().any(|u| u == &url) {
+        urls.push(url);
     }
+}
+
+/// Worker-first, then jsDelivr, then GitHub raw (installer fetch when GitHub is blocked).
+pub fn installer_script_urls(slug: &str) -> Vec<String> {
+    let mut urls = Vec::new();
+    if cfg!(windows) {
+        for path in ["/install.ps1", "/install-vpngate.ps1"] {
+            for u in edge_path_urls(path) {
+                push_unique(&mut urls, u);
+            }
+        }
+        push_unique(
+            &mut urls,
+            format!("https://cdn.jsdelivr.net/gh/{slug}@main/install-vpngate.ps1"),
+        );
+        push_unique(
+            &mut urls,
+            format!("https://fastly.jsdelivr.net/gh/{slug}@main/install-vpngate.ps1"),
+        );
+        push_unique(
+            &mut urls,
+            format!("https://raw.githubusercontent.com/{slug}/main/install-vpngate.ps1"),
+        );
+    } else {
+        for path in ["/install.sh", "/install-vpngate.sh"] {
+            for u in edge_path_urls(path) {
+                push_unique(&mut urls, u);
+            }
+        }
+        push_unique(
+            &mut urls,
+            format!("https://cdn.jsdelivr.net/gh/{slug}@main/install-vpngate.sh"),
+        );
+        push_unique(
+            &mut urls,
+            format!("https://fastly.jsdelivr.net/gh/{slug}@main/install-vpngate.sh"),
+        );
+        push_unique(
+            &mut urls,
+            format!("https://raw.githubusercontent.com/{slug}/main/install-vpngate.sh"),
+        );
+    }
+    urls
 }
 
 /// Parse a tiny `desktop-version.txt` (`0.2.20`) or `[workspace.package] version`.
@@ -313,7 +347,7 @@ async fn fetch_public_text(url: &str) -> Option<String> {
         return None;
     }
     let port = parsed.port_or_known_default()?;
-    let ips = resolve_ipv4_via_cloudflare_doh(&host, Duration::from_secs(4))
+    let ips = resolve_ipv4_via_doh(&host, Duration::from_secs(4))
         .await
         .ok()?;
     let ua = user_agents()[0].clone();
@@ -358,10 +392,7 @@ pub fn pick_highest_version(hits: &[(String, String)]) -> Option<RemoteDesktopVe
     best
 }
 
-async fn first_parsed_version(
-    urls: &[String],
-    timeout: Duration,
-) -> Option<RemoteDesktopVersion> {
+async fn first_parsed_version(urls: &[String], timeout: Duration) -> Option<RemoteDesktopVersion> {
     let mut set = tokio::task::JoinSet::new();
     for url in urls.iter().cloned() {
         set.spawn(async move {
@@ -429,10 +460,15 @@ pub async fn check_remote_desktop_version() -> Result<RemoteDesktopVersion, Stri
         .cloned()
         .filter(|u| is_github_version_url(u))
         .collect();
+    let edge: Vec<String> = urls
+        .iter()
+        .cloned()
+        .filter(|u| is_edge_url(u) && !is_github_version_url(u))
+        .collect();
     let cdn: Vec<String> = urls
         .iter()
         .cloned()
-        .filter(|u| !is_github_version_url(u))
+        .filter(|u| !is_github_version_url(u) && !is_edge_url(u))
         .collect();
 
     // GitHub raw is the source of truth for public main. Do not let a stale
@@ -440,9 +476,12 @@ pub async fn check_remote_desktop_version() -> Result<RemoteDesktopVersion, Stri
     if let Some(remote) = first_parsed_version(&github, GITHUB_CHECK_TIMEOUT).await {
         return Ok(remote);
     }
+    if let Some(remote) = first_parsed_version(&edge, CDN_CHECK_TIMEOUT).await {
+        return Ok(remote);
+    }
     let hits = collect_public_versions(&cdn, CDN_CHECK_TIMEOUT).await;
     pick_highest_version(&hits).ok_or_else(|| {
-        "Could not read the public desktop version (raw.githubusercontent.com / jsDelivr). No GitHub login is used."
+        "Could not read the public desktop version (GitHub raw / Cloudflare Worker / jsDelivr). No GitHub login is used."
             .to_string()
     })
 }
@@ -572,10 +611,7 @@ mod tests {
         assert!(a < next);
         assert_eq!(a.to_string(), "0.3.4a");
         assert_eq!(plain.to_string(), "0.3.4");
-        assert_eq!(
-            parse_version_payload("0.3.4a\n").as_deref(),
-            Some("0.3.4a")
-        );
+        assert_eq!(parse_version_payload("0.3.4a\n").as_deref(), Some("0.3.4a"));
     }
 
     #[test]
@@ -615,10 +651,7 @@ edition = "2024"
             parse_workspace_package_version(toml).as_deref(),
             Some("0.2.18")
         );
-        assert_eq!(
-            parse_version_payload("0.2.20\n").as_deref(),
-            Some("0.2.20")
-        );
+        assert_eq!(parse_version_payload("0.2.20\n").as_deref(), Some("0.2.20"));
         assert!(parse_version_payload("<html>404</html>").is_none());
         assert!(parse_version_payload("<!DOCTYPE html>").is_none());
     }

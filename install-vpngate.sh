@@ -19,6 +19,8 @@ SKIP_DEPS=0
 KEEP_TOOLCHAIN=0
 TOOLCHAIN_POLICY=""
 REPO_SLUG="${VPNGATE_REPO:-warmaster726/vpngate-connect}"
+EDGE_BASE="${VPNGATE_EDGE:-}"
+EDGE_BASE="${EDGE_BASE%/}"
 HOST_UNAME="$(uname -s 2>/dev/null || echo Linux)"
 HOST_MACHINE="$(uname -m 2>/dev/null || echo unknown)"
 HOST_ARCH=""
@@ -95,6 +97,22 @@ done
 info() { echo "[*] $*"; }
 ok()   { echo "[+] $*"; }
 warn() { echo "[!] $*"; }
+
+# Try URLs in order. First non-empty 200 body wins (GitHub-bypass: Worker, then GitHub).
+vg_fetch() {
+  dest=$1
+  shift
+  for url in "$@"; do
+    [ -n "${url}" ] || continue
+    info "Trying ${url} ..."
+    if curl -fsSL --connect-timeout 12 --max-time 120 "${url}" -o "${dest}" </dev/null \
+      && [ -s "${dest}" ]; then
+      return 0
+    fi
+    rm -f "${dest}"
+  done
+  return 1
+}
 
 read_user_line() {
   ans=""
@@ -731,9 +749,14 @@ if [ ! -f "${WORK_SRC_DIR}/Cargo.toml" ] && [ ! -x "${WORK_SRC_DIR}/vpngate" ]; 
   BRANCH_NAME="${VPNGATE_BRANCH:-main}"
   SRC_STAGE_DIR="${INSTALL_TMP_ROOT}/src"
   mkdir -p "${SRC_STAGE_DIR}"
-  ARCHIVE_URL="https://codeload.github.com/${REPO_SLUG}/tar.gz/refs/heads/${BRANCH_NAME}"
-  info "Fetching source archive from ${ARCHIVE_URL} ..."
-  curl -fsSL "${ARCHIVE_URL}" -o "${SRC_STAGE_DIR}/src.tar.gz" </dev/null
+  info "Fetching source archive (Cloudflare Worker, then GitHub) ..."
+  if ! vg_fetch "${SRC_STAGE_DIR}/src.tar.gz" \
+      ${EDGE_BASE:+"${EDGE_BASE}/src.tar.gz"} \
+      "https://codeload.github.com/${REPO_SLUG}/tar.gz/refs/heads/${BRANCH_NAME}" \
+      "https://github.com/${REPO_SLUG}/archive/refs/heads/${BRANCH_NAME}.tar.gz"; then
+    warn "Could not download source archive. Set VPNGATE_EDGE to your workers.dev origin or clone the repo locally."
+    exit 1
+  fi
   tar -xzf "${SRC_STAGE_DIR}/src.tar.gz" -C "${SRC_STAGE_DIR}"
   rm -f "${SRC_STAGE_DIR}/src.tar.gz"
   EXTRACTED_DIR="$(find "${SRC_STAGE_DIR}" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
@@ -764,12 +787,20 @@ if [ -f "${WORK_SRC_DIR}/Cargo.toml" ]; then
   fi
 
   if [ -z "${CARGO_BIN}" ]; then
+    RUSTUP_SH="${INSTALL_TMP_ROOT}/rustup-init.sh"
+    if ! vg_fetch "${RUSTUP_SH}" \
+        "https://sh.rustup.rs" \
+        "https://static.rust-lang.org/rustup/rustup-init.sh" \
+        "https://rsproxy.cn/rustup-init.sh"; then
+      warn "Could not download rustup (sh.rustup.rs / static.rust-lang.org / rsproxy.cn)."
+      exit 1
+    fi
     if [ "${KEEP_TOOLCHAIN}" -eq 1 ]; then
       info "Rust toolchain ('cargo') not found — installing minimal stable rustup toolchain for ${TARGET_USER} (kept after install) ..."
       if [ "$(id -u)" -eq 0 ] && [ "${TARGET_USER}" != "root" ]; then
-        sudo -u "${TARGET_USER}" sh -c "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-host '${RUST_HOST_TRIPLE}'" </dev/null
+        sudo -u "${TARGET_USER}" sh "${RUSTUP_SH}" -y --profile minimal --default-host "${RUST_HOST_TRIPLE}" </dev/null
       else
-        sh -c "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-host '${RUST_HOST_TRIPLE}'" </dev/null
+        sh "${RUSTUP_SH}" -y --profile minimal --default-host "${RUST_HOST_TRIPLE}" </dev/null
       fi
       if [ -x "${TARGET_HOME}/.cargo/bin/cargo" ]; then
         CARGO_BIN="${TARGET_HOME}/.cargo/bin/cargo"
@@ -789,12 +820,12 @@ if [ -f "${WORK_SRC_DIR}/Cargo.toml" ]; then
         sudo -u "${TARGET_USER}" env \
           RUSTUP_HOME="${BUILD_RUSTUP_HOME}" \
           CARGO_HOME="${BUILD_CARGO_HOME}" \
-          sh -c "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path --default-host '${RUST_HOST_TRIPLE}'" </dev/null
+          sh "${RUSTUP_SH}" -y --profile minimal --no-modify-path --default-host "${RUST_HOST_TRIPLE}" </dev/null
       else
         env \
           RUSTUP_HOME="${BUILD_RUSTUP_HOME}" \
           CARGO_HOME="${BUILD_CARGO_HOME}" \
-          sh -c "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path --default-host '${RUST_HOST_TRIPLE}'" </dev/null
+          sh "${RUSTUP_SH}" -y --profile minimal --no-modify-path --default-host "${RUST_HOST_TRIPLE}" </dev/null
       fi
       if [ -x "${BUILD_CARGO_HOME}/bin/cargo" ]; then
         CARGO_BIN="${BUILD_CARGO_HOME}/bin/cargo"

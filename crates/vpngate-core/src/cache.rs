@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 use crate::cooldown::CooldownStore;
 use crate::discovery::{DiscoveryClient, DiscoveryOptions, ProgressEvent};
 use crate::error::Result;
-use crate::parser::OfficialMirrorSite;
+use crate::parser::{
+    OfficialMirrorSite, bundled_mirror_seeds, format_mirror_seed, parse_mirror_seed_text,
+};
 use crate::server::VpnServer;
 
 pub const CACHE_TTL_SECONDS: u64 = 600;
@@ -96,6 +98,8 @@ pub struct AppPaths {
     pub l2tp_resolv_bak: PathBuf,
     pub l2tp_run_dir: PathBuf,
     pub update_check: PathBuf,
+    /// User-pasted last-good Official Mirror URLs (one per line).
+    pub mirror_seed: PathBuf,
 }
 
 impl AppPaths {
@@ -121,6 +125,7 @@ impl AppPaths {
             l2tp_route: cache_dir.join("l2tp_route.json"),
             l2tp_resolv_bak: cache_dir.join("resolv.conf.bak"),
             update_check: cache_dir.join("update_check.json"),
+            mirror_seed: cache_dir.join("mirror-seed.txt"),
             l2tp_run_dir,
             cache_dir,
         }
@@ -304,6 +309,38 @@ pub fn save_cached_mirrors(paths: &AppPaths, mirrors: &[OfficialMirrorSite]) {
     let _ = atomic_write_json(&paths.mirrors_cache, &payload);
 }
 
+pub fn load_user_mirror_seed(paths: &AppPaths) -> Vec<OfficialMirrorSite> {
+    fs::read_to_string(&paths.mirror_seed)
+        .ok()
+        .map(|text| parse_mirror_seed_text(&text))
+        .unwrap_or_default()
+}
+
+pub fn save_user_mirror_seed(paths: &AppPaths, mirrors: &[OfficialMirrorSite]) {
+    if mirrors.is_empty() {
+        return;
+    }
+    let _ = paths.ensure_dirs();
+    if fs::write(&paths.mirror_seed, format_mirror_seed(mirrors)).is_ok() {
+        fix_owner(&paths.mirror_seed);
+    }
+}
+
+fn merge_seed_lists(lists: Vec<Vec<OfficialMirrorSite>>) -> Vec<OfficialMirrorSite> {
+    let mut out = Vec::new();
+    for list in lists {
+        for m in list {
+            if !out
+                .iter()
+                .any(|x: &OfficialMirrorSite| x.base_url == m.base_url)
+            {
+                out.push(m);
+            }
+        }
+    }
+    out
+}
+
 ///Silent convenience wrapper around `get_servers_cached_with_progress`.
 pub async fn get_servers_cached(paths: &AppPaths, force_refresh: bool) -> Result<Vec<VpnServer>> {
     get_servers_cached_with_progress(paths, force_refresh, &[], |_| {}).await
@@ -329,15 +366,18 @@ pub async fn get_servers_cached_with_progress(
         return Ok(cached.servers);
     }
 
-    let mut seeds = extra_mirrors.to_vec();
-    for mut m in load_cached_mirrors(paths) {
+    let mut cached = load_cached_mirrors(paths);
+    for m in &mut cached {
         if m.source == "sites.aspx" {
             m.source = "cached".to_string();
         }
-        if !seeds.iter().any(|x| x.base_url == m.base_url) {
-            seeds.push(m);
-        }
     }
+    let seeds = merge_seed_lists(vec![
+        extra_mirrors.to_vec(),
+        load_user_mirror_seed(paths),
+        cached,
+        bundled_mirror_seeds(),
+    ]);
 
     let opts = DiscoveryOptions {
         seed_mirrors: seeds,

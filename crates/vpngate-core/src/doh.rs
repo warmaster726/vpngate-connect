@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::edge::edge_path_urls;
 use crate::error::{CoreError, Result};
 
 /// Returns `true` if `ip` is a bogon, private, loopback, carrier-grade NAT, or ISP-poisoned sinkhole IP.
@@ -43,12 +44,46 @@ struct DohAnswer {
     data: String,
 }
 
-/// Resolves unpoisoned public IPv4 `A` records via Cloudflare DoH (`1.1.1.1:443` / `1.0.0.1:443`)
-/// using direct IP-pinned TLS (`cloudflare-dns.com` SNI), completely immune to local UDP-53 poisoning.
+struct DohUpstream {
+    /// TLS SNI / Host header. Empty = URL host, no IP pin.
+    sni: &'static str,
+    url: &'static str,
+    ips: &'static [Ipv4Addr],
+}
+
+/// IP-pinned DoH mesh. UDP/53 is never used. Poisoned A records are dropped.
+const PINNED_DOH: &[DohUpstream] = &[
+    DohUpstream {
+        sni: "cloudflare-dns.com",
+        url: "https://cloudflare-dns.com/dns-query",
+        ips: &[Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(1, 0, 0, 1)],
+    },
+    DohUpstream {
+        sni: "dns.google",
+        url: "https://dns.google/dns-query",
+        ips: &[Ipv4Addr::new(8, 8, 8, 8), Ipv4Addr::new(8, 8, 4, 4)],
+    },
+    DohUpstream {
+        sni: "dns.quad9.net",
+        url: "https://dns.quad9.net/dns-query",
+        ips: &[Ipv4Addr::new(9, 9, 9, 9), Ipv4Addr::new(149, 112, 112, 112)],
+    },
+];
+
+/// Resolves unpoisoned public IPv4 `A` records via Cloudflare DoH (`1.1.1.1:443`).
+/// Prefer [`resolve_ipv4_via_doh`], which also tries Google, Quad9, and the Worker.
 pub async fn resolve_ipv4_via_cloudflare_doh(
     host: &str,
     timeout: Duration,
 ) -> Result<Vec<Ipv4Addr>> {
+    resolve_ipv4_via_doh(host, timeout).await
+}
+
+/// Resolves unpoisoned public IPv4 `A` records via a DoH mesh:
+/// Cloudflare `1.1.1.1` / `1.0.0.1`, Google `8.8.8.8` / `8.8.4.4`,
+/// Quad9 `9.9.9.9` / `149.112.112.112`, then the Cloudflare Worker `/dns-query`.
+/// Each public resolver is IP-pinned (SNI) so local UDP-53 poisoning cannot divert the query.
+pub async fn resolve_ipv4_via_doh(host: &str, timeout: Duration) -> Result<Vec<Ipv4Addr>> {
     if let Ok(literal) = host.trim().parse::<Ipv4Addr>() {
         if !is_poisoned_ipv4(literal) {
             return Ok(vec![literal]);
@@ -58,40 +93,14 @@ pub async fn resolve_ipv4_via_cloudflare_doh(
         });
     }
 
-    for resolver_ip in [Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(1, 0, 0, 1)] {
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .resolve(
-                "cloudflare-dns.com",
-                SocketAddr::new(IpAddr::V4(resolver_ip), 443),
-            )
-            .build()?;
-
-        let resp = client
-            .get("https://cloudflare-dns.com/dns-query")
-            .query(&[("name", host), ("type", "A")])
-            .header("Accept", "application/dns-json")
-            .send()
-            .await;
-
-        let Ok(http_resp) = resp else {
-            continue;
-        };
-        let Ok(parsed) = http_resp.json::<DohResponse>().await else {
-            continue;
-        };
-
-        let mut valid = Vec::new();
-        for ans in parsed.answer {
-            if ans.record_type == 1
-                && let Ok(v4) = ans.data.trim().parse::<Ipv4Addr>()
-                && !is_poisoned_ipv4(v4)
-                && !valid.contains(&v4)
-            {
-                valid.push(v4);
-            }
+    for upstream in PINNED_DOH {
+        if let Some(valid) = query_doh_upstream(upstream, host, timeout).await {
+            return Ok(valid);
         }
-        if !valid.is_empty() {
+    }
+
+    for url in edge_path_urls("/dns-query") {
+        if let Some(valid) = query_doh_url(&url, None, None, host, timeout).await {
             return Ok(valid);
         }
     }
@@ -99,6 +108,58 @@ pub async fn resolve_ipv4_via_cloudflare_doh(
     Err(CoreError::DohResolutionFailed {
         host: host.to_string(),
     })
+}
+
+async fn query_doh_upstream(
+    upstream: &DohUpstream,
+    host: &str,
+    timeout: Duration,
+) -> Option<Vec<Ipv4Addr>> {
+    if upstream.ips.is_empty() {
+        return query_doh_url(upstream.url, None, None, host, timeout).await;
+    }
+    for &ip in upstream.ips {
+        let pin = SocketAddr::new(IpAddr::V4(ip), 443);
+        if let Some(valid) =
+            query_doh_url(upstream.url, Some(upstream.sni), Some(pin), host, timeout).await
+        {
+            return Some(valid);
+        }
+    }
+    None
+}
+
+async fn query_doh_url(
+    url: &str,
+    sni: Option<&str>,
+    pin: Option<SocketAddr>,
+    host: &str,
+    timeout: Duration,
+) -> Option<Vec<Ipv4Addr>> {
+    let mut builder = reqwest::Client::builder().timeout(timeout);
+    if let (Some(name), Some(addr)) = (sni, pin) {
+        builder = builder.resolve(name, addr);
+    }
+    let client = builder.build().ok()?;
+    let resp = client
+        .get(url)
+        .query(&[("name", host), ("type", "A")])
+        .header("Accept", "application/dns-json")
+        .send()
+        .await
+        .ok()?;
+    let parsed = resp.json::<DohResponse>().await.ok()?;
+    let mut valid = Vec::new();
+    for ans in parsed.answer {
+        if ans.record_type == 1
+            && let Ok(v4) = ans.data.trim().parse::<Ipv4Addr>()
+            && !is_poisoned_ipv4(v4)
+            && !valid.contains(&v4)
+        {
+            valid.push(v4);
+        }
+    }
+    if valid.is_empty() { None } else { Some(valid) }
 }
 
 #[cfg(test)]
@@ -113,5 +174,7 @@ mod tests {
         assert!(is_poisoned_ipv4(Ipv4Addr::new(100, 64, 0, 1)));
         assert!(!is_poisoned_ipv4(Ipv4Addr::new(219, 100, 37, 10)));
         assert!(!is_poisoned_ipv4(Ipv4Addr::new(1, 1, 1, 1)));
+        assert!(!is_poisoned_ipv4(Ipv4Addr::new(8, 8, 8, 8)));
+        assert!(!is_poisoned_ipv4(Ipv4Addr::new(9, 9, 9, 9)));
     }
 }

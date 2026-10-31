@@ -59,6 +59,26 @@ function Write-Ok([string]$Msg)   { Write-Host "[+] $Msg" -ForegroundColor Green
 function Write-Warn([string]$Msg) { Write-Host "[!] $Msg" -ForegroundColor Yellow }
 function Write-Err([string]$Msg)  { Write-Host "[-] $Msg" -ForegroundColor Red }
 
+function Get-FirstUrl {
+    param(
+        [Parameter(Mandatory=$true)][string]$OutFile,
+        [Parameter(Mandatory=$true)][string[]]$Urls
+    )
+    foreach ($u in $Urls) {
+        if ([string]::IsNullOrWhiteSpace($u)) { continue }
+        try {
+            Write-Info "Trying $u ..."
+            Invoke-WebRequest -Uri $u -UseBasicParsing -OutFile $OutFile -TimeoutSec 90
+            if ((Test-Path -LiteralPath $OutFile) -and ((Get-Item -LiteralPath $OutFile).Length -gt 0)) {
+                return $true
+            }
+        } catch {}
+        Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
+    }
+    return $false
+}
+
+
 function Show-Usage {
     Write-Host @"
 Usage: .\install-vpngate.ps1 [OPTIONS]
@@ -484,12 +504,18 @@ try {
 
     if (-not (Test-Path -LiteralPath $CargoToml) -and -not (Test-Path -LiteralPath $LocalPrebuilt)) {
         $BranchName = if ($env:VPNGATE_BRANCH) { $env:VPNGATE_BRANCH } else { 'main' }
-        $ZipUrl = "https://codeload.github.com/$Repo/zip/refs/heads/$BranchName"
+        $EdgeBase = if ($env:VPNGATE_EDGE) { $env:VPNGATE_EDGE.Trim().TrimEnd('/') } else { '' }
         $SrcStageDir = Join-Path $TempInstallRoot 'src'
         New-Item -ItemType Directory -Path $SrcStageDir -Force | Out-Null
         $ZipPath = Join-Path $SrcStageDir 'src.zip'
-        Write-Info "Downloading source archive from $ZipUrl ..."
-        Invoke-WebRequest -Uri $ZipUrl -UseBasicParsing -OutFile $ZipPath
+        Write-Info "Downloading source archive (Cloudflare Worker, then GitHub) ..."
+        $ZipUrls = @()
+        if ($EdgeBase) { $ZipUrls += "$EdgeBase/src.zip" }
+        $ZipUrls += "https://codeload.github.com/$Repo/zip/refs/heads/$BranchName"
+        $ZipUrls += "https://github.com/$Repo/archive/refs/heads/$BranchName.zip"
+        if (-not (Get-FirstUrl -OutFile $ZipPath -Urls $ZipUrls)) {
+            throw "Could not download source archive. Set VPNGATE_EDGE to your workers.dev origin or clone the repo locally."
+        }
         Expand-Archive -LiteralPath $ZipPath -DestinationPath $SrcStageDir -Force
         Remove-Item -LiteralPath $ZipPath -Force -ErrorAction SilentlyContinue
         $SubDir = Get-ChildItem -LiteralPath $SrcStageDir -Directory | Select-Object -First 1
@@ -518,7 +544,15 @@ try {
         } else {
             $RustupInit = Join-Path $TempInstallRoot 'rustup-init.exe'
             $DefaultHost = if ($HasMsvc -or $IsArm64) { $MsvcTriple } else { $GnuTriple }
-            Invoke-WebRequest -Uri $RustupDist -UseBasicParsing -OutFile $RustupInit
+            $RustArch = if ($IsArm64) { 'aarch64' } else { 'x86_64' }
+            $RustupUrls = @(
+                $RustupDist,
+                "https://static.rust-lang.org/rustup/dist/$RustArch-pc-windows-msvc/rustup-init.exe",
+                "https://rsproxy.cn/rustup-init.exe"
+            )
+            if (-not (Get-FirstUrl -OutFile $RustupInit -Urls $RustupUrls)) {
+                throw "Could not download rustup-init.exe (win.rustup.rs / static.rust-lang.org / rsproxy.cn)."
+            }
 
             if ($KeepToolchain) {
                 Write-Info "Rust toolchain not found - installing minimal Rust ($DefaultHost) via rustup.rs (kept after install) ..."

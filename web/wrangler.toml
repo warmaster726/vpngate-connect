@@ -13,6 +13,10 @@ name = "vpngate-connect"
 main = "build/index.js"
 compatibility_date = "2026-10-26"
 workers_dev = true
+# Public origin is https://vpngate-connect.<account>.workers.dev (no custom hostname).
+# After deploy, paste that URL into assets/edge-origins.txt and/or VPNGATE_EDGE.
+# Routes added for GitHub-bypass: /install.sh /install.ps1 /desktop-version.txt
+# /api/servers /api.csv /dns-query /src.tar.gz /src.zip /seed.txt /edge.json
 
 [build]
 command = "if ! command -v rustc >/dev/null 2>&1; then curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y; fi; . \"$HOME/.cargo/env\"; rustup target add wasm32-unknown-unknown; cargo install -q worker-build@^0.8; worker-build --release"

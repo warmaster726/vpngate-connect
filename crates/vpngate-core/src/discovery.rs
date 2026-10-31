@@ -7,12 +7,14 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
-use crate::doh::resolve_ipv4_via_cloudflare_doh;
+use crate::doh::resolve_ipv4_via_doh;
+use crate::edge::edge_path_urls;
 use crate::error::{CoreError, Result};
 use crate::ikev1::{probe_tcp, sweep_ikev1_sa_responders, verify_l2tp_psk_vpn};
 use crate::parser::{
-    OfficialMirrorSite, extract_aspnet_fields, normalize_mirror_base_url, parse_sdise_csv_into,
-    parse_vpngate_csv_into, parse_vpngate_html_into, parse_vpngate_mirror_sites_html,
+    OfficialMirrorSite, bundled_mirror_seeds, extract_aspnet_fields, normalize_mirror_base_url,
+    parse_sdise_csv_into, parse_vpngate_csv_into, parse_vpngate_html_into,
+    parse_vpngate_mirror_sites_html,
 };
 use crate::server::VpnServer;
 
@@ -259,14 +261,14 @@ impl DiscoveryClient {
             }
         }
 
-        // Fallback: resolve hostname via IP-pinned Cloudflare DoH (1.1.1.1:443)
+        // Fallback: resolve hostname via IP-pinned DoH mesh (1.1.1.1 / 8.8.8.8 / 9.9.9.9)
         let parsed = reqwest::Url::parse(url).ok()?;
         let host = parsed.host_str()?;
         if host.parse::<Ipv4Addr>().is_ok() {
             return None;
         }
         let port = parsed.port_or_known_default()?;
-        let ips = resolve_ipv4_via_cloudflare_doh(host, Duration::from_secs(4))
+        let ips = resolve_ipv4_via_doh(host, Duration::from_secs(4))
             .await
             .ok()?;
 
@@ -330,9 +332,12 @@ impl DiscoveryClient {
     }
 
     async fn try_primary_csv(&self) -> Option<String> {
-        for &url in OFFICIAL_CSV_URLS {
+        let mut urls: Vec<String> = edge_path_urls("/api.csv");
+        urls.extend(edge_path_urls("/api/iphone/"));
+        urls.extend(OFFICIAL_CSV_URLS.iter().map(|u| (*u).to_string()));
+        for url in urls {
             if let Some(body) = self
-                .fetch_text_with_doh(url, Duration::from_millis(3200))
+                .fetch_text_with_doh(&url, Duration::from_millis(3200))
                 .await
                 && (body.contains("*vpn_servers") || body.contains("#HostName"))
             {
@@ -590,6 +595,7 @@ impl DiscoveryClient {
                 collect_env_custom_mirrors(),
                 primary_sites,
                 self.opts.seed_mirrors.clone(),
+                bundled_mirror_seeds(),
                 fallback_sites,
             ])
         };
@@ -745,6 +751,7 @@ impl DiscoveryClient {
             env_mirrors.clone(),
             primary_mirrors.clone(),
             self.opts.seed_mirrors.clone(),
+            bundled_mirror_seeds(),
         ]);
 
         if !primary_mirrors.is_empty() {
@@ -895,13 +902,13 @@ impl DiscoveryClient {
                 async {
                     tokio::time::timeout(Duration::from_millis(13_500), async {
                         let csv_fut = async {
-                            let mut futs = Vec::new();
-                            for &u in MIRROR_CSV_URLS {
-                                futs.push(self.fetch_text_with_doh(u, Duration::from_secs(9)));
-                            }
+                            let mut urls = edge_path_urls("/api.csv");
+                            urls.extend(MIRROR_CSV_URLS.iter().map(|u| (*u).to_string()));
                             let mut bodies = Vec::new();
-                            for f in futs {
-                                if let Some(b) = f.await {
+                            for u in urls {
+                                if let Some(b) =
+                                    self.fetch_text_with_doh(&u, Duration::from_secs(9)).await
+                                {
                                     bodies.push(b);
                                 }
                             }
