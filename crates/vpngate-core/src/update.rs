@@ -22,9 +22,9 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(12);
 const GITHUB_CHECK_TIMEOUT: Duration = Duration::from_secs(12);
 const CDN_CHECK_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// Public desktop label. Cargo crate version stays SemVer (`0.4.1`); a trailing
-/// letter (`0.4.1a`) would be a revision *after* that patch, used for update prompts.
-pub const PRODUCT_VERSION: &str = "0.4.1";
+/// Public desktop label. Cargo crate version stays SemVer (`0.4.2`); a trailing
+/// letter (`0.4.2a`) would be a revision *after* that patch, used for update prompts.
+pub const PRODUCT_VERSION: &str = "0.4.2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DesktopVersion {

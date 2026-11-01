@@ -70,6 +70,9 @@ pub fn patch_ovpn_text(raw_text: &str, server: &VpnServer, opts: &OvpnPatchOptio
                 || low.starts_with("register-dns")
                 || low.starts_with("block-outside-dns")
                 || low.starts_with("windows-driver")
+                || low.starts_with("comp-lzo")
+                || low.starts_with("compress")
+                || low.starts_with("allow-compression")
             {
                 continue;
             }
@@ -131,10 +134,58 @@ pub fn patch_ovpn_text(raw_text: &str, server: &VpnServer, opts: &OvpnPatchOptio
         }
     }
 
-    lines_out.push("connect-retry-max 2".to_string());
+    if opts.platform == TargetPlatform::Linux {
+        lines_out.push("connect-retry 2".to_string());
+        lines_out.push("connect-retry-max 6".to_string());
+    } else {
+        lines_out.push("connect-retry-max 2".to_string());
+    }
     lines_out.push("resolv-retry 10".to_string());
     lines_out.push("hand-window 20".to_string());
     lines_out.push("keepalive 10 30".to_string());
+
+    if opts.platform == TargetPlatform::Linux {
+        fn has_prefix(lines: &[String], prefix: &str) -> bool {
+            lines.iter().any(|l| {
+                l.trim()
+                    .to_ascii_lowercase()
+                    .starts_with(&prefix.to_ascii_lowercase())
+            })
+        }
+        if !has_prefix(&lines_out, "persist-tun") {
+            lines_out.push("persist-tun".to_string());
+        }
+        if !has_prefix(&lines_out, "persist-key") {
+            lines_out.push("persist-key".to_string());
+        }
+        if !has_prefix(&lines_out, "nobind") {
+            lines_out.push("nobind".to_string());
+        }
+        if !has_prefix(&lines_out, "redirect-gateway") {
+            lines_out.push("redirect-gateway def1 bypass-dhcp".to_string());
+        }
+        if !has_prefix(&lines_out, "mssfix") {
+            lines_out.push("mssfix 1300".to_string());
+        }
+        match opts.compat {
+            OpenVpnCompat::OpenVpn26 => {
+                lines_out.push("providers legacy default".to_string());
+                lines_out.push("allow-compression no".to_string());
+            }
+            OpenVpnCompat::OpenVpn25 => {
+                lines_out.push("allow-compression no".to_string());
+            }
+            OpenVpnCompat::OpenVpn24 => {
+                lines_out.push("comp-lzo no".to_string());
+            }
+            OpenVpnCompat::MobileCore3 => {}
+        }
+        lines_out.push("pull-filter ignore \"comp-lzo\"".to_string());
+        lines_out.push("pull-filter ignore \"compress\"".to_string());
+        if !want_tcp {
+            lines_out.push("explicit-exit-notify 1".to_string());
+        }
+    }
 
     // Keep any vendor `dhcp-option DNS` from the volunteer config (connection DNS),
     // then append Cloudflare + Google (or `--dns`) as extra resolvers.
@@ -310,6 +361,12 @@ mod tests {
         assert!(patched.contains("remote 219.100.37.10 443"));
         assert!(!patched.contains("auth-user-pass"));
         assert!(patched.contains("disable-dco"));
+        assert!(patched.contains("redirect-gateway def1 bypass-dhcp"));
+        assert!(patched.contains("mssfix 1300"));
+        assert!(patched.contains("providers legacy default"));
+        assert!(patched.contains("allow-compression no"));
+        assert!(patched.contains("pull-filter ignore \"comp-lzo\""));
+        assert!(!patched.contains("explicit-exit-notify"));
         assert!(patched.contains("dhcp-option DNS 1.1.1.1"));
         assert!(patched.contains("dhcp-option DNS 8.8.8.8"));
         assert!(patched.contains("dhcp-option DNS6 2606:4700:4700::1111"));

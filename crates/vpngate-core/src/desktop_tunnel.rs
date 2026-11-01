@@ -726,50 +726,67 @@ fn manage_linux_l2tp_firewall(enable: bool) {
     }
 
     // Prefer native nftables first (preserves pure single-backend nftables on Kali Linux!)
-    if which_bin("nft").is_some()
-        && let Ok(out) = Command::new("nft")
-            .args(["-a", "list", "chain", "inet", "filter", "input"])
-            .output()
-        && out.status.success()
-    {
-        let chain_txt = String::from_utf8_lossy(&out.stdout);
-        // Remove any prior tagged rules cleanly by handle
-        for ln in chain_txt.lines() {
-            if ln.contains(NFT_COMMENT_TAG)
-                && let Some((_, handle_str)) = ln.rsplit_once("# handle ")
-                && let Ok(h) = handle_str.trim().parse::<u64>()
-            {
-                let _ = Command::new("nft")
-                    .args([
-                        "delete",
-                        "rule",
-                        "inet",
-                        "filter",
-                        "input",
-                        "handle",
-                        &h.to_string(),
-                    ])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
+    if which_bin("nft").is_some() {
+        let mut used_nft = false;
+        for chain in ["input", "output"] {
+            let Ok(out) = Command::new("nft")
+                .args(["-a", "list", "chain", "inet", "filter", chain])
+                .output()
+            else {
+                continue;
+            };
+            if !out.status.success() {
+                continue;
+            }
+            used_nft = true;
+            let chain_txt = String::from_utf8_lossy(&out.stdout);
+            for ln in chain_txt.lines() {
+                if ln.contains(NFT_COMMENT_TAG)
+                    && let Some((_, handle_str)) = ln.rsplit_once("# handle ")
+                    && let Ok(h) = handle_str.trim().parse::<u64>()
+                {
+                    let _ = Command::new("nft")
+                        .args([
+                            "delete",
+                            "rule",
+                            "inet",
+                            "filter",
+                            chain,
+                            "handle",
+                            &h.to_string(),
+                        ])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                }
+            }
+            if enable {
+                let rules: &[&str] = if chain == "input" {
+                    &[
+                        r#"iifname "ppp*" accept comment "vpngate-l2tp""#,
+                        r#"iifname "tun*" accept comment "vpngate-l2tp""#,
+                        r#"meta secpath exists accept comment "vpngate-l2tp""#,
+                    ]
+                } else {
+                    &[
+                        r#"oifname "ppp*" accept comment "vpngate-l2tp""#,
+                        r#"oifname "tun*" accept comment "vpngate-l2tp""#,
+                    ]
+                };
+                for rule_expr in rules {
+                    let mut args = vec!["insert", "rule", "inet", "filter", chain];
+                    args.extend(rule_expr.split_whitespace());
+                    let _ = Command::new("nft")
+                        .args(&args)
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                }
             }
         }
-        if enable {
-            for rule_expr in [
-                r#"iifname "ppp*" accept comment "vpngate-l2tp""#,
-                r#"iifname "tun*" accept comment "vpngate-l2tp""#,
-                r#"meta secpath exists accept comment "vpngate-l2tp""#,
-            ] {
-                let mut args = vec!["insert", "rule", "inet", "filter", "input"];
-                args.extend(rule_expr.split_whitespace());
-                let _ = Command::new("nft")
-                    .args(&args)
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
-            }
+        if used_nft {
+            return;
         }
-        return;
     }
 
     // Fallback to iptables only on distros without an active `inet filter` nftables table
@@ -796,6 +813,45 @@ fn manage_linux_l2tp_firewall(enable: bool) {
                 "INPUT",
                 &[
                     "-i",
+                    "ppp+",
+                    "-m",
+                    "comment",
+                    "--comment",
+                    NFT_COMMENT_TAG,
+                    "-j",
+                    "ACCEPT",
+                ],
+            ),
+            (
+                "INPUT",
+                &[
+                    "-i",
+                    "tun+",
+                    "-m",
+                    "comment",
+                    "--comment",
+                    NFT_COMMENT_TAG,
+                    "-j",
+                    "ACCEPT",
+                ],
+            ),
+            (
+                "OUTPUT",
+                &[
+                    "-o",
+                    "tun+",
+                    "-m",
+                    "comment",
+                    "--comment",
+                    NFT_COMMENT_TAG,
+                    "-j",
+                    "ACCEPT",
+                ],
+            ),
+            (
+                "OUTPUT",
+                &[
+                    "-o",
                     "ppp+",
                     "-m",
                     "comment",
@@ -842,19 +898,18 @@ fn manage_linux_l2tp_firewall(enable: bool) {
     }
 }
 
-fn snapshot_and_apply_linux_sysctls(paths: &AppPaths, l2tp_mode: bool) {
+fn snapshot_and_apply_linux_sysctls(paths: &AppPaths, _l2tp_mode: bool) {
     if !cfg!(target_os = "linux") || !is_root_or_admin() {
         return;
     }
-    let mut keys = vec![
+    let keys = [
         ("net.ipv6.conf.all.disable_ipv6", "1"),
         ("net.ipv6.conf.default.disable_ipv6", "1"),
         ("net.ipv6.conf.lo.disable_ipv6", "0"),
+        // Loose reverse-path so tun/ppp replies are not dropped (OpenVPN and L2TP).
+        ("net.ipv4.conf.all.rp_filter", "2"),
+        ("net.ipv4.conf.default.rp_filter", "2"),
     ];
-    if l2tp_mode {
-        keys.push(("net.ipv4.conf.all.rp_filter", "2"));
-        keys.push(("net.ipv4.conf.default.rp_filter", "2"));
-    }
 
     let mut snap: BTreeMap<String, String> =
         read_json_opt(&paths.sysctl_backup).unwrap_or_default();
@@ -976,11 +1031,8 @@ fn apply_linux_tunnel_dns(
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
-        let _ = Command::new("resolvectl")
-            .args(["domain", dev, "~."])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        // Do not `resolvectl domain ~.` — that locks every query to this link.
+        // Aid resolvers (Cloudflare/Google) sit beside relay-pushed DNS.
         if ok_dns && is_systemd_symlink {
             resolved_handled = true;
         }
@@ -1616,6 +1668,72 @@ pub async fn connect_l2tp_windows(
     Ok(WIN_VPN_PROFILE_NAME.to_string())
 }
 
+fn ensure_linux_tun_device() {
+    if !cfg!(target_os = "linux") || Path::new("/dev/net/tun").exists() {
+        return;
+    }
+    if let Some(mp) = which_bin("modprobe").or_else(|| {
+        ["/sbin/modprobe", "/usr/sbin/modprobe"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|p| p.is_file())
+    }) {
+        let _ = Command::new(mp)
+            .arg("tun")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+fn pin_linux_server_host_route(paths: &AppPaths, server_ip: &str) {
+    if !cfg!(target_os = "linux") || !is_root_or_admin() {
+        return;
+    }
+    let gw = get_default_gateway();
+    if gw.dev.is_empty() {
+        return;
+    }
+    let mut rt_args = vec![
+        "-4".to_string(),
+        "route".to_string(),
+        "replace".to_string(),
+        format!("{server_ip}/32"),
+    ];
+    if !gw.gw.is_empty() {
+        rt_args.push("via".to_string());
+        rt_args.push(gw.gw.clone());
+    }
+    rt_args.push("dev".to_string());
+    rt_args.push(gw.dev.clone());
+    let _ = Command::new("ip")
+        .args(&rt_args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = atomic_write_json(
+        &paths.l2tp_route,
+        &PinnedRouteRecord {
+            server_ip: server_ip.to_string(),
+            gw: gw.gw,
+            dev: gw.dev,
+        },
+    );
+}
+
+fn ensure_linux_openvpn_split_default(dev: &str) {
+    if !cfg!(target_os = "linux") || !is_root_or_admin() || dev.is_empty() {
+        return;
+    }
+    for cidr in ["0.0.0.0/1", "128.0.0.0/1"] {
+        let _ = Command::new("ip")
+            .args(["-4", "route", "replace", cidr, "dev", dev])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
 /// Connects OpenVPN on Desktop (`nmcli` optional on Linux, plus direct `openvpn` daemon across Linux/macOS/Windows).
 pub async fn connect_openvpn_desktop(
     paths: &AppPaths,
@@ -1647,7 +1765,10 @@ pub async fn connect_openvpn_desktop(
     fix_owner(&ovpn_path);
 
     if cfg!(target_os = "linux") {
+        ensure_linux_tun_device();
         snapshot_and_apply_linux_sysctls(paths, false);
+        manage_linux_l2tp_firewall(true);
+        pin_linux_server_host_route(paths, &server.ip);
     }
 
     // Try NetworkManager first on Linux if explicitly requested (`nm`)
@@ -1734,6 +1855,8 @@ pub async fn connect_openvpn_desktop(
                     .next()
                     .cloned()
                     .unwrap_or_else(|| "tun0".to_string());
+                ensure_linux_openvpn_split_default(&dev);
+                apply_linux_tunnel_dns(paths, &dev, dns_servers, &[]);
                 return Ok((dev, "nmcli-openvpn".to_string()));
             }
         }
@@ -1757,6 +1880,12 @@ pub async fn connect_openvpn_desktop(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if cfg!(target_os = "linux") {
+        cmd.arg("--cd").arg(&paths.cache_dir);
+        if matches!(compat, OpenVpnCompat::OpenVpn26) {
+            cmd.arg("--disable-dco");
+        }
+    }
 
     if !cfg!(target_os = "windows") {
         cmd.arg("--daemon").arg("--writepid").arg(&paths.ovpn_pid);
@@ -1775,6 +1904,8 @@ pub async fn connect_openvpn_desktop(
 
     let eff_timeout = if cfg!(target_os = "windows") {
         timeout_secs.max(38)
+    } else if cfg!(target_os = "linux") {
+        timeout_secs.max(22)
     } else {
         timeout_secs.max(15)
     };
@@ -1858,6 +1989,7 @@ pub async fn connect_openvpn_desktop(
         let extra = fs::read_to_string(&log_path)
             .map(|t| parse_dhcp_option_dns(&t))
             .unwrap_or_default();
+        ensure_linux_openvpn_split_default(&dev);
         apply_linux_tunnel_dns(paths, &dev, dns_servers, &extra);
         return Ok((dev, "openvpn-daemon".to_string()));
     }
