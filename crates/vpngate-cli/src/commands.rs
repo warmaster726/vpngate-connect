@@ -360,7 +360,7 @@ fn render_established_session_summary(st: &ActiveSessionState) -> io::Result<()>
                 st.protocol, st.backend
             )),
             Some(format!(
-                "Interface : {GREEN}{}{RESET}   |   DNS Locked : {CYAN}{}{RESET}",
+                "Interface : {GREEN}{}{RESET}   |   DNS : {CYAN}{}{RESET}",
                 st.device, st.dns
             )),
             Some(format!(
