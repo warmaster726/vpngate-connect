@@ -16,6 +16,7 @@ use vpngate_core::{
     ActiveSessionState, AppPaths, ConnectSessionConfig, CountrySummary, DiscoveryClient,
     DiscoveryOptions, INTERRUPTED_EXIT, Ikev1StateInfo, MONITOR_INTERVAL_SECONDS, NM_PROFILE_PREFIX,
     OfficialMirrorSite, ProgressEvent, ProtocolFilter, ServerCacheFile, SortBy, VpnServer,
+    parse_dns_list, tunnel_aid_dns_cli,
     cleanup_existing_vpn_with_progress, detect_host_os_label, engage_candidates_with_progress,
     filter_by_country, filter_by_protocol, find_openvpn_bin, get_default_gateway,
     get_ppp_interfaces, get_public_ip_trace, get_running_monitor_pid, get_running_openvpn_pid,
@@ -743,12 +744,7 @@ pub async fn cmd_connect(paths: &AppPaths, args: &ConnectArgs) -> io::Result<i32
         return Ok(1);
     }
 
-    let dns_servers: Vec<String> = args
-        .dns
-        .replace(',', " ")
-        .split_whitespace()
-        .map(ToString::to_string)
-        .collect();
+    let dns_servers = parse_dns_list(&args.dns);
 
     let cfg = ConnectSessionConfig {
         region_label: args.country.clone(),
@@ -757,11 +753,7 @@ pub async fn cmd_connect(paths: &AppPaths, args: &ConnectArgs) -> io::Result<i32
         limit: args.limit,
         timeout_secs: args.timeout_secs,
         engine: args.engine.clone(),
-        dns_servers: if dns_servers.is_empty() {
-            vec!["1.1.1.1".to_string(), "1.0.0.1".to_string()]
-        } else {
-            dns_servers
-        },
+        dns_servers,
         start_index: args.start_index.max(1),
         auto_reconnect,
         in_monitor: false,
@@ -2144,7 +2136,7 @@ pub async fn interactive_menu(paths: &AppPaths, help_text: &str) -> io::Result<i
                     limit: 0,
                     timeout_secs: 22,
                     engine: "auto".to_string(),
-                    dns: "1.1.1.1 1.0.0.1".to_string(),
+                    dns: tunnel_aid_dns_cli(),
                     start_index: 1,
                     force_refresh: false,
                     auto_reconnect_override: None,
@@ -2210,7 +2202,7 @@ pub async fn interactive_menu(paths: &AppPaths, help_text: &str) -> io::Result<i
                     limit: 0,
                     timeout_secs: 22,
                     engine: "auto".to_string(),
-                    dns: "1.1.1.1 1.0.0.1".to_string(),
+                    dns: tunnel_aid_dns_cli(),
                     start_index: start_idx,
                     force_refresh: false,
                     auto_reconnect_override: None,

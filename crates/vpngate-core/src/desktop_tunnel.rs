@@ -15,6 +15,10 @@ use crate::cache::{
     load_watchdog_pref, now_unix_secs, read_json_opt, save_cooldowns,
 };
 use crate::discovery::ProgressEvent;
+use crate::dns::{
+    merge_connection_and_aid_dns, parse_dhcp_option_dns, parse_nameserver_file,
+    parse_resolvectl_dns_output, tunnel_aid_dns,
+};
 use crate::ikev1::{probe_tcp, verify_l2tp_psk_vpn};
 use crate::ikev1_daemon::VPNGATE_XFRM_REQID;
 use crate::profile::{OvpnPatchOptions, build_patched_ovpn};
@@ -915,9 +919,43 @@ pub fn probe_linux_l2tp_kernel_support() -> std::result::Result<(), String> {
     Ok(())
 }
 
-/// Locks tunnel DNS on Linux across both `systemd-resolved` (`resolvectl`) and direct `/etc/resolv.conf` distros.
-fn apply_linux_tunnel_dns(paths: &AppPaths, dev: &str, dns_servers: &[String]) {
-    if !cfg!(target_os = "linux") || dns_servers.is_empty() || !is_root_or_admin() {
+fn collect_linux_connection_dns(dev: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if which_bin("resolvectl").is_some()
+        && let Ok(o) = Command::new("resolvectl")
+            .args(["dns", dev])
+            .output()
+    {
+        out.extend(parse_resolvectl_dns_output(&String::from_utf8_lossy(
+            &o.stdout,
+        )));
+    }
+    for p in [
+        "/etc/ppp/resolv.conf",
+        "/var/run/ppp/resolv.conf",
+        "/run/ppp/resolv.conf",
+    ] {
+        if let Ok(txt) = fs::read_to_string(p) {
+            out.extend(parse_nameserver_file(&txt));
+        }
+    }
+    out
+}
+
+/// Sets tunnel DNS to connection-pushed resolvers plus Cloudflare/Google (or `--dns`).
+fn apply_linux_tunnel_dns(
+    paths: &AppPaths,
+    dev: &str,
+    aid_dns: &[String],
+    extra_connection: &[String],
+) {
+    if !cfg!(target_os = "linux") || !is_root_or_admin() {
+        return;
+    }
+    let mut connection = collect_linux_connection_dns(dev);
+    connection.extend(extra_connection.iter().cloned());
+    let dns_servers = merge_connection_and_aid_dns(&connection, aid_dns);
+    if dns_servers.is_empty() {
         return;
     }
 
@@ -1437,7 +1475,7 @@ pub async fn connect_l2tp_linux_builtin(
         return Err("L2TP/PPP timed out waiting for pppX interface".to_string());
     }
 
-    // Install split-default routes (0.0.0.0/1 + 128.0.0.0/1) & lock Cloudflare DNS
+    // Install split-default routes (0.0.0.0/1 + 128.0.0.0/1) & merge PPP DNS + Cloudflare/Google
     for cidr in ["0.0.0.0/1", "128.0.0.0/1"] {
         let _ = Command::new("ip")
             .args(["-4", "route", "replace", cidr, "dev", &ppp_dev])
@@ -1446,7 +1484,7 @@ pub async fn connect_l2tp_linux_builtin(
             .status();
     }
 
-    apply_linux_tunnel_dns(paths, &ppp_dev, dns_servers);
+    apply_linux_tunnel_dns(paths, &ppp_dev, dns_servers, &[]);
 
     Ok(ppp_dev)
 }
@@ -1554,13 +1592,19 @@ pub async fn connect_l2tp_windows(
     }
 
     if !dns_servers.is_empty() {
-        let joined = dns_servers
+        let aid = dns_servers
             .iter()
             .map(|d| format!("'{d}'"))
             .collect::<Vec<_>>()
             .join(",");
         let dns_ps = format!(
-            "Set-DnsClientServerAddress -InterfaceAlias '{WIN_VPN_PROFILE_NAME}' -ServerAddresses @({joined}) -ErrorAction SilentlyContinue"
+            "$aid = @({aid}); \
+             $cur = @(); \
+             try {{ $cur = @(Get-DnsClientServerAddress -InterfaceAlias '{WIN_VPN_PROFILE_NAME}' -ErrorAction SilentlyContinue | ForEach-Object {{ $_.ServerAddresses }}) }} catch {{}}; \
+             $merged = @(); \
+             foreach ($x in @($cur + $aid)) {{ if ($x -and ($merged -notcontains $x)) {{ $merged += $x }} }}; \
+             if ($merged.Count -eq 0) {{ $merged = $aid }}; \
+             Set-DnsClientServerAddress -InterfaceAlias '{WIN_VPN_PROFILE_NAME}' -ServerAddresses $merged -ErrorAction SilentlyContinue"
         );
         let _ = quiet_cmd("powershell")
             .args(["-NoProfile", "-Command", &dns_ps])
@@ -1620,25 +1664,32 @@ pub async fn connect_openvpn_desktop(
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or(&profile_name);
-        let dns_csv = dns_servers.join(",");
+        let dns_v4 = dns_servers
+            .iter()
+            .filter(|d| !d.contains(':'))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut nm_args = vec![
+            "connection".into(),
+            "modify".into(),
+            stem.to_string(),
+            "connection.id".into(),
+            profile_name.clone(),
+            "connection.autoconnect".into(),
+            "no".into(),
+            "ipv6.method".into(),
+            "disabled".into(),
+            "ipv4.ignore-auto-dns".into(),
+            "no".into(),
+            "ipv4.dns-priority".into(),
+            "-50".into(),
+        ];
+        if !dns_v4.is_empty() {
+            nm_args.extend(["ipv4.dns".into(), dns_v4]);
+        }
         let _ = Command::new("nmcli")
-            .args([
-                "connection",
-                "modify",
-                stem,
-                "connection.id",
-                &profile_name,
-                "connection.autoconnect",
-                "no",
-                "ipv6.method",
-                "disabled",
-                "ipv4.dns",
-                &dns_csv,
-                "ipv4.ignore-auto-dns",
-                "yes",
-                "ipv4.dns-priority",
-                "-50",
-            ])
+            .args(&nm_args)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
@@ -1804,7 +1855,10 @@ pub async fn connect_openvpn_desktop(
                 }
             });
 
-        apply_linux_tunnel_dns(paths, &dev, dns_servers);
+        let extra = fs::read_to_string(&log_path)
+            .map(|t| parse_dhcp_option_dns(&t))
+            .unwrap_or_default();
+        apply_linux_tunnel_dns(paths, &dev, dns_servers, &extra);
         return Ok((dev, "openvpn-daemon".to_string()));
     }
 
@@ -2451,7 +2505,7 @@ pub async fn run_monitor_daemon(paths: &AppPaths) -> i32 {
             timeout_secs: state.timeout,
             engine: state.engine.clone(),
             dns_servers: if dns_vec.is_empty() {
-                vec!["1.1.1.1".to_string(), "1.0.0.1".to_string()]
+                tunnel_aid_dns()
             } else {
                 dns_vec
             },

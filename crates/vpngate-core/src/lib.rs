@@ -14,6 +14,7 @@ pub mod cooldown;
 pub mod country;
 pub mod desktop_tunnel;
 pub mod discovery;
+pub mod dns;
 pub mod doh;
 pub mod error;
 pub mod ikev1;
@@ -47,6 +48,10 @@ pub use desktop_tunnel::{
 };
 pub use discovery::{
     DiscoveryClient, DiscoveryOptions, DiscoveryOutcome, MirrorProbeResult, ProgressEvent,
+};
+pub use dns::{
+    TUNNEL_AID_DNS, merge_connection_and_aid_dns, parse_dhcp_option_dns, parse_dns_list,
+    tunnel_aid_dns, tunnel_aid_dns_cli,
 };
 pub use doh::{is_poisoned_ip, is_poisoned_ipv4, resolve_ipv4_via_cloudflare_doh};
 pub use error::{CoreError, Result};

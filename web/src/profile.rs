@@ -1,8 +1,23 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STD;
 
-use crate::parse::{parse_ipv4_octets, valid_public_ipv4};
+use crate::parse::{parse_ipv4_octets, valid_dns_addr};
 use crate::model::Server;
+
+pub const TUNNEL_AID_DNS: &[&str] = &[
+    "1.1.1.1",
+    "1.0.0.1",
+    "8.8.8.8",
+    "8.8.4.4",
+    "2606:4700:4700::1111",
+    "2606:4700:4700::1001",
+    "2001:4860:4860::8888",
+    "2001:4860:4860::8844",
+];
+
+pub fn tunnel_aid_dns() -> Vec<String> {
+    TUNNEL_AID_DNS.iter().map(|s| (*s).to_string()).collect()
+}
 
 fn xml_escape(input: &str) -> String {
     input
@@ -14,14 +29,14 @@ fn xml_escape(input: &str) -> String {
 }
 
 pub fn sanitize_dns_list(raw_dns: Option<&str>) -> Vec<String> {
-    let src = raw_dns.unwrap_or("1.1.1.1,1.0.0.1");
+    let src = raw_dns.unwrap_or("");
     let parts: Vec<String> = src
         .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
-        .filter_map(valid_public_ipv4)
-        .take(4)
+        .filter_map(valid_dns_addr)
+        .take(12)
         .collect();
     if parts.is_empty() {
-        vec!["1.1.1.1".into(), "1.0.0.1".into()]
+        tunnel_aid_dns()
     } else {
         parts
     }
@@ -212,7 +227,14 @@ pub fn patch_ovpn_text(raw_text: &str, server: &Server, opts: &OvpnOpts<'_>) -> 
     lines_out.push("hand-window 20".into());
     lines_out.push("keepalive 10 30".into());
     for dns in opts.dns_servers {
-        lines_out.push(format!("dhcp-option DNS {dns}"));
+        let line = if dns.contains(':') {
+            format!("dhcp-option DNS6 {dns}")
+        } else {
+            format!("dhcp-option DNS {dns}")
+        };
+        if !lines_out.iter().any(|l| l.eq_ignore_ascii_case(&line)) {
+            lines_out.push(line);
+        }
     }
     if opts.windows_driver == "tap-windows6" || opts.windows_driver == "wintun" {
         lines_out.push(format!("windows-driver {}", opts.windows_driver));
