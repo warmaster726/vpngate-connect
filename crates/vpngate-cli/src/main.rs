@@ -25,6 +25,7 @@ use commands::{
 use term_ui::{err, init_console, print_line, prompt_input, set_dynamic_resize, set_screen_clear};
 use vpngate_core::{
     AppPaths, PRODUCT_VERSION, ProtocolFilter, SortBy, assert_supported_native_host,
+    tunnel_aid_dns_cli,
     run_ikev1_daemon, run_monitor_daemon,
 };
 
@@ -55,7 +56,8 @@ fn build_help_text() -> String {
            -n, --limit <N>       Max servers to list or try (0 = all)\n\
            -t, --timeout <SEC>   Per-attempt tunnel timeout in seconds (default: 22)\n\
            -e, --engine <ENG>    auto | nm | daemon\n\
-               --dns <IPS>       Locked tunnel DNS servers (default: '1.1.1.1 1.0.0.1')\n\
+               --dns <IPS>       Extra tunnel DNS, merged with connection-pushed resolvers\n\
+                                 (default: Cloudflare+Google IPv4/IPv6)\n\
                --start <N>       1-based server index in sorted list to start connecting from\n\
            -M, --mirrors         Discover & live-probe Official VPNGate Mirror Sites\n\
                --mirror <URL>    Add/use an Official VPNGate Mirror URL (e.g. http://host:port/en/)\n\
@@ -242,7 +244,7 @@ async fn dispatch_commands(paths: &AppPaths, raw_args: &[String]) -> io::Result<
     let mut limit: Option<usize> = None;
     let mut timeout_secs: u64 = 22;
     let mut engine = "auto".to_string();
-    let mut dns = "1.1.1.1 1.0.0.1".to_string();
+    let mut dns = tunnel_aid_dns_cli();
     let mut start_index: usize = 1;
     let mut force_refresh = false;
     let mut auto_reconnect_override: Option<bool> = None;

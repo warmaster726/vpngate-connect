@@ -4,6 +4,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STD;
 use regex::Regex;
 
+use crate::dns::{ovpn_dhcp_option_line, tunnel_aid_dns};
 use crate::error::{CoreError, Result};
 use crate::protocol::{OpenVpnCompat, TargetPlatform, VpnProtocol, WindowsOvpnDriver};
 use crate::server::VpnServer;
@@ -25,7 +26,7 @@ impl Default for OvpnPatchOptions {
             compat: OpenVpnCompat::OpenVpn26,
             transport: VpnProtocol::OpenVpnUdp,
             windows_driver: WindowsOvpnDriver::TapWindows6,
-            dns_servers: vec!["1.1.1.1".to_string(), "1.0.0.1".to_string()],
+            dns_servers: tunnel_aid_dns(),
         }
     }
 }
@@ -135,8 +136,13 @@ pub fn patch_ovpn_text(raw_text: &str, server: &VpnServer, opts: &OvpnPatchOptio
     lines_out.push("hand-window 20".to_string());
     lines_out.push("keepalive 10 30".to_string());
 
+    // Keep any vendor `dhcp-option DNS` from the volunteer config (connection DNS),
+    // then append Cloudflare + Google (or `--dns`) as extra resolvers.
     for dns in &opts.dns_servers {
-        lines_out.push(format!("dhcp-option DNS {dns}"));
+        let line = ovpn_dhcp_option_line(dns);
+        if !lines_out.iter().any(|l| l.eq_ignore_ascii_case(&line)) {
+            lines_out.push(line);
+        }
     }
 
     if opts.platform == TargetPlatform::Windows {
@@ -186,6 +192,11 @@ pub fn build_apple_l2tp_mobileconfig(server: &VpnServer) -> String {
     let payload_uuid = format!("56504e47-4154-4500-8001-0000{suffix}");
     let root_uuid = format!("56504e47-4154-4500-8000-0000{suffix}");
     let shared_secret_b64 = BASE64_STD.encode(b"vpn");
+    let dns_xml: String = tunnel_aid_dns()
+        .iter()
+        .map(|d| format!("                    <string>{}</string>", xml_escape(d)))
+        .collect::<Vec<_>>()
+        .join("\n");
 
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -199,8 +210,7 @@ pub fn build_apple_l2tp_mobileconfig(server: &VpnServer) -> String {
             <dict>
                 <key>ServerAddresses</key>
                 <array>
-                    <string>1.1.1.1</string>
-                    <string>1.0.0.1</string>
+{dns_xml}
                 </array>
             </dict>
             <key>IPSec</key>
@@ -301,6 +311,8 @@ mod tests {
         assert!(!patched.contains("auth-user-pass"));
         assert!(patched.contains("disable-dco"));
         assert!(patched.contains("dhcp-option DNS 1.1.1.1"));
+        assert!(patched.contains("dhcp-option DNS 8.8.8.8"));
+        assert!(patched.contains("dhcp-option DNS6 2606:4700:4700::1111"));
     }
 
     #[test]
@@ -310,5 +322,7 @@ mod tests {
         assert!(xml.contains("<string>com.apple.vpn.managed</string>"));
         assert!(xml.contains("<string>219.100.37.10</string>"));
         assert!(xml.contains("<string>1.1.1.1</string>"));
+        assert!(xml.contains("<string>8.8.8.8</string>"));
+        assert!(xml.contains("<string>2001:4860:4860::8888</string>"));
     }
 }

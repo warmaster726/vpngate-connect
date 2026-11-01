@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::IpAddr;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STD;
@@ -69,6 +70,15 @@ pub fn valid_public_ipv4(raw: &str) -> Option<String> {
         return None;
     }
     Some(format!("{}.{}.{}.{}", o[0], o[1], o[2], o[3]))
+}
+
+pub fn valid_dns_addr(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    let ip: IpAddr = t.parse().ok()?;
+    if ip.is_unspecified() || ip.is_multicast() || ip.is_loopback() {
+        return None;
+    }
+    Some(t.to_string())
 }
 
 fn strip_tags(raw: &str) -> String {
