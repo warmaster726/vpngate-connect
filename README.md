@@ -26,7 +26,7 @@ Censorship-resilient **SoftEther VPN Gate** desktop client engineered around a *
 
 | Branch | Status | Description |
 | :--- | :--- | :--- |
-| **`main`** | **Active (Default)** | Public **0.3.x** Pure-Rust 64-bit Desktop Edition (`vpngate-core`, `vpngate-cli`, Linux/macOS & Windows 11 installers, GNOME GTK/VTE launcher). Version on `main` ticks when `develop` is merged. |
+| **`main`** | **Active (Default)** | Public **0.4.x** Pure-Rust 64-bit Desktop Edition (`vpngate-core`, `vpngate-cli`, Linux/macOS & Windows 11 installers, GNOME GTK/VTE launcher). Version on `main` ticks when `develop` is merged. |
 | **`develop`** | **Active (integration)** | Ongoing desktop work. Merge into `main` when you want a public version bump, so `main` does not increment on every change. |
 
 ---
