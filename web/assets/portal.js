@@ -220,6 +220,37 @@
     });
   }
 
+  function normalizeCountryCode(code) {
+    var up = String(code || "").toUpperCase();
+    if (up === "UK") return "GB";
+    return up;
+  }
+
+  function setCountrySelection(codes) {
+    var out = [];
+    var seen = {};
+    for (var i = 0; i < codes.length; i++) {
+      var up = normalizeCountryCode(codes[i]);
+      if (!up || up === "ALL" || seen[up]) continue;
+      seen[up] = true;
+      out.push(up);
+    }
+    state.country = out.length ? out.join(",") : "ALL";
+  }
+
+  function toggleCountryCode(code) {
+    if (!code || code === "ALL") {
+      state.country = "ALL";
+      return;
+    }
+    var cur = selectedCountryCodes(state.country);
+    var up = normalizeCountryCode(code);
+    var idx = cur.indexOf(up);
+    if (idx >= 0) cur.splice(idx, 1);
+    else cur.push(up);
+    setCountrySelection(cur);
+  }
+
   function matchCountryToken(srv, token) {
     var q = (token || "").trim();
     if (isAllCountryToken(q)) return true;
@@ -557,34 +588,42 @@
   function renderCountryControls() {
     var sel = document.getElementById("connect-country");
     var pills = document.getElementById("quick-country-pills");
+    var selectedRow = document.getElementById("selected-country-chips");
+    var allPills = document.getElementById("all-country-pills");
     if (!sel || !pills) return;
 
     var codes = selectedCountryCodes(state.country);
-    var multi = codes.length > 1;
-    var opts = "";
-    if (multi) {
-      opts += '<option value="' + esc(codes.join(",")) + '" selected>Several: ' +
-        esc(codes.join(", ")) + "</option>";
-    }
-    opts += '<option value="ALL"' + (!codes.length ? " selected" : "") +
-      ">🌐 All Countries (" + state.counts.total + " relays)</option>";
+    var opts = '<option value="">Add a country…</option>' +
+      '<option value="ALL">🌐 All countries (' + state.counts.total + " relays)</option>";
     for (var i = 0; i < state.countries.length; i++) {
       var c = state.countries[i];
-      var selected = !multi && codes.length === 1 && codes[0] === c.country_short ? " selected" : "";
-      opts += '<option value="' + esc(c.country_short) + '"' + selected + ">" +
+      opts += '<option value="' + esc(c.country_short) + '">' +
         flagEmoji(c.country_short) + " " + esc(c.country_long) + " (" + esc(c.country_short) + ") — " +
         c.total_servers + " (" + c.l2tp_count + " L2TP)</option>";
     }
     sel.innerHTML = opts;
-    if (!multi && codes.length === 1) sel.value = codes[0];
-    else if (!codes.length) sel.value = "ALL";
+    sel.value = "";
+
+    if (selectedRow) {
+      if (!codes.length) {
+        selectedRow.innerHTML = '<span class="chip active">🌐 ALL countries</span>';
+      } else {
+        var selHtml = "";
+        for (var r = 0; r < codes.length; r++) {
+          var cc = codes[r];
+          selHtml += '<button type="button" class="chip active" data-cc="' + esc(cc) + '" title="Remove ' + esc(cc) + '">' +
+            flagEmoji(cc) + " " + esc(cc) + '<span class="chip-x" aria-hidden="true">×</span></button>';
+        }
+        selectedRow.innerHTML = selHtml;
+      }
+    }
 
     var topCodes = ["ALL"];
     var seen = { ALL: true };
     for (var s = 0; s < codes.length; s++) {
       if (!seen[codes[s]]) { topCodes.push(codes[s]); seen[codes[s]] = true; }
     }
-    for (var j = 0; j < Math.min(6, state.countries.length); j++) {
+    for (var j = 0; j < Math.min(8, state.countries.length); j++) {
       var sc = state.countries[j].country_short;
       if (!seen[sc]) { topCodes.push(sc); seen[sc] = true; }
     }
@@ -596,6 +635,17 @@
       pillHtml += '<button type="button" class="chip' + act + '" data-cc="' + esc(code) + '">' + lbl + "</button>";
     }
     pills.innerHTML = pillHtml;
+
+    if (allPills) {
+      var allHtml = "";
+      for (var a = 0; a < state.countries.length; a++) {
+        var ac = state.countries[a];
+        var aact = codes.indexOf(ac.country_short) !== -1 ? " active" : "";
+        allHtml += '<button type="button" class="chip' + aact + '" data-cc="' + esc(ac.country_short) + '">' +
+          flagEmoji(ac.country_short) + " " + esc(ac.country_short) + "</button>";
+      }
+      allPills.innerHTML = allHtml;
+    }
   }
 
   function getConnectCandidates() {
@@ -705,7 +755,7 @@
     var candidates = getConnectCandidates();
     if (candidates.length === 0) {
       wrap.innerHTML = '<div class="card"><div class="card-title">No matching relays</div>' +
-        '<div class="card-subtitle">Switch country to ALL, protocol to Auto, or refresh the pool.</div></div>';
+        '<div class="card-subtitle">Clear countries to ALL, switch protocol to Auto, or refresh the pool.</div></div>';
       return;
     }
 
@@ -1485,27 +1535,29 @@
     });
 
     document.getElementById("connect-country").addEventListener("change", function (e) {
-      state.country = e.target.value;
-      onFilterChange();
-    });
-
-    document.getElementById("quick-country-pills").addEventListener("click", function (e) {
-      var btn = e.target.closest("[data-cc]");
-      if (!btn) return;
-      var code = btn.getAttribute("data-cc");
-      if (!code || code === "ALL") {
-        state.country = "ALL";
-      } else {
+      var val = e.target.value;
+      if (!val) return;
+      if (val === "ALL") state.country = "ALL";
+      else {
         var cur = selectedCountryCodes(state.country);
-        var up = code.toUpperCase();
-        if (up === "UK") up = "GB";
-        var idx = cur.indexOf(up);
-        if (idx >= 0) cur.splice(idx, 1);
-        else cur.push(up);
-        state.country = cur.length ? cur.join(",") : "ALL";
+        var up = normalizeCountryCode(val);
+        if (cur.indexOf(up) < 0) cur.push(up);
+        setCountrySelection(cur);
       }
       onFilterChange();
     });
+
+    function onCountryChipClick(e) {
+      var btn = e.target.closest("[data-cc]");
+      if (!btn) return;
+      toggleCountryCode(btn.getAttribute("data-cc"));
+      onFilterChange();
+    }
+    document.getElementById("quick-country-pills").addEventListener("click", onCountryChipClick);
+    var selectedRowEl = document.getElementById("selected-country-chips");
+    if (selectedRowEl) selectedRowEl.addEventListener("click", onCountryChipClick);
+    var allPillsEl = document.getElementById("all-country-pills");
+    if (allPillsEl) allPillsEl.addEventListener("click", onCountryChipClick);
 
     document.getElementById("connect-proto").addEventListener("change", function (e) {
       state.proto = e.target.value;

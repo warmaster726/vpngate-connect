@@ -512,17 +512,7 @@ pub fn decorate_servers(servers: &[Server]) -> Vec<Server> {
 }
 
 fn match_country(srv: &Server, query: &str) -> bool {
-    if query.is_empty() || query.eq_ignore_ascii_case("ALL") || query.eq_ignore_ascii_case("any") {
-        return true;
-    }
-    let q = query.trim();
-    let up = q.to_ascii_uppercase();
-    if q.len() == 2 && q.chars().all(|c| c.is_ascii_alphabetic()) {
-        let iso = if up == "UK" { "GB" } else { up.as_str() };
-        return srv.country_short.eq_ignore_ascii_case(iso);
-    }
-    let low = q.to_ascii_lowercase();
-    srv.country_short.eq_ignore_ascii_case(&up) || srv.country_long.to_ascii_lowercase().contains(&low)
+    crate::country::match_country_fields(&srv.country_short, &srv.country_long, query)
 }
 
 fn match_proto(srv: &Server, proto: &str) -> bool {
