@@ -16,4 +16,16 @@ mod tests {
             "portal.js still contains a Worker template placeholder; the console would stay on BOOTING"
         );
     }
+
+    #[test]
+    fn portal_lets_users_add_several_countries() {
+        let html = include_str!("../assets/portal.html.in");
+        let js = include_str!("../assets/portal.js");
+        assert!(html.contains("id=\"selected-country-chips\""));
+        assert!(html.contains("id=\"all-country-pills\""));
+        assert!(html.contains("Add a country"));
+        assert!(js.contains("function toggleCountryCode"));
+        assert!(js.contains("function setCountrySelection"));
+        assert!(js.contains("Add a country"));
+    }
 }

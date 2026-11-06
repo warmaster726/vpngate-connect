@@ -174,3 +174,79 @@ pub fn normalize_country_pair(raw_long: &str, raw_short: &str) -> (String, Strin
         },
     )
 }
+
+pub fn is_all_country_token(token: &str) -> bool {
+    matches!(
+        token.to_ascii_lowercase().as_str(),
+        "all" | "any" | "*" | "worldwide"
+    )
+}
+
+/// Splits `JP,KR` / `JP KR` (ISO codes) while leaving `United States` as one name.
+pub fn split_country_query(raw: &str) -> Vec<String> {
+    let q = raw.trim();
+    if q.is_empty() {
+        return Vec::new();
+    }
+    let mut parts: Vec<String> = q
+        .split(|c: char| c == ',' || c == ';' || c == '/')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parts.len() == 1 {
+        let ws: Vec<&str> = parts[0].split_whitespace().collect();
+        if ws.len() > 1
+            && ws.iter().all(|t| {
+                is_all_country_token(t) || (t.len() == 2 && t.chars().all(|c| c.is_ascii_alphabetic()))
+            })
+        {
+            parts = ws.iter().map(|s| (*s).to_string()).collect();
+        }
+    }
+    parts
+}
+
+fn country_token_matches(country_short: &str, country_long: &str, token: &str) -> bool {
+    let q = token.trim();
+    if q.is_empty() || is_all_country_token(q) {
+        return true;
+    }
+    let up = q.to_ascii_uppercase();
+    if q.len() == 2 && q.chars().all(|c| c.is_ascii_alphabetic()) {
+        let iso = if up == "UK" { "GB" } else { up.as_str() };
+        return country_short.eq_ignore_ascii_case(iso);
+    }
+    let low = q.to_ascii_lowercase();
+    country_short.eq_ignore_ascii_case(&up) || country_long.to_ascii_lowercase().contains(&low)
+}
+
+/// Union filter matching desktop `filter_by_country`. `all` is worldwide.
+pub fn match_country_fields(country_short: &str, country_long: &str, query: &str) -> bool {
+    if query.is_empty() || is_all_country_token(query.trim()) {
+        return true;
+    }
+    let parts = split_country_query(query);
+    if parts.is_empty() || parts.iter().any(|t| is_all_country_token(t)) {
+        return true;
+    }
+    parts
+        .iter()
+        .any(|t| country_token_matches(country_short, country_long, t))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn match_country_unions_iso_list() {
+        assert!(match_country_fields("JP", "Japan", "JP,KR"));
+        assert!(match_country_fields("KR", "Korea", "JP KR"));
+        assert!(!match_country_fields("US", "United States", "JP,KR"));
+        assert!(match_country_fields("US", "United States", "ALL"));
+        assert!(match_country_fields("JP", "Japan", "UK,JP"));
+        assert!(match_country_fields("GB", "United Kingdom", "UK"));
+        assert!(match_country_fields("US", "United States", "United"));
+        assert!(!match_country_fields("AU", "Australia", "US"));
+    }
+}

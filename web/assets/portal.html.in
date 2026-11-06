@@ -54,8 +54,12 @@
         </div>
         <div class="grid-2">
           <div>
-            <label class="field-label" for="connect-country">Target country (chips: several)</label>
-            <select id="connect-country"><option value="ALL">Loading countries...</option></select>
+            <label class="field-label" for="connect-country">Target countries</label>
+            <div class="pill-row" id="selected-country-chips" aria-live="polite"></div>
+            <select id="connect-country" aria-label="Add a country">
+              <option value="">Add a country…</option>
+              <option value="ALL">🌐 All countries</option>
+            </select>
           </div>
           <div>
             <label class="field-label" for="connect-proto">Protocol priority</label>
@@ -69,6 +73,10 @@
           </div>
         </div>
         <div class="pill-row scroll" id="quick-country-pills"></div>
+        <details class="adv" id="all-countries-wrap">
+          <summary>All countries — tap several</summary>
+          <div class="pill-row wrap" id="all-country-pills" style="margin-top:10px"></div>
+        </details>
         <label class="field-label" style="margin-top:10px">Server priority</label>
         <div class="pill-row scroll" id="connect-sort-pills" style="margin-top:4px">
           <button type="button" class="chip active" data-csort="recommended">Score</button>
@@ -145,7 +153,7 @@
             <div class="card-subtitle" id="relays-meta">Loading relays...</div>
           </div>
         </div>
-        <input type="text" id="relay-search" placeholder="Filter by ISO (JP, KR, US) or country / hostname / IP" autocomplete="off" spellcheck="false">
+        <input type="text" id="relay-search" placeholder="JP,KR or country / hostname / IP" autocomplete="off" spellcheck="false">
         <div class="pill-row scroll" id="relay-proto-pills">
           <button type="button" class="chip active" data-rproto="all">All protocols</button>
           <button type="button" class="chip" data-rproto="l2tp">L2TP/IPsec</button>
