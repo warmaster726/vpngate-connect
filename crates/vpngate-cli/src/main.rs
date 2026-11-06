@@ -36,7 +36,7 @@ fn build_help_text() -> String {
            vpngate                              Launch Interactive Console Dashboard [0-9]\n\
            vpngate countries [-p PROTO] [-r]    List available countries & protocol counts\n\
            vpngate list [-c CC] [-p PROTO] [-s SORT] [-n LIMIT] [-r]\n\
-           vpngate connect -c <CC|all> [-p PROTO] [-s SORT] [-n LIMIT] [--start N] [-a]\n\
+           vpngate connect -c <CC[,CC]|all> [-p PROTO] [-s SORT] [-n LIMIT] [--start N] [-a]\n\
            vpngate mirrors [--mirror URL]       Discover & live-probe Official VPNGate Mirror Sites\n\
            vpngate status                       Show active tunnel, XFRM SA, watchdog & egress IP\n\
            vpngate refresh                      Clear 30m server cooldowns & force live pool update\n\
@@ -50,7 +50,7 @@ fn build_help_text() -> String {
            -i, --interactive     Launch Interactive Console Dashboard\n\
            -L, --list-countries  Show unified countries & regions table\n\
            -l, --list            List matching relay servers\n\
-           -c, --country <CC>    Target country code/name (e.g. JP, KR, US, TW, all)\n\
+           -c, --country <CC>    Country code(s) or name (JP, JP,KR, repeat -c, all)\n\
            -p, --proto <PROTO>   auto (default) | l2tp | openvpn-udp | openvpn-tcp | openvpn\n\
            -s, --sort <SORT>     score (default) | speed | ping\n\
            -n, --limit <N>       Max servers to list or try (0 = all)\n\
@@ -287,7 +287,13 @@ async fn dispatch_commands(paths: &AppPaths, raw_args: &[String]) -> io::Result<
             "-c" | "--country" => {
                 i += 1;
                 if let Some(v) = raw_args.get(i) {
-                    country = Some(v.clone());
+                    match country.as_mut() {
+                        Some(existing) => {
+                            existing.push(',');
+                            existing.push_str(v);
+                        }
+                        None => country = Some(v.clone()),
+                    }
                 }
             }
             "-p" | "--proto" => {

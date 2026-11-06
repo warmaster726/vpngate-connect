@@ -65,7 +65,9 @@ pub use profile::{OvpnPatchOptions, build_apple_l2tp_mobileconfig, build_patched
 pub use protocol::{
     OpenVpnCompat, ProtocolFilter, SortBy, TargetPlatform, VpnProtocol, WindowsOvpnDriver,
 };
-pub use server::{VpnServer, filter_by_country, filter_by_protocol, sort_servers};
+pub use server::{
+    VpnServer, filter_by_country, filter_by_protocol, sort_servers, split_country_query,
+};
 pub use update::{
     DesktopVersion, RemoteDesktopVersion, UpdateCheckCache, PRODUCT_VERSION, cache_is_fresh,
     cached_newer_than_installed, cached_remote_version, cargo_toml_check_urls,
