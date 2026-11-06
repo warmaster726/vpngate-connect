@@ -54,12 +54,16 @@
         </div>
         <div class="grid-2">
           <div>
-            <label class="field-label" for="connect-country">Target countries</label>
+            <label class="field-label" id="connect-country-label" for="connect-country">Target countries</label>
             <div class="pill-row" id="selected-country-chips" aria-live="polite"></div>
-            <select id="connect-country" aria-label="Add a country">
-              <option value="">Add a country…</option>
-              <option value="ALL">🌐 All countries</option>
-            </select>
+            <div class="msel" id="connect-country-msel">
+              <button type="button" class="msel-toggle" id="connect-country" aria-labelledby="connect-country-label" aria-haspopup="listbox" aria-expanded="false" aria-controls="connect-country-list">All countries</button>
+              <div class="msel-panel" id="connect-country-panel" hidden>
+                <div class="msel-hint">Tap several — the list stays open</div>
+                <input type="search" class="msel-filter" id="connect-country-filter" placeholder="Filter countries" autocomplete="off" spellcheck="false">
+                <div class="msel-list" id="connect-country-list" role="listbox" aria-multiselectable="true" aria-labelledby="connect-country-label"></div>
+              </div>
+            </div>
           </div>
           <div>
             <label class="field-label" for="connect-proto">Protocol priority</label>

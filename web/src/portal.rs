@@ -23,9 +23,10 @@ mod tests {
         let js = include_str!("../assets/portal.js");
         assert!(html.contains("id=\"selected-country-chips\""));
         assert!(html.contains("id=\"all-country-pills\""));
-        assert!(html.contains("Add a country"));
+        assert!(html.contains("aria-multiselectable=\"true\""));
+        assert!(html.contains("id=\"connect-country-list\""));
         assert!(js.contains("function toggleCountryCode"));
-        assert!(js.contains("function setCountrySelection"));
-        assert!(js.contains("Add a country"));
+        assert!(js.contains("function setCountryMenuOpen"));
+        assert!(js.contains("function rebuildCountryList"));
     }
 }

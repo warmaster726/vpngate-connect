@@ -91,21 +91,66 @@ label.field-label {
   display: block; font-size: 11px; font-weight: 700; color: var(--muted);
   text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 6px; font-family: var(--mono);
 }
-select, input[type="text"] {
+select, input[type="text"], input[type="search"] {
   width: 100%; background: var(--console); color: var(--text);
   border: 1px solid var(--border); border-radius: 11px;
   padding: 11px 12px; font-size: 16px; font-family: var(--sans); outline: none;
   min-height: 44px;
 }
-select {
+select, .msel-toggle {
   appearance: none; -webkit-appearance: none;
   background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'><path fill='%238FA3BB' d='M1.2 1.2L6 6l4.8-4.8'/></svg>");
   background-repeat: no-repeat; background-position: right 12px center; padding-right: 34px;
 }
-select:focus, input[type="text"]:focus { border-color: var(--cyan); box-shadow: 0 0 0 3px rgba(56,189,248,0.15); }
+select:focus, input[type="text"]:focus, input[type="search"]:focus, .msel-toggle:focus {
+  border-color: var(--cyan); box-shadow: 0 0 0 3px rgba(56,189,248,0.15);
+}
 button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible {
   outline: 2px solid var(--cyan); outline-offset: 2px;
 }
+
+.msel { position: relative; }
+.msel.open { z-index: 25; }
+.msel-toggle {
+  display: block; width: 100%; text-align: left;
+  background-color: var(--console); color: var(--text);
+  border: 1px solid var(--border); border-radius: 11px;
+  padding: 11px 34px 11px 12px; font-size: 16px; font-family: var(--sans);
+  min-height: 44px; cursor: pointer;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.msel.open .msel-toggle { border-color: var(--cyan); }
+.msel-panel {
+  position: absolute; left: 0; right: 0; top: calc(100% + 6px);
+  background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+  box-shadow: var(--shadow); padding: 8px; display: flex; flex-direction: column;
+  max-height: min(360px, 62vh);
+}
+.msel-panel[hidden] { display: none; }
+.msel-hint {
+  font-family: var(--mono); font-size: 11px; font-weight: 700; color: var(--muted);
+  padding: 2px 6px 8px;
+}
+.msel-filter { min-height: 40px; font-size: 16px; margin-bottom: 6px; }
+.msel-list { overflow-y: auto; -webkit-overflow-scrolling: touch; flex: 1 1 auto; }
+.msel-opt {
+  display: flex; align-items: center; gap: 10px; width: 100%;
+  background: transparent; border: 0; border-radius: 9px;
+  color: var(--text); text-align: left; cursor: pointer;
+  padding: 9px 10px; min-height: 42px; font-size: 14px; font-family: var(--sans);
+}
+.msel-opt:hover { background: var(--card-alt); }
+.msel-opt[aria-selected="true"] { background: var(--cyan-dim); color: var(--cyan); }
+.msel-check {
+  width: 18px; height: 18px; flex-shrink: 0; border-radius: 4px;
+  border: 1px solid var(--border); background: var(--console);
+  display: grid; place-items: center; font-size: 12px; font-weight: 800; color: #072033;
+}
+.msel-opt[aria-selected="true"] .msel-check {
+  background: var(--cyan); border-color: var(--cyan);
+}
+.msel-opt-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.msel-empty { padding: 12px 8px; color: var(--muted); font-size: 13px; }
 
 .pill-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 .pill-row.wrap { flex-wrap: wrap; max-height: 220px; overflow-y: auto; }

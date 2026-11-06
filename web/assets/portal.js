@@ -4,6 +4,7 @@
 
   var verifyGen = 0;
   var walkAbort = null;
+  var countryMenuDirty = false;
   var state = {
     tab: "connect",
     servers: [],
@@ -249,6 +250,95 @@
     if (idx >= 0) cur.splice(idx, 1);
     else cur.push(up);
     setCountrySelection(cur);
+  }
+
+  function countryMenuIsOpen() {
+    var panel = document.getElementById("connect-country-panel");
+    return !!(panel && !panel.hidden);
+  }
+
+  function countryToggleLabel(codes) {
+    if (!codes.length) return "All countries (" + state.counts.total + " relays)";
+    if (codes.length <= 4) {
+      return codes.map(function (c) { return flagEmoji(c) + " " + c; }).join(" · ");
+    }
+    return codes.length + " countries · " + codes.slice(0, 3).join(", ") + "…";
+  }
+
+  function countryOptionHtml(code, labelHtml, selected) {
+    return '<button type="button" class="msel-opt" role="option" data-cc="' + esc(code) +
+      '" aria-selected="' + (selected ? "true" : "false") + '">' +
+      '<span class="msel-check" aria-hidden="true">' + (selected ? "✓" : "") + "</span>" +
+      '<span class="msel-opt-label">' + labelHtml + "</span></button>";
+  }
+
+  function applyCountryMenuFilter() {
+    var input = document.getElementById("connect-country-filter");
+    var list = document.getElementById("connect-country-list");
+    if (!list) return;
+    var q = input ? input.value.trim().toLowerCase() : "";
+    var opts = list.querySelectorAll(".msel-opt");
+    var shown = 0;
+    for (var i = 0; i < opts.length; i++) {
+      var cc = (opts[i].getAttribute("data-cc") || "");
+      var text = (opts[i].textContent || "").toLowerCase();
+      var show = !q || cc === "ALL" || text.indexOf(q) !== -1 || cc.toLowerCase().indexOf(q) !== -1;
+      opts[i].hidden = !show;
+      if (show) shown++;
+    }
+    var empty = document.getElementById("connect-country-empty");
+    if (empty) empty.hidden = shown > 0;
+  }
+
+  function syncCountryOptionState() {
+    var list = document.getElementById("connect-country-list");
+    if (!list) return;
+    var codes = selectedCountryCodes(state.country);
+    var opts = list.querySelectorAll(".msel-opt");
+    for (var i = 0; i < opts.length; i++) {
+      var cc = opts[i].getAttribute("data-cc");
+      var on = (cc === "ALL" && !codes.length) || (cc !== "ALL" && codes.indexOf(cc) !== -1);
+      opts[i].setAttribute("aria-selected", on ? "true" : "false");
+      var check = opts[i].querySelector(".msel-check");
+      if (check) check.textContent = on ? "✓" : "";
+    }
+  }
+
+  function rebuildCountryList() {
+    var list = document.getElementById("connect-country-list");
+    if (!list) return;
+    var codes = selectedCountryCodes(state.country);
+    var html = countryOptionHtml("ALL", "🌐 All countries (" + state.counts.total + " relays)", !codes.length);
+    for (var i = 0; i < state.countries.length; i++) {
+      var c = state.countries[i];
+      var label = flagEmoji(c.country_short) + " " + esc(c.country_long) + " (" + esc(c.country_short) + ") — " +
+        c.total_servers + " (" + c.l2tp_count + " L2TP)";
+      html += countryOptionHtml(c.country_short, label, codes.indexOf(c.country_short) !== -1);
+    }
+    html += '<div class="msel-empty" id="connect-country-empty" hidden>No countries match</div>';
+    list.innerHTML = html;
+    list.setAttribute("data-n", String(state.countries.length));
+    applyCountryMenuFilter();
+  }
+
+  function setCountryMenuOpen(open) {
+    var panel = document.getElementById("connect-country-panel");
+    var btn = document.getElementById("connect-country");
+    var wrap = document.getElementById("connect-country-msel");
+    if (!panel || !btn) return;
+    var was = !panel.hidden;
+    panel.hidden = !open;
+    btn.setAttribute("aria-expanded", open ? "true" : "false");
+    if (wrap) wrap.classList.toggle("open", !!open);
+    if (open) {
+      var filter = document.getElementById("connect-country-filter");
+      if (filter) {
+        try { filter.focus(); } catch (err) {}
+      }
+    } else if (was && countryMenuDirty) {
+      countryMenuDirty = false;
+      runRecursiveVerify({});
+    }
   }
 
   function matchCountryToken(srv, token) {
@@ -586,23 +676,18 @@
   }
 
   function renderCountryControls() {
-    var sel = document.getElementById("connect-country");
+    var toggle = document.getElementById("connect-country");
     var pills = document.getElementById("quick-country-pills");
     var selectedRow = document.getElementById("selected-country-chips");
     var allPills = document.getElementById("all-country-pills");
-    if (!sel || !pills) return;
+    var list = document.getElementById("connect-country-list");
+    if (!toggle || !pills) return;
 
     var codes = selectedCountryCodes(state.country);
-    var opts = '<option value="">Add a country…</option>' +
-      '<option value="ALL">🌐 All countries (' + state.counts.total + " relays)</option>";
-    for (var i = 0; i < state.countries.length; i++) {
-      var c = state.countries[i];
-      opts += '<option value="' + esc(c.country_short) + '">' +
-        flagEmoji(c.country_short) + " " + esc(c.country_long) + " (" + esc(c.country_short) + ") — " +
-        c.total_servers + " (" + c.l2tp_count + " L2TP)</option>";
-    }
-    sel.innerHTML = opts;
-    sel.value = "";
+    toggle.textContent = countryToggleLabel(codes);
+
+    if (list && list.getAttribute("data-n") !== String(state.countries.length)) rebuildCountryList();
+    else syncCountryOptionState();
 
     if (selectedRow) {
       if (!codes.length) {
@@ -1504,7 +1589,8 @@
     state.verified = null;
     renderCountryControls();
     renderConnectHero();
-    runRecursiveVerify({});
+    if (countryMenuIsOpen()) countryMenuDirty = true;
+    else runRecursiveVerify({});
   }
 
   function onSortChange() {
@@ -1534,17 +1620,27 @@
       loadPool(true, state.customMirror);
     });
 
-    document.getElementById("connect-country").addEventListener("change", function (e) {
-      var val = e.target.value;
-      if (!val) return;
-      if (val === "ALL") state.country = "ALL";
-      else {
-        var cur = selectedCountryCodes(state.country);
-        var up = normalizeCountryCode(val);
-        if (cur.indexOf(up) < 0) cur.push(up);
-        setCountrySelection(cur);
-      }
-      onFilterChange();
+    document.getElementById("connect-country").addEventListener("click", function (e) {
+      e.preventDefault();
+      setCountryMenuOpen(!countryMenuIsOpen());
+    });
+    var countryFilter = document.getElementById("connect-country-filter");
+    if (countryFilter) {
+      countryFilter.addEventListener("input", applyCountryMenuFilter);
+      countryFilter.addEventListener("keydown", function (e) {
+        if (e.key === "Escape") {
+          e.preventDefault();
+          setCountryMenuOpen(false);
+        }
+      });
+    }
+    document.addEventListener("click", function (e) {
+      var wrap = document.getElementById("connect-country-msel");
+      if (!wrap || !countryMenuIsOpen()) return;
+      if (!wrap.contains(e.target)) setCountryMenuOpen(false);
+    });
+    document.addEventListener("keydown", function (e) {
+      if (e.key === "Escape" && countryMenuIsOpen()) setCountryMenuOpen(false);
     });
 
     function onCountryChipClick(e) {
@@ -1558,6 +1654,8 @@
     if (selectedRowEl) selectedRowEl.addEventListener("click", onCountryChipClick);
     var allPillsEl = document.getElementById("all-country-pills");
     if (allPillsEl) allPillsEl.addEventListener("click", onCountryChipClick);
+    var countryListEl = document.getElementById("connect-country-list");
+    if (countryListEl) countryListEl.addEventListener("click", onCountryChipClick);
 
     document.getElementById("connect-proto").addEventListener("change", function (e) {
       state.proto = e.target.value;
