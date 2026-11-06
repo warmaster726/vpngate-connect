@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal};
@@ -642,7 +642,7 @@ pub struct ConnectArgs {
 pub async fn cmd_connect(paths: &AppPaths, args: &ConnectArgs) -> io::Result<i32> {
     if args.country.trim().is_empty() {
         err(
-            "Please specify a target country/region with -c / --country (e.g. -c JP, -c KR, -c all).",
+            "Please specify a target country/region with -c / --country (e.g. -c JP, -c JP,KR, -c all).",
         );
         return Ok(1);
     }
@@ -1560,10 +1560,13 @@ fn prompt_country(servers: &[VpnServer], proto: ProtocolFilter) -> io::Result<Op
     print_line(&format!(
         "  {CYAN}[A]{RESET} All Regions / Best Available Worldwide"
     ));
+    print_line(&format!(
+        "  Several: {CYAN}1,4,7{RESET} or {CYAN}JP KR{RESET}  (union, same sort order)"
+    ));
     print_line(&format!("  {CYAN}[0]{RESET} Cancel / Back to Main Menu"));
     loop {
         let Some(ans) = prompt_input(&format!(
-            "\nSelect region by {BOLD}Number (1-{}){RESET}, {BOLD}Country Code (e.g. JP){RESET}, {BOLD}A (All){RESET}, or {BOLD}0 (Back){RESET}: ",
+            "\nSelect region by {BOLD}Number (1-{}){RESET}, {BOLD}code(s) (JP or JP,KR){RESET}, {BOLD}A (All){RESET}, or {BOLD}0 (Back){RESET}: ",
             rows.len()
         )) else {
             return Ok(None);
@@ -1571,23 +1574,83 @@ fn prompt_country(servers: &[VpnServer], proto: ProtocolFilter) -> io::Result<Op
         if ans.is_empty() || matches!(ans.to_ascii_lowercase().as_str(), "0" | "q" | "back") {
             return Ok(None);
         }
-        if matches!(ans.to_ascii_lowercase().as_str(), "a" | "all" | "*") {
-            return Ok(Some("all".to_string()));
+        match interpret_country_selection(&ans, &rows, &filtered) {
+            Some(sel) => return Ok(Some(sel)),
+            None => warn(&format!(
+                "Invalid selection '{ans}'. Use 1-{}, JP, JP,KR or 1,4 — or 0 to cancel.",
+                rows.len()
+            )),
         }
-        if let Ok(idx) = ans.parse::<usize>()
-            && idx >= 1
-            && idx <= rows.len()
-        {
-            return Ok(Some(rows[idx - 1].country_short.clone()));
+    }
+}
+
+fn interpret_country_selection(
+    ans: &str,
+    rows: &[CountrySummary],
+    filtered: &[VpnServer],
+) -> Option<String> {
+    let trimmed = ans.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "a" | "all" | "*" | "worldwide"
+    ) {
+        return Some("all".to_string());
+    }
+    let has_list_sep = trimmed.contains(',') || trimmed.contains(';') || trimmed.contains('/');
+    let ws: Vec<&str> = trimmed.split_whitespace().collect();
+    let iso_or_idx = |t: &str| {
+        t.parse::<usize>().is_ok()
+            || (t.len() == 2 && t.chars().all(|c| c.is_ascii_alphabetic()))
+            || matches!(t.to_ascii_lowercase().as_str(), "a" | "all" | "*" | "worldwide")
+    };
+    let chunks: Vec<&str> = if has_list_sep {
+        trimmed
+            .split(|c: char| c == ',' || c == ';' || c == '/' || c.is_whitespace())
+            .filter(|s| !s.is_empty())
+            .collect()
+    } else if ws.len() > 1 && ws.iter().copied().all(iso_or_idx) {
+        ws
+    } else {
+        vec![trimmed]
+    };
+    if chunks.is_empty() {
+        return None;
+    }
+    let mut codes = Vec::new();
+    let mut seen = HashSet::new();
+    for chunk in chunks {
+        if matches!(
+            chunk.to_ascii_lowercase().as_str(),
+            "a" | "all" | "*" | "worldwide"
+        ) {
+            return Some("all".to_string());
         }
-        let matched = filter_by_country(&filtered, Some(&ans));
-        if let Some(first) = matched.first() {
-            return Ok(Some(first.country_short.clone()));
+        if let Ok(idx) = chunk.parse::<usize>() {
+            if idx >= 1 && idx <= rows.len() {
+                let code = rows[idx - 1].country_short.clone();
+                if seen.insert(code.to_ascii_uppercase()) {
+                    codes.push(code);
+                }
+                continue;
+            }
+            return None;
         }
-        warn(&format!(
-            "Invalid selection '{ans}'. Please enter 1-{}, a country code like JP, or 0 to cancel.",
-            rows.len()
-        ));
+        let matched = filter_by_country(filtered, Some(chunk));
+        let Some(first) = matched.first() else {
+            return None;
+        };
+        let code = first.country_short.clone();
+        if seen.insert(code.to_ascii_uppercase()) {
+            codes.push(code);
+        }
+    }
+    if codes.is_empty() {
+        None
+    } else {
+        Some(codes.join(","))
     }
 }
 

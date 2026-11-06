@@ -192,10 +192,37 @@
     }
   }
 
-  function matchCountry(srv, query) {
-    if (!query || query === "ALL") return true;
-    var q = query.trim();
-    if (!q || q.toLowerCase() === "all" || q.toLowerCase() === "any") return true;
+  function isAllCountryToken(t) {
+    var x = (t || "").toLowerCase();
+    return !x || x === "all" || x === "any" || x === "*" || x === "worldwide";
+  }
+
+  function splitCountryQuery(query) {
+    if (!query || query === "ALL") return [];
+    var q = String(query).trim();
+    if (!q || isAllCountryToken(q)) return [];
+    var parts = q.split(/[,;\/]/).map(function (s) { return s.trim(); }).filter(Boolean);
+    if (parts.length === 1) {
+      var ws = parts[0].split(/\s+/).filter(Boolean);
+      if (ws.length > 1 && ws.every(function (t) {
+        return isAllCountryToken(t) || /^[A-Za-z]{2}$/.test(t);
+      })) {
+        parts = ws;
+      }
+    }
+    return parts;
+  }
+
+  function selectedCountryCodes(query) {
+    return splitCountryQuery(query).map(function (t) {
+      var up = t.toUpperCase();
+      return up === "UK" ? "GB" : up;
+    });
+  }
+
+  function matchCountryToken(srv, token) {
+    var q = (token || "").trim();
+    if (isAllCountryToken(q)) return true;
     var up = q.toUpperCase();
     if (q.length === 2 && /^[A-Za-z]{2}$/.test(q)) {
       var iso = up === "UK" ? "GB" : up;
@@ -206,6 +233,12 @@
       (srv.country_short || "").toUpperCase() === up ||
       (srv.country_long || "").toLowerCase().indexOf(low) !== -1
     );
+  }
+
+  function matchCountry(srv, query) {
+    var parts = splitCountryQuery(query);
+    if (!parts.length || parts.some(isAllCountryToken)) return true;
+    return parts.some(function (t) { return matchCountryToken(srv, t); });
   }
 
   function matchRelayQuery(srv, query) {
@@ -526,28 +559,39 @@
     var pills = document.getElementById("quick-country-pills");
     if (!sel || !pills) return;
 
-    var opts = '<option value="ALL">🌐 All Countries (' + state.counts.total + " relays)</option>";
+    var codes = selectedCountryCodes(state.country);
+    var multi = codes.length > 1;
+    var opts = "";
+    if (multi) {
+      opts += '<option value="' + esc(codes.join(",")) + '" selected>Several: ' +
+        esc(codes.join(", ")) + "</option>";
+    }
+    opts += '<option value="ALL"' + (!codes.length ? " selected" : "") +
+      ">🌐 All Countries (" + state.counts.total + " relays)</option>";
     for (var i = 0; i < state.countries.length; i++) {
       var c = state.countries[i];
-      var selected = state.country === c.country_short ? " selected" : "";
+      var selected = !multi && codes.length === 1 && codes[0] === c.country_short ? " selected" : "";
       opts += '<option value="' + esc(c.country_short) + '"' + selected + ">" +
         flagEmoji(c.country_short) + " " + esc(c.country_long) + " (" + esc(c.country_short) + ") — " +
         c.total_servers + " (" + c.l2tp_count + " L2TP)</option>";
     }
     sel.innerHTML = opts;
-    if (state.country && state.country !== "ALL") sel.value = state.country;
+    if (!multi && codes.length === 1) sel.value = codes[0];
+    else if (!codes.length) sel.value = "ALL";
 
     var topCodes = ["ALL"];
-    var hasCurrent = state.country === "ALL";
-    for (var j = 0; j < Math.min(6, state.countries.length); j++) {
-      topCodes.push(state.countries[j].country_short);
-      if (state.countries[j].country_short === state.country) hasCurrent = true;
+    var seen = { ALL: true };
+    for (var s = 0; s < codes.length; s++) {
+      if (!seen[codes[s]]) { topCodes.push(codes[s]); seen[codes[s]] = true; }
     }
-    if (!hasCurrent && state.country) topCodes.splice(1, 0, state.country);
+    for (var j = 0; j < Math.min(6, state.countries.length); j++) {
+      var sc = state.countries[j].country_short;
+      if (!seen[sc]) { topCodes.push(sc); seen[sc] = true; }
+    }
     var pillHtml = "";
     for (var k = 0; k < topCodes.length; k++) {
       var code = topCodes[k];
-      var act = state.country === code ? " active" : "";
+      var act = (code === "ALL" && !codes.length) || (code !== "ALL" && codes.indexOf(code) !== -1) ? " active" : "";
       var lbl = code === "ALL" ? "🌐 ALL" : (flagEmoji(code) + " " + code);
       pillHtml += '<button type="button" class="chip' + act + '" data-cc="' + esc(code) + '">' + lbl + "</button>";
     }
@@ -1448,7 +1492,18 @@
     document.getElementById("quick-country-pills").addEventListener("click", function (e) {
       var btn = e.target.closest("[data-cc]");
       if (!btn) return;
-      state.country = btn.getAttribute("data-cc");
+      var code = btn.getAttribute("data-cc");
+      if (!code || code === "ALL") {
+        state.country = "ALL";
+      } else {
+        var cur = selectedCountryCodes(state.country);
+        var up = code.toUpperCase();
+        if (up === "UK") up = "GB";
+        var idx = cur.indexOf(up);
+        if (idx >= 0) cur.splice(idx, 1);
+        else cur.push(up);
+        state.country = cur.length ? cur.join(",") : "ALL";
+      }
       onFilterChange();
     });
 

@@ -83,36 +83,70 @@ impl VpnServer {
     }
 }
 
-/// Filters servers by 2-letter ISO code or case-insensitive country substring.
-///
-/// When `query` is a 2-letter ASCII alphabetic ISO code (e.g. `US`, `IN`, `DE`, `JP`, `KR`,
-/// plus common alias `UK` -> `GB`), matching is strictly restricted to `country_short` so `-c US`
-/// never matches `Russian Federation` (`rUSsian`), `Australia` (`aUStralia`), or `Belarus`.
+fn is_all_country_token(token: &str) -> bool {
+    matches!(
+        token.to_ascii_lowercase().as_str(),
+        "all" | "any" | "*" | "worldwide"
+    )
+}
+
+fn is_iso2_token(token: &str) -> bool {
+    token.len() == 2 && token.chars().all(|c| c.is_ascii_alphabetic())
+}
+
+/// Splits `-c JP,KR` / `JP KR` (ISO codes) while leaving `United States` as one name.
+pub fn split_country_query(raw: &str) -> Vec<String> {
+    let q = raw.trim();
+    if q.is_empty() {
+        return Vec::new();
+    }
+    let mut parts: Vec<String> = q
+        .split(|c: char| c == ',' || c == ';' || c == '/')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parts.len() == 1 {
+        let ws: Vec<&str> = parts[0].split_whitespace().collect();
+        if ws.len() > 1
+            && ws
+                .iter()
+                .all(|t| is_all_country_token(t) || is_iso2_token(t))
+        {
+            parts = ws.iter().map(|s| (*s).to_string()).collect();
+        }
+    }
+    parts
+}
+
+fn country_token_matches(server: &VpnServer, token: &str) -> bool {
+    let q = token.trim();
+    if q.is_empty() || is_all_country_token(q) {
+        return true;
+    }
+    let q_up = q.to_ascii_uppercase();
+    if is_iso2_token(q) {
+        let iso = if q_up == "UK" { "GB" } else { q_up.as_str() };
+        return server.country_short.eq_ignore_ascii_case(iso);
+    }
+    let q_low = q.to_ascii_lowercase();
+    server.country_short.eq_ignore_ascii_case(&q_up)
+        || server.country_long.to_ascii_lowercase().contains(&q_low)
+}
+
+/// Filters servers by country. `query` may be one code/name, `all`, or several
+/// (`JP,KR` / `JP KR` / `UK,JP`). Each 2-letter token is a strict ISO match
+/// (`UK` → `GB`) so `-c US` never hits `Russian Federation` or `Australia`.
 pub fn filter_by_country(servers: &[VpnServer], query: Option<&str>) -> Vec<VpnServer> {
     let Some(q_raw) = query else {
         return servers.to_vec();
     };
-    let q = q_raw.trim();
-    if q.is_empty() || q.eq_ignore_ascii_case("all") || q.eq_ignore_ascii_case("any") {
+    let parts = split_country_query(q_raw);
+    if parts.is_empty() || parts.iter().any(|t| is_all_country_token(t)) {
         return servers.to_vec();
     }
-    let q_up = q.to_ascii_uppercase();
-    if q.len() == 2 && q.chars().all(|c| c.is_ascii_alphabetic()) {
-        let iso = if q_up == "UK" { "GB" } else { q_up.as_str() };
-        return servers
-            .iter()
-            .filter(|s| s.country_short.eq_ignore_ascii_case(iso))
-            .cloned()
-            .collect();
-    }
-
-    let q_low = q.to_ascii_lowercase();
     servers
         .iter()
-        .filter(|s| {
-            s.country_short.eq_ignore_ascii_case(&q_up)
-                || s.country_long.to_ascii_lowercase().contains(&q_low)
-        })
+        .filter(|s| parts.iter().any(|t| country_token_matches(s, t)))
         .cloned()
         .collect()
 }
@@ -231,5 +265,20 @@ mod tests {
         let uk_alias = filter_by_country(&pool, Some("UK"));
         assert_eq!(uk_alias.len(), 1);
         assert_eq!(uk_alias[0].country_short, "GB");
+
+        let us_and_gb = filter_by_country(&pool, Some("US,UK"));
+        assert_eq!(us_and_gb.len(), 2);
+        assert!(us_and_gb.iter().any(|s| s.country_short == "US"));
+        assert!(us_and_gb.iter().any(|s| s.country_short == "GB"));
+
+        let spaced = filter_by_country(&pool, Some("US GB"));
+        assert_eq!(spaced.len(), 2);
+
+        let united = filter_by_country(&pool, Some("United States"));
+        assert_eq!(united.len(), 1);
+        assert_eq!(united[0].country_short, "US");
+
+        let all_mix = filter_by_country(&pool, Some("JP,all"));
+        assert_eq!(all_mix.len(), pool.len());
     }
 }

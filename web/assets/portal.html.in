@@ -54,7 +54,7 @@
         </div>
         <div class="grid-2">
           <div>
-            <label class="field-label" for="connect-country">Target country</label>
+            <label class="field-label" for="connect-country">Target country (chips: several)</label>
             <select id="connect-country"><option value="ALL">Loading countries...</option></select>
           </div>
           <div>

@@ -109,6 +109,7 @@ vpngate -w                     # Launch inside dedicated dark GNOME GTK/VTE or W
 vpngate countries              # View unified countries & protocol summary table
 vpngate list -c JP -n 15       # List top 15 servers in Japan
 vpngate connect -c JP          # Auto-connect to Japan (L2TP/IPsec -> OVPN UDP -> OVPN TCP)
+vpngate connect -c JP,KR       # Japan and Korea, one sorted walk (repeat -c JP -c KR)
 vpngate connect -c KR -p l2tp  # Connect using verified PSK='vpn' L2TP/IPsec only
 vpngate mirrors                # Discover & live-probe Official VPNGate Mirror Sites
 vpngate --mirror http://host:port/en/ refresh

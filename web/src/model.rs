@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const APP_VERSION: &str = "0.4.1";
+pub const APP_VERSION: &str = "0.4.3";
 pub const POOL_CACHE_TTL_MS: u64 = 180_000;
 pub const POOL_CACHE_KEY_URL: &str = "https://vpngate-edge-cache.internal/v1/pool-snapshot";
 pub const VERIFY_MEM_CACHE_URL: &str = "https://vpngate-edge-cache.internal/v1/verify-memory";
