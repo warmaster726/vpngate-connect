@@ -13,23 +13,23 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use vpngate_core::{
-    ActiveSessionState, AppPaths, ConnectSessionConfig, CountrySummary, DiscoveryClient,
-    DiscoveryOptions, INTERRUPTED_EXIT, Ikev1StateInfo, MONITOR_INTERVAL_SECONDS,
-    NM_PROFILE_PREFIX, OfficialMirrorSite, PRODUCT_VERSION, ProgressEvent, ProtocolFilter,
-    ServerCacheFile, SortBy, UiControlAccess, UiControlError, VpnServer, acquire_ui_control,
-    cached_newer_than_installed, cleanup_existing_vpn_with_progress, default_repo_slug,
-    detect_host_os_label, engage_candidates_with_progress, fetch_public_url_text,
-    filter_by_country, filter_by_protocol, find_openvpn_bin, get_default_gateway,
-    get_ppp_interfaces, get_public_ip_trace, get_running_monitor_pid, get_running_openvpn_pid,
-    get_servers_cached_with_progress, get_tun_interfaces, installed_desktop_version,
-    installer_script_urls, is_root_or_admin, join_ui_control, load_cached_mirrors, load_cooldowns,
-    load_update_cache, load_watchdog_pref, normalize_mirror_base_url, now_unix_secs,
-    parse_dns_list, probe_tcp, prune_stale_state_if_dead, query_windows_natt_rule, read_json_opt,
-    record_update_declined, refresh_update_cache, resolve_user_home, run_ikev1_crypto_self_test,
-    save_cached_mirrors, save_cooldowns, save_watchdog_pref, should_auto_prompt, sort_servers,
-    spawn_auto_reconnect_monitor, stop_monitor_daemon, summarize_countries, tunnel_aid_dns_cli,
-    ui_control_status, ui_control_token_for_process, verify_l2tp_psk_vpn,
-    wait_for_ui_control_cancel, which_bin,
+    ActiveSessionState, AppPaths, ConnectSessionConfig, CooldownStore, CountrySummary,
+    DEFAULT_COOLDOWN_SECS, DiscoveryClient, DiscoveryOptions, INTERRUPTED_EXIT, Ikev1StateInfo,
+    MONITOR_INTERVAL_SECONDS, NM_PROFILE_PREFIX, OfficialMirrorSite, PRODUCT_VERSION,
+    ProgressEvent, ProtocolFilter, ServerCacheFile, SortBy, UiControlAccess, UiControlError,
+    VpnServer, acquire_ui_control, cached_newer_than_installed, cleanup_existing_vpn_with_progress,
+    default_repo_slug, detect_host_os_label, engage_candidates_with_progress,
+    fetch_public_url_text, filter_by_country, filter_by_protocol, find_openvpn_bin, fix_owner,
+    get_default_gateway, get_ppp_interfaces, get_public_ip_trace, get_running_monitor_pid,
+    get_running_openvpn_pid, get_servers_cached_with_progress, get_tun_interfaces,
+    installed_desktop_version, installer_script_urls, is_root_or_admin, join_ui_control,
+    load_cached_mirrors, load_cooldowns, load_update_cache, load_watchdog_pref,
+    normalize_mirror_base_url, now_unix_secs, parse_dns_list, probe_tcp, prune_stale_state_if_dead,
+    query_windows_natt_rule, read_json_opt, record_update_declined, refresh_update_cache,
+    resolve_user_home, run_ikev1_crypto_self_test, save_cached_mirrors, save_cooldowns,
+    save_watchdog_pref, should_auto_prompt, sort_servers, spawn_auto_reconnect_monitor,
+    stop_monitor_daemon, summarize_countries, tunnel_aid_dns_cli, ui_control_status,
+    ui_control_token_for_process, verify_l2tp_psk_vpn, wait_for_ui_control_cancel, which_bin,
 };
 
 use crate::term_ui::{
@@ -862,11 +862,35 @@ pub async fn cmd_disconnect(paths: &AppPaths) -> io::Result<i32> {
     Ok(0)
 }
 
+fn clear_relay_cooldowns(paths: &AppPaths) -> io::Result<usize> {
+    let mut cooldowns = CooldownStore::load_from_path(&paths.failed_servers)
+        .unwrap_or_else(|_| CooldownStore::new(DEFAULT_COOLDOWN_SECS));
+    let cleared = cooldowns.clear_all();
+    cooldowns
+        .save_to_path(&paths.failed_servers)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    fix_owner(&paths.failed_servers);
+    Ok(cleared)
+}
+
+pub fn cmd_reset_cooldowns(paths: &AppPaths) -> io::Result<i32> {
+    clear_screen_if_tty();
+    let cleared = clear_relay_cooldowns(paths)?;
+    if cleared == 0 {
+        info("No active relay cooldown entries needed resetting.");
+    } else {
+        ok(&format!(
+            "Reset {cleared} relay/protocol cooldown entry/entries."
+        ));
+    }
+    Ok(0)
+}
+
 pub async fn cmd_refresh(paths: &AppPaths, custom_mirrors: &[String]) -> io::Result<i32> {
     clear_screen_if_tty();
-    let mut cd = load_cooldowns(paths);
-    let cleared = cd.clear_all();
-    save_cooldowns(paths, &mut cd);
+    let mut cooldowns = load_cooldowns(paths);
+    let cleared = cooldowns.clear_all();
+    save_cooldowns(paths, &mut cooldowns);
     if cleared > 0 {
         info(&format!(
             "Cleared {cleared} penalized server cooldown entry/entries."
@@ -2578,7 +2602,8 @@ mod tests {
     use std::collections::VecDeque;
     use std::fs;
 
-    use super::{poll_observer_log, quote_windows_arg};
+    use super::{cmd_reset_cooldowns, poll_observer_log, quote_windows_arg};
+    use vpngate_core::{AppPaths, CooldownStore, VpnProtocol, load_cooldowns, now_unix_secs};
 
     #[test]
     fn observer_log_tails_incrementally_and_recovers_after_truncation() {
@@ -2614,6 +2639,29 @@ mod tests {
             ["New GUI session"]
         );
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn cooldown_reset_command_clears_saved_penalties() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let cache_dir = std::env::temp_dir().join(format!(
+            "vpngate-cli-cooldown-reset-{}-{nonce}",
+            std::process::id()
+        ));
+        let paths = AppPaths::with_base_dir(cache_dir.clone());
+        let mut cooldowns = CooldownStore::new(1800);
+        let now = now_unix_secs();
+        cooldowns.mark_failed_at("192.0.2.1", VpnProtocol::L2tpIpsec, now);
+        cooldowns.mark_failed_at("192.0.2.1", VpnProtocol::OpenVpnUdp, now);
+        cooldowns.save_to_path(&paths.failed_servers).unwrap();
+
+        assert_eq!(load_cooldowns(&paths).active_count(), 2);
+        assert_eq!(cmd_reset_cooldowns(&paths).unwrap(), 0);
+        assert_eq!(load_cooldowns(&paths).active_count(), 0);
+        fs::remove_dir_all(cache_dir).unwrap();
     }
 
     #[test]

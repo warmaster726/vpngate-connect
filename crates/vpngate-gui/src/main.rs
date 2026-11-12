@@ -127,6 +127,7 @@ enum ToolAction {
     List,
     Mirrors,
     Refresh,
+    ResetCooldowns,
     Status,
     Doctor,
     Probe,
@@ -621,6 +622,14 @@ impl GuiApp {
                 let mut args = vec!["refresh".to_string()];
                 append_mirror_args(&mut args, &self.tools_mirrors);
                 self.start_cli_command("Refresh relay pool", args, false, false);
+            }
+            ToolAction::ResetCooldowns => {
+                self.start_cli_command(
+                    "Reset relay cooldowns",
+                    vec!["cooldowns".to_string(), "reset".to_string()],
+                    false,
+                    false,
+                );
             }
             ToolAction::Status => {
                 self.start_cli_command(
@@ -1496,11 +1505,15 @@ impl GuiApp {
         } else if self.selected_relay_ip.is_some() {
             ui.label(RichText::new("Selected relay is outside the current filters.").weak());
         }
-        if connect_selected && let Some((rank, server)) = self.selected_relay() {
+        if connect_selected && let Some((_, server)) = self.selected_relay() {
+            let protocol = Self::parsed_protocol(&self.relay_protocol);
+            let sort = Self::parsed_sort(&self.relay_sort);
             self.connect_country = server.country_short.clone();
             self.connect_protocol = self.relay_protocol.clone();
             self.connect_sort = self.relay_sort.clone();
-            self.connect_start_index = rank + 1;
+            self.connect_start_index =
+                selected_relay_start_index(&self.cached_servers, &server, protocol, sort)
+                    .unwrap_or(1);
             self.start_connect();
         }
         ui.add_space(8.0);
@@ -1590,6 +1603,13 @@ impl GuiApp {
                 }
                 if ui.button("Refresh relay pool").clicked() {
                     action = Some(ToolAction::Refresh);
+                }
+                if ui
+                    .button("Reset relay cooldowns")
+                    .on_hover_text("Clear the 30-minute failure penalties so relays can be retried immediately.")
+                    .clicked()
+                {
+                    action = Some(ToolAction::ResetCooldowns);
                 }
                 if ui.button("Connection status").clicked() {
                     action = Some(ToolAction::Status);
@@ -1914,6 +1934,21 @@ fn relay_matches(server: &VpnServer, query: &str) -> bool {
         || contains_ascii_case_insensitive(&server.ip, query)
         || contains_ascii_case_insensitive(&server.country_short, query)
         || contains_ascii_case_insensitive(&server.country_long, query)
+}
+
+fn selected_relay_start_index(
+    servers: &[VpnServer],
+    selected: &VpnServer,
+    protocol: ProtocolFilter,
+    sort: SortBy,
+) -> Option<usize> {
+    let available = filter_by_protocol(servers, protocol);
+    let mut candidates = filter_by_country(&available, Some(&selected.country_short));
+    sort_servers(&mut candidates, sort, protocol);
+    candidates
+        .iter()
+        .position(|candidate| candidate.ip == selected.ip)
+        .map(|rank| rank + 1)
 }
 
 fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
@@ -2541,9 +2576,9 @@ mod tests {
     use super::{
         action_result_message, append_mirror_args, append_observer_log, connect_regions_fetch_args,
         country_picker_label, format_age, parse_ui_control_protocol_output, protocol_labels,
-        protocol_version_compatible, relay_matches, strip_ansi,
+        protocol_version_compatible, relay_matches, selected_relay_start_index, strip_ansi,
     };
-    use vpngate_core::{AppPaths, VpnServer};
+    use vpngate_core::{AppPaths, ProtocolFilter, SortBy, VpnServer};
 
     fn server() -> VpnServer {
         VpnServer {
@@ -2566,6 +2601,16 @@ mod tests {
         }
     }
 
+    fn relay(ip: &str, country_short: &str, country_long: &str, score: u64) -> VpnServer {
+        let mut server = server();
+        server.hostname = format!("relay-{ip}");
+        server.ip = ip.to_string();
+        server.country_short = country_short.to_string();
+        server.country_long = country_long.to_string();
+        server.score = score;
+        server
+    }
+
     #[test]
     fn relay_filter_matches_country_name_code_hostname_and_ip() {
         let relay = server();
@@ -2576,6 +2621,38 @@ mod tests {
         assert!(relay_matches(&relay, "192.0.2"));
         assert!(!relay_matches(&relay, "korea"));
         assert!(relay_matches(&relay, ""));
+    }
+
+    #[test]
+    fn selected_relay_start_index_uses_the_cli_country_scoped_order() {
+        let servers = vec![
+            relay("192.0.2.1", "KR", "Korea", 100),
+            relay("192.0.2.2", "JP", "Japan", 80),
+            relay("192.0.2.3", "KR", "Korea", 70),
+            relay("192.0.2.4", "JP", "Japan", 60),
+        ];
+        let selected = &servers[3];
+        let mut all_country_candidates = servers.clone();
+        vpngate_core::sort_servers(
+            &mut all_country_candidates,
+            SortBy::Score,
+            ProtocolFilter::Auto,
+        );
+        let all_country_rank = all_country_candidates
+            .iter()
+            .position(|candidate| candidate.ip == selected.ip)
+            .unwrap()
+            + 1;
+        let japan_count = servers
+            .iter()
+            .filter(|candidate| candidate.country_short == "JP")
+            .count();
+
+        assert!(all_country_rank > japan_count);
+        assert_eq!(
+            selected_relay_start_index(&servers, selected, ProtocolFilter::Auto, SortBy::Score,),
+            Some(2)
+        );
     }
 
     #[test]

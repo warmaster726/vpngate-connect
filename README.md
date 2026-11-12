@@ -103,7 +103,7 @@ cargo build --release --locked -p vpngate-cli --target x86_64-unknown-linux-gnu
 
 ## Optional Native GUI (trial)
 
-The functional eframe/egui GUI is an **opt-in desktop trial**; the existing `vpngate` CLI/`[0-9]` console and Linux GTK/VTE window remain available and are not replaced. The GUI presents native Connect, Relays, More actions, and System pages while using the companion desktop service for the full operation set (connect, countries, relays, mirrors, refresh, status, diagnostics, watchdog, probe, disconnect, and update/upgrade).
+The functional eframe/egui GUI is an **opt-in desktop trial**; the existing `vpngate` CLI/`[0-9]` console and Linux GTK/VTE window remain available and are not replaced. The GUI presents native Connect, Relays, More actions, and System pages while using the companion desktop service for the full operation set (connect, countries, relays, mirrors, refresh, cooldown reset, status, diagnostics, watchdog, probe, disconnect, and update/upgrade).
 
 All frontends share an exclusive control lease in the VPN Gate cache. They stay open and follow the same tunnel/cache state; while one frontend runs an operation, the other remains observe-only until the lease is released. Before enabling actions, the GUI checks that its companion service supports the shared-control protocol. If it is outdated or incompatible, the GUI shows a compatibility notice rather than surfacing a generic exit code 2 or running unsynchronized operations. Build/install the GUI and companion service from a compatible desktop revision. The GUI supports connect cancellation with the normal rollback, keeps session/control state live while idle, and puts raw diagnostic output under **Technical details**. It anonymously checks the public desktop version at startup and after diagnostics; if a newer version is available, it prompts and strongly recommends installing it. Privileged operations use Windows UAC, macOS authorization, or Linux `pkexec` when available; a Linux GUI without a polkit agent may need to be launched from a terminal or use the legacy CLI/GTK window for sudo prompts.
 
@@ -131,6 +131,7 @@ vpngate connect -c JP,KR       # Japan and Korea, one sorted walk (repeat -c JP 
 vpngate connect -c KR -p l2tp  # Connect using verified PSK='vpn' L2TP/IPsec only
 vpngate mirrors                # Discover & live-probe Official VPNGate Mirror Sites
 vpngate --mirror http://host:port/en/ refresh
+vpngate cooldowns reset        # Clear failed-relay penalties without refreshing the pool
 vpngate status                 # Check live tunnel, kernel XFRM SA, watchdog & Cloudflare egress IP
 vpngate watchdog on            # Arm 15s background Auto-Reconnect Watchdog
 vpngate doctor                 # Run IKEv1 crypto, L2TP/XFRM, OpenVPN & gateway diagnostics

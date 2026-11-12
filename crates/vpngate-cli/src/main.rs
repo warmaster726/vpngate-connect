@@ -18,9 +18,9 @@ use std::path::{Path, PathBuf};
 
 use commands::{
     ConnectArgs, UpgradeOffer, acquire_command_control, cmd_connect, cmd_countries, cmd_disconnect,
-    cmd_doctor_with_update, cmd_list, cmd_mirrors, cmd_probe, cmd_refresh, cmd_status, cmd_upgrade,
-    cmd_watchdog, interactive_menu, set_no_elevate_requested, set_skip_update_check,
-    set_uac_already_attempted,
+    cmd_doctor_with_update, cmd_list, cmd_mirrors, cmd_probe, cmd_refresh, cmd_reset_cooldowns,
+    cmd_status, cmd_upgrade, cmd_watchdog, interactive_menu, set_no_elevate_requested,
+    set_skip_update_check, set_uac_already_attempted,
 };
 use term_ui::{err, init_console, print_line, prompt_input, set_dynamic_resize, set_screen_clear};
 use vpngate_core::{
@@ -39,6 +39,7 @@ fn build_help_text() -> String {
            vpngate mirrors [--mirror URL]       Discover & live-probe Official VPNGate Mirror Sites\n\
            vpngate status                       Show active tunnel, XFRM SA, watchdog & egress IP\n\
            vpngate refresh                      Clear 30m server cooldowns & force live pool update\n\
+           vpngate cooldowns reset              Clear relay cooldowns without refreshing the pool\n\
            vpngate watchdog [on|off|status]     Manage 15s Auto-Reconnect Watchdog\n\
            vpngate doctor                       Run crypto, L2TP/XFRM, OpenVPN & network diagnostics\n\
            vpngate probe <IPv4>                 Run 1-RTT IKEv1 PSK='vpn' + TCP/443 pre-flight check\n\
@@ -444,6 +445,8 @@ async fn dispatch_commands(
             Some("Update desktop")
         } else if matches!(subcmd.as_str(), "refresh") {
             Some("Refresh relay pool")
+        } else if matches!(subcmd.as_str(), "cooldowns") {
+            Some("Reset relay cooldowns")
         } else if flag_countries || matches!(subcmd.as_str(), "countries" | "regions" | "c") {
             Some("List countries")
         } else if flag_list || matches!(subcmd.as_str(), "list" | "ls" | "servers") {
@@ -509,6 +512,15 @@ async fn dispatch_commands(
     }
     if matches!(subcmd.as_str(), "refresh") {
         return cmd_refresh(paths, &custom_mirrors).await;
+    }
+    if matches!(subcmd.as_str(), "cooldowns") {
+        return match positional.first().map(String::as_str) {
+            Some("reset") => cmd_reset_cooldowns(paths),
+            _ => {
+                err("Usage: vpngate cooldowns reset");
+                Ok(2)
+            }
+        };
     }
     if flag_countries || matches!(subcmd.as_str(), "countries" | "regions" | "c") {
         return cmd_countries(paths, proto_filter, force_refresh, &custom_mirrors).await;
