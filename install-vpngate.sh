@@ -19,6 +19,7 @@ SKIP_DEPS=0
 KEEP_TOOLCHAIN=0
 TOOLCHAIN_POLICY=""
 REPO_SLUG="${VPNGATE_REPO:-warmaster726/vpngate-connect}"
+BRANCH_NAME="${VPNGATE_BRANCH:-}"
 HOST_UNAME="$(uname -s 2>/dev/null || echo Linux)"
 HOST_MACHINE="$(uname -m 2>/dev/null || echo unknown)"
 HOST_ARCH=""
@@ -44,8 +45,11 @@ Options:
   --keep-toolchain     Keep compile tools (Rust toolchain and any C linker we install) after building `vpngate`
   --remove-toolchain   Remove compile tools after building `vpngate` (default when there is no prompt)
   --repo <owner/repo>  GitHub repository slug when downloading source archive outside a local checkout
+  --branch <name>     Source branch for archive downloads (default: VPNGATE_BRANCH or main)
   --help, -h           Show this help message and exit
 
+A local checkout is always built as checked out, including non-main branches.
+When no local source is present, --branch overrides VPNGATE_BRANCH; the default is main.
 When Rust (`cargo`) or a C linker (`gcc`) must be bootstrapped, an interactive
 install asks whether to keep those compile tools or delete them after `vpngate`
 is built. Pre-existing toolchains are never removed. Non-interactive runs
@@ -77,6 +81,11 @@ while [ "$#" -gt 0 ]; do
     --repo)
       [ "$#" -gt 0 ] || { echo "[!] Missing value for --repo" >&2; exit 2; }
       REPO_SLUG="$1"
+      shift
+      ;;
+    --branch)
+      [ "$#" -gt 0 ] || { echo "[!] Missing value for --branch" >&2; exit 2; }
+      BRANCH_NAME="$1"
       shift
       ;;
     --help|-h|help)
@@ -716,10 +725,21 @@ if [ "${HOST_UNAME}" = "Linux" ] && [ "${SKIP_DEPS}" -eq 0 ]; then
   fi
 fi
 
-# 2. Locate local workspace / prebuilt binary, or fetch `main` source archive from GitHub (Release-free!)
+# 2. Prefer the local checkout (including non-main branches); otherwise fetch a source archive.
 WORK_SRC_DIR="${SCRIPT_DIR}"
 BIN_SRC=""
 LAUNCHER_SRC=""
+LOCAL_BRANCH=""
+if [ -f "${WORK_SRC_DIR}/Cargo.toml" ] && command -v git >/dev/null 2>&1; then
+  LOCAL_BRANCH="$(git -C "${WORK_SRC_DIR}" branch --show-current 2>/dev/null || true)"
+fi
+if [ -f "${WORK_SRC_DIR}/Cargo.toml" ]; then
+  if [ -n "${LOCAL_BRANCH}" ]; then
+    info "Using the local checkout on branch '${LOCAL_BRANCH}'; building its checked-out source."
+  else
+    info "Using the local source tree at ${WORK_SRC_DIR}."
+  fi
+fi
 HAD_LOCAL_TARGET=0
 if [ -e "${WORK_SRC_DIR}/target" ]; then
   HAD_LOCAL_TARGET=1
@@ -728,7 +748,15 @@ HAD_EXISTING_CARGO=0
 USED_EPHEMERAL_RUSTUP=0
 
 if [ ! -f "${WORK_SRC_DIR}/Cargo.toml" ] && [ ! -x "${WORK_SRC_DIR}/vpngate" ]; then
-  BRANCH_NAME="${VPNGATE_BRANCH:-main}"
+  if [ -z "${BRANCH_NAME}" ]; then
+    BRANCH_NAME="main"
+  fi
+  case "${BRANCH_NAME}" in
+    ''|*[!A-Za-z0-9._/+@-]*|*..*|/*|*/|*//*)
+      warn "Invalid source branch name: ${BRANCH_NAME}"
+      exit 2
+      ;;
+  esac
   SRC_STAGE_DIR="${INSTALL_TMP_ROOT}/src"
   mkdir -p "${SRC_STAGE_DIR}"
   ARCHIVE_URL="https://codeload.github.com/${REPO_SLUG}/tar.gz/refs/heads/${BRANCH_NAME}"

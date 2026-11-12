@@ -29,6 +29,8 @@ param(
 
     [string]$Repo = 'warmaster726/vpngate-connect',
 
+    [string]$Branch = '',
+
     [switch]$RestoreNatTRule,
 
     [switch]$UserOnly,
@@ -78,8 +80,11 @@ Options:
   --keep-toolchain             Keep compile tools (Rust toolchain and any MinGW gcc we install) after building vpngate.exe
   --remove-toolchain           Remove compile tools after building vpngate.exe (default when there is no prompt)
   --repo <owner/repo>          GitHub repository slug when downloading source archive outside a checkout
+  -Branch <name>, --branch <name> Source branch for archive downloads (VPNGATE_BRANCH or main by default)
   --help, -Help, -h            Show this help message and exit
 
+A local checkout is always built as checked out, including non-main branches.
+When no local source is present, -Branch/--branch overrides VPNGATE_BRANCH; the default is main.
 When Rust (cargo.exe) or MinGW gcc must be bootstrapped, an interactive install
 asks whether to keep those compile tools or delete them after vpngate.exe is built.
 Pre-existing toolchains are never removed. Non-interactive runs default to removing
@@ -103,6 +108,15 @@ if ($RemainingArgs) {
             '--keep-toolchain'    { $KeepToolchain = $true; $RemoveToolchain = $false }
             '--remove-toolchain'  { $RemoveToolchain = $true; $KeepToolchain = $false }
             '--repo'              { if ($idx + 1 -lt $RemainingArgs.Count) { $idx++; $Repo = $RemainingArgs[$idx] } }
+            '--branch' {
+                if (($idx + 1) -ge $RemainingArgs.Count) {
+                    Write-Err "Missing value for --branch"
+                    Show-Usage
+                    exit 2
+                }
+                $idx++
+                $Branch = $RemainingArgs[$idx]
+            }
             '--help'            { $Help = $true }
             '-h'                { $Help = $true }
             default {
@@ -461,6 +475,14 @@ if ($Uninstall) {
 # INSTALL / UPGRADE MODE (`.\install-vpngate.ps1` or `install-vpngate.cmd`)
 # ==============================================================================
 $SourceDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+$LocalBranch = $null
+try {
+    $DetectedBranch = & git -C $SourceDir branch --show-current 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        $DetectedBranch = (@($DetectedBranch) -join '').Trim()
+        if ($DetectedBranch) { $LocalBranch = $DetectedBranch }
+    }
+} catch {}
 Invoke-VPNGateResidueCleanup -Mode 'Install'
 
 # 1. Resolve or build `vpngate.exe` inside an isolated temporary root so zero build bloat remains
@@ -481,9 +503,25 @@ try {
     $WorkDir = $SourceDir
     $CargoToml = Join-Path $WorkDir 'Cargo.toml'
     $LocalPrebuilt = Join-Path $WorkDir 'vpngate.exe'
+    $UsingLocalSource = Test-Path -LiteralPath $CargoToml
+    if ($UsingLocalSource) {
+        if ($LocalBranch) {
+            Write-Info "Using the local checkout on branch '$LocalBranch'; building its checked-out source."
+        } else {
+            Write-Info "Using the local source tree at $WorkDir."
+        }
+    }
 
-    if (-not (Test-Path -LiteralPath $CargoToml) -and -not (Test-Path -LiteralPath $LocalPrebuilt)) {
-        $BranchName = if ($env:VPNGATE_BRANCH) { $env:VPNGATE_BRANCH } else { 'main' }
+    if (-not $UsingLocalSource -and -not (Test-Path -LiteralPath $LocalPrebuilt)) {
+        $BranchName = $Branch
+        if ([string]::IsNullOrWhiteSpace($BranchName)) { $BranchName = $env:VPNGATE_BRANCH }
+        if ([string]::IsNullOrWhiteSpace($BranchName)) { $BranchName = 'main' }
+        $BranchName = $BranchName.Trim()
+        if ($BranchName -notmatch '^[A-Za-z0-9._/+@-]+$' -or
+            $BranchName.Contains('..') -or $BranchName.StartsWith('/') -or
+            $BranchName.EndsWith('/') -or $BranchName.Contains('//')) {
+            throw "Invalid source branch name: $BranchName"
+        }
         $ZipUrl = "https://codeload.github.com/$Repo/zip/refs/heads/$BranchName"
         $SrcStageDir = Join-Path $TempInstallRoot 'src'
         New-Item -ItemType Directory -Path $SrcStageDir -Force | Out-Null
