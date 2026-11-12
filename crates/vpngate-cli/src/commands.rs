@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal};
@@ -2091,6 +2091,122 @@ async fn prompt_and_maybe_install(
     }
 }
 
+const OBSERVER_OUTPUT_LINES: usize = 14;
+const OBSERVER_REFRESH: Duration = Duration::from_millis(500);
+
+/// Read-only original-console companion used by the native GUI to mirror its live output.
+pub fn interactive_observer(paths: &AppPaths) -> io::Result<i32> {
+    let mut offset = 0u64;
+    let mut pending = Vec::new();
+    let mut output = VecDeque::new();
+
+    loop {
+        poll_observer_log(
+            &paths.ui_observer_log,
+            &mut offset,
+            &mut pending,
+            &mut output,
+        )?;
+
+        let session = read_json_opt::<ActiveSessionState>(&paths.active_state);
+        let tunnel_line = if let Some(state) = session {
+            format!(
+                "Tunnel: {} → {} ({} · {})",
+                state.status.to_ascii_uppercase(),
+                state.hostname,
+                state.country_short,
+                state.protocol
+            )
+        } else {
+            "Tunnel: DISCONNECTED".to_string()
+        };
+        let watchdog_pid = get_running_monitor_pid(paths);
+        let watchdog_line = if watchdog_pid > 0 {
+            format!("Watchdog: ARMED (PID {watchdog_pid})")
+        } else if load_watchdog_pref(paths) {
+            "Watchdog: ON (standby)".to_string()
+        } else {
+            "Watchdog: OFF".to_string()
+        };
+        let controller_line = ui_control_status(paths)
+            .map(|control| {
+                format!(
+                    "Controller: OBSERVE ONLY — {} is running {} ({})",
+                    control.owner, control.operation, control.phase
+                )
+            })
+            .unwrap_or_else(|| "Controller: idle — no operation currently running".to_string());
+
+        let mut lines = vec![
+            Some(format!(
+                "{CYAN}{BOLD}VPN Gate Console v{PRODUCT_VERSION}{RESET}  ·  LIVE OBSERVER"
+            )),
+            Some(tunnel_line),
+            Some(controller_line),
+            Some(format!("{}  ·  {watchdog_line}", local_pool_summary_line(paths))),
+            None,
+            Some(format!("{BOLD}Original dashboard actions (read-only in this window){RESET}")),
+            Some(" [1] Connect by region   [2] Pick relay   [3] Countries   [4] Live status   [5] Watchdog".to_string()),
+            Some(" [6] Disconnect   [7] Refresh pool   [8] Mirrors   [9] Diagnostics / CLI reference".to_string()),
+            None,
+            Some(format!("{BOLD}Live output from GUI operations{RESET}")),
+        ];
+        if output.is_empty() {
+            lines.push(Some(format!(
+                "{DIM}Waiting for the GUI to start an operation…{RESET}"
+            )));
+        } else {
+            lines.extend(output.iter().map(|line| Some(truncate_plain(line, 112))));
+        }
+        lines.push(None);
+        lines.push(Some(format!(
+            "{DIM}This companion is observe-only. Use the VPN Gate Connect GUI to control operations; close this window or press Ctrl+C to exit.{RESET}"
+        )));
+
+        clear_screen_if_tty();
+        render_dynamic_box(&lines, 0, 76)?;
+        if !is_stdout_tty() {
+            return Ok(0);
+        }
+        std::thread::sleep(OBSERVER_REFRESH);
+    }
+}
+
+fn poll_observer_log(
+    path: &std::path::Path,
+    offset: &mut u64,
+    pending: &mut Vec<u8>,
+    output: &mut VecDeque<String>,
+) -> io::Result<()> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if (bytes.len() as u64) < *offset {
+        *offset = 0;
+        pending.clear();
+        output.clear();
+    }
+    let start = usize::try_from(*offset).unwrap_or(0).min(bytes.len());
+    pending.extend_from_slice(&bytes[start..]);
+    *offset = bytes.len() as u64;
+
+    while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+        let line = pending.drain(..=newline).collect::<Vec<_>>();
+        let line = String::from_utf8_lossy(&line[..line.len().saturating_sub(1)])
+            .trim_end_matches('\r')
+            .to_string();
+        if !line.is_empty() {
+            output.push_back(line);
+            while output.len() > OBSERVER_OUTPUT_LINES {
+                output.pop_front();
+            }
+        }
+    }
+    Ok(())
+}
+
 pub async fn interactive_menu(paths: &AppPaths, help_text: &str) -> io::Result<i32> {
     let os_label = detect_host_os_label();
 
@@ -2459,7 +2575,46 @@ pub async fn interactive_menu(paths: &AppPaths, help_text: &str) -> io::Result<i
 
 #[cfg(test)]
 mod tests {
-    use super::quote_windows_arg;
+    use std::collections::VecDeque;
+    use std::fs;
+
+    use super::{poll_observer_log, quote_windows_arg};
+
+    #[test]
+    fn observer_log_tails_incrementally_and_recovers_after_truncation() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "vpngate-cli-observer-{}-{nonce}.log",
+            std::process::id()
+        ));
+        fs::write(&path, "Connect started\nrelay".as_bytes()).unwrap();
+        let mut offset = 0;
+        let mut pending = Vec::new();
+        let mut output = VecDeque::new();
+        poll_observer_log(&path, &mut offset, &mut pending, &mut output).unwrap();
+        assert_eq!(
+            output.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["Connect started"]
+        );
+
+        fs::write(&path, "Connect started\nrelay ready\n".as_bytes()).unwrap();
+        poll_observer_log(&path, &mut offset, &mut pending, &mut output).unwrap();
+        assert_eq!(
+            output.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["Connect started", "relay ready"]
+        );
+
+        fs::write(&path, "New GUI session\n".as_bytes()).unwrap();
+        poll_observer_log(&path, &mut offset, &mut pending, &mut output).unwrap();
+        assert_eq!(
+            output.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["New GUI session"]
+        );
+        fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn quotes_windows_command_line_arguments_accurately() {

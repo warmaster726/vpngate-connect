@@ -2,13 +2,16 @@
 #![forbid(unsafe_code)]
 
 use std::collections::{HashSet, VecDeque};
-use std::io::{BufRead, BufReader, Read};
+use std::fs::{self, OpenOptions};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
@@ -31,6 +34,7 @@ const BUSY_CACHE_POLL_INTERVAL: Duration = Duration::from_secs(3);
 const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(700);
 const MAX_RELAY_ROWS: usize = 100;
 const MAX_LOG_LINES: usize = 600;
+const MAX_UI_OBSERVER_LOG_BYTES: u64 = 2 * 1024 * 1024;
 
 fn main() -> eframe::Result {
     if let Err(error) = vpngate_core::assert_supported_native_host() {
@@ -169,6 +173,7 @@ struct GuiApp {
     worker: Option<CommandWorker>,
     command_log: VecDeque<String>,
     status_message: String,
+    observer_status: String,
     host_label: String,
     native_arch: &'static str,
     elevated: bool,
@@ -204,6 +209,7 @@ impl GuiApp {
 
         let paths = AppPaths::resolve();
         let (cli_binary, cli_notice) = resolve_cli_binary();
+        let observer_status = start_legacy_observer(cli_binary.as_deref(), &paths, "started");
         let mut app = Self {
             paths,
             cli_binary,
@@ -227,11 +233,12 @@ impl GuiApp {
             worker: None,
             command_log: VecDeque::new(),
             status_message: String::new(),
+            observer_status,
             host_label: detect_host_os_label(),
             native_arch: cpu_isa_label(),
             elevated: is_root_or_admin(),
 
-            connect_country: "JP".to_string(),
+            connect_country: "all".to_string(),
             connect_protocol: "auto".to_string(),
             connect_sort: "score".to_string(),
             connect_limit: 0,
@@ -448,6 +455,11 @@ impl GuiApp {
         self.start_cli_command("Connect", args, true, true);
     }
 
+    fn fetch_connect_regions(&mut self) {
+        let args = connect_regions_fetch_args(&self.connect_protocol, &self.connect_mirrors);
+        self.start_cli_command("Fetch regions", args, false, false);
+    }
+
     fn start_cli_command(
         &mut self,
         operation: &str,
@@ -486,6 +498,7 @@ impl GuiApp {
         lease.set_phase("Starting desktop operation");
         self.command_log.clear();
         self.push_log(format!("Starting {operation}…"));
+        let _ = append_observer_log(&self.paths, &format!("=== GUI started {operation} ==="));
         self.status_message.clear();
         self.control_lease = Some(lease);
         self.reload_control();
@@ -525,6 +538,7 @@ impl GuiApp {
         self.control_lease = Some(lease);
         self.command_log.clear();
         self.push_log("Checking for desktop updates…".to_string());
+        let _ = append_observer_log(&self.paths, "=== GUI started desktop update check ===");
         self.status_message.clear();
         self.reload_control();
 
@@ -569,10 +583,10 @@ impl GuiApp {
             if let Some(worker) = &mut self.worker {
                 worker.cancel_requested = true;
             }
-            self.push_log(
-                "Cancellation requested — tunnel changes will be rolled back before returning."
-                    .to_string(),
-            );
+            let message =
+                "Cancellation requested — tunnel changes will be rolled back before returning.";
+            let _ = append_observer_log(&self.paths, message);
+            self.push_log(message.to_string());
             self.status_message = "Cancelling and rolling back…".to_string();
             self.reload_control();
         } else {
@@ -742,11 +756,13 @@ impl GuiApp {
             .unwrap_or_default();
         let mut finished = false;
         let mut latest_phase = None;
+        let mut observer_output = Vec::new();
         for event in events {
             match event {
                 CommandEvent::Output(line) => {
                     let clean = strip_ansi(&line);
                     if !clean.trim().is_empty() {
+                        observer_output.push(clean.clone());
                         latest_phase = Some(clean.clone());
                         self.push_log(clean);
                     }
@@ -761,6 +777,7 @@ impl GuiApp {
                                 "Desktop update v{} is available; installing it is strongly recommended.",
                                 remote.raw
                             );
+                            observer_output.push(message.clone());
                             self.push_log(message.clone());
                             self.status_message = message;
                             self.update_offer = Some(remote);
@@ -770,12 +787,14 @@ impl GuiApp {
                                 "Desktop update v{} is available; its reminder is snoozed after your earlier choice.",
                                 remote.raw
                             );
+                            observer_output.push(message.clone());
                             self.push_log(message.clone());
                             self.status_message = message;
                         }
                     } else {
                         let message =
                             format!("VPN Gate Connect is up to date (v{PRODUCT_VERSION}).");
+                        observer_output.push(message.clone());
                         self.push_log(message.clone());
                         self.status_message = message;
                     }
@@ -783,6 +802,7 @@ impl GuiApp {
                 }
                 CommandEvent::UpdateCheck(_, Err(error)) => {
                     let message = format!("Desktop update check did not complete: {error}");
+                    observer_output.push(message.clone());
                     self.push_log(message.clone());
                     self.status_message = message;
                     finished = true;
@@ -794,8 +814,11 @@ impl GuiApp {
                         .map(|worker| worker.operation.as_str())
                         .unwrap_or("Action");
                     let message = action_result_message(operation, code);
+                    observer_output.push(message.clone());
                     if code != 0 {
-                        self.push_log(format!("Technical result status: {code}"));
+                        let detail = format!("Technical result status: {code}");
+                        observer_output.push(detail.clone());
+                        self.push_log(detail);
                     }
                     self.push_log(message.clone());
                     self.status_message = message;
@@ -808,11 +831,15 @@ impl GuiApp {
                         .map(|worker| worker.operation.as_str())
                         .unwrap_or("Action");
                     let message = format!("Could not start {operation}: {error}");
+                    observer_output.push(message.clone());
                     self.push_log(message.clone());
                     self.status_message = message;
                     finished = true;
                 }
             }
+        }
+        if !observer_output.is_empty() {
+            let _ = append_observer_log(&self.paths, &observer_output.join("\n"));
         }
         if let (Some(phase), Some(lease)) = (latest_phase, self.control_lease.as_ref()) {
             lease.set_phase(phase.chars().take(180).collect::<String>());
@@ -1086,8 +1113,20 @@ impl GuiApp {
         ui.add_space(10.0);
         let blocked = self.actions_blocked();
         let countries = self.available_countries();
+        let selected_country_label = country_picker_label(&self.connect_country, &countries);
+        let region_cache_label = self
+            .cache_timestamp
+            .map(|timestamp| {
+                format!(
+                    "{} regions · cache {}",
+                    countries.len(),
+                    format_age(now_unix_secs().saturating_sub(timestamp))
+                )
+            })
+            .unwrap_or_else(|| "No region cache yet".to_string());
         let mut connect_clicked = false;
         let mut disconnect_clicked = false;
+        let mut fetch_regions_clicked = false;
         ui.add_enabled_ui(!blocked, |ui| {
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.label(RichText::new("Connection options").strong());
@@ -1096,13 +1135,14 @@ impl GuiApp {
                     .spacing([12.0, 8.0])
                     .show(ui, |ui| {
                         ui.label("Country / region");
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.connect_country)
-                                    .desired_width(170.0),
+                                    .desired_width(150.0)
+                                    .hint_text("all or JP,KR"),
                             );
                             egui::ComboBox::from_id_salt("connect_country_picker")
-                                .selected_text("From cache")
+                                .selected_text(selected_country_label)
                                 .show_ui(ui, |ui| {
                                     ui.selectable_value(
                                         &mut self.connect_country,
@@ -1117,6 +1157,11 @@ impl GuiApp {
                                         );
                                     }
                                 });
+                            fetch_regions_clicked = ui
+                                .button("Fetch regions")
+                                .on_hover_text("Refresh the live relay pool and update this region picker without leaving Connect")
+                                .clicked();
+                            ui.label(RichText::new(&region_cache_label).weak().small());
                         });
                         ui.end_row();
 
@@ -1284,7 +1329,9 @@ impl GuiApp {
             }
         }
 
-        if connect_clicked {
+        if fetch_regions_clicked {
+            self.fetch_connect_regions();
+        } else if connect_clicked {
             self.start_connect();
         } else if disconnect_clicked {
             self.execute_tool_action(ToolAction::Disconnect);
@@ -1646,9 +1693,21 @@ impl GuiApp {
                             "No session file"
                         },
                     );
+                    detail_row(ui, "Original UI observer", &self.observer_status);
                     ui.end_row();
                 });
         });
+        let mut reopen_observer = false;
+        ui.horizontal(|ui| {
+            reopen_observer = ui.button("Open another terminal observer").clicked();
+            ui.label(
+                RichText::new("Read-only CLI view; mirrors GUI operations and output.").weak(),
+            );
+        });
+        if reopen_observer {
+            self.observer_status =
+                start_legacy_observer(self.cli_binary.as_deref(), &self.paths, "reopened");
+        }
         ui.add_space(10.0);
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.label(RichText::new("Shared controller").strong());
@@ -1893,6 +1952,35 @@ fn format_age(seconds: u64) -> String {
     }
 }
 
+fn country_picker_label(selection: &str, countries: &[(String, String)]) -> String {
+    let selection = selection.trim();
+    if selection.eq_ignore_ascii_case("all") {
+        return "All countries".to_string();
+    }
+    if let Some((code, name)) = countries
+        .iter()
+        .find(|(code, _)| code.eq_ignore_ascii_case(selection))
+    {
+        return format!("{name} ({code})");
+    }
+    if selection.is_empty() {
+        "Choose a region".to_string()
+    } else {
+        selection.to_string()
+    }
+}
+
+fn connect_regions_fetch_args(protocol: &str, mirrors: &str) -> Vec<String> {
+    let mut args = vec![
+        "countries".to_string(),
+        "--proto".to_string(),
+        protocol.to_string(),
+        "--refresh".to_string(),
+    ];
+    append_mirror_args(&mut args, mirrors);
+    args
+}
+
 fn append_mirror_args(args: &mut Vec<String>, value: &str) {
     for mirror in value
         .split([';', '\n'])
@@ -1987,6 +2075,227 @@ fn resolve_cli_binary() -> (Option<PathBuf>, Option<String>) {
         "The synchronized desktop action service was not found. Install it beside this app or make it available in PATH.".to_string()
     };
     (None, Some(notice))
+}
+
+fn start_legacy_observer(cli_binary: Option<&Path>, paths: &AppPaths, reason: &str) -> String {
+    let Some(cli_binary) = cli_binary else {
+        return "Not started — the compatible desktop CLI was not found.".to_string();
+    };
+    if !cli_supports_observer(cli_binary) {
+        return "Not started — update the desktop CLI component to enable live observation."
+            .to_string();
+    }
+    if let Err(error) = append_observer_log(
+        paths,
+        &format!("=== GUI {reason}; launching read-only CLI observer ==="),
+    ) {
+        return format!("Not started — could not prepare the shared output log: {error}");
+    }
+    match launch_legacy_observer_window(cli_binary, paths) {
+        Ok(window) => format!("Running in {window} (observe-only)"),
+        Err(error) => {
+            let message = format!("Could not launch the CLI observer: {error}");
+            let _ = append_observer_log(paths, &message);
+            message
+        }
+    }
+}
+
+fn cli_supports_observer(cli_binary: &Path) -> bool {
+    let mut command = Command::new(cli_binary);
+    command
+        .arg("--help")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000);
+
+    command.output().is_ok_and(|output| {
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("--observe")
+    })
+}
+
+fn append_observer_log(paths: &AppPaths, message: &str) -> std::io::Result<()> {
+    fs::create_dir_all(&paths.cache_dir)?;
+    if fs::metadata(&paths.ui_observer_log)
+        .is_ok_and(|metadata| metadata.len() > MAX_UI_OBSERVER_LOG_BYTES)
+    {
+        fs::write(
+            &paths.ui_observer_log,
+            "=== Older GUI output trimmed to keep the observer log bounded ===\n",
+        )?;
+    }
+
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&paths.ui_observer_log)?;
+    #[cfg(unix)]
+    fs::set_permissions(&paths.ui_observer_log, fs::Permissions::from_mode(0o600))?;
+
+    for line in message.lines() {
+        writeln!(file, "{}", line.trim_end_matches('\r'))?;
+    }
+    file.flush()
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn add_observer_cli_args(command: &mut Command, cli_binary: &Path, paths: &AppPaths) {
+    command
+        .arg(cli_binary)
+        .arg("--cache-dir")
+        .arg(&paths.cache_dir)
+        .arg("--observe");
+}
+
+#[cfg(target_os = "linux")]
+fn launch_legacy_observer_window(
+    cli_binary: &Path,
+    paths: &AppPaths,
+) -> Result<&'static str, String> {
+    let mut launcher_candidates = Vec::new();
+    if let Some(directory) = cli_binary.parent() {
+        launcher_candidates.push(directory.join("vpngate-launcher"));
+    }
+    if let Ok(executable) = std::env::current_exe()
+        && let Some(directory) = executable.parent()
+    {
+        launcher_candidates.push(directory.join("vpngate-launcher"));
+    }
+    launcher_candidates.push(PathBuf::from("/usr/local/bin/vpngate-launcher"));
+    if let Some(path) = vpngate_core::which_bin("vpngate-launcher") {
+        launcher_candidates.push(path);
+    }
+
+    if let Some(launcher) = launcher_candidates.into_iter().find(|path| path.is_file()) {
+        let mut command = Command::new(launcher);
+        command
+            .arg("--cache-dir")
+            .arg(&paths.cache_dir)
+            .arg("--observe")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if command.spawn().is_ok() {
+            return Ok("the GTK/VTE window");
+        }
+    }
+
+    let terminal_candidates: [(&str, &[&str]); 4] = [
+        (
+            "gnome-terminal",
+            &["--wait", "--title", "VPN Gate Observer", "--"],
+        ),
+        (
+            "konsole",
+            &["--separate", "--title", "VPN Gate Observer", "-e"],
+        ),
+        ("x-terminal-emulator", &["-T", "VPN Gate Observer", "-e"]),
+        ("xterm", &["-T", "VPN Gate Observer", "-e"]),
+    ];
+    for (binary, prefix) in terminal_candidates {
+        let Some(path) = vpngate_core::which_bin(binary) else {
+            continue;
+        };
+        let mut command = Command::new(path);
+        command.args(prefix);
+        add_observer_cli_args(&mut command, cli_binary, paths);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if command.spawn().is_ok() {
+            return Ok("a terminal window");
+        }
+    }
+    Err("no GTK/VTE launcher or supported terminal emulator was found".to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn launch_legacy_observer_window(
+    cli_binary: &Path,
+    paths: &AppPaths,
+) -> Result<&'static str, String> {
+    if let Some(windows_terminal) =
+        vpngate_core::which_bin("wt.exe").or_else(|| vpngate_core::which_bin("wt"))
+    {
+        let mut command = Command::new(windows_terminal);
+        command.args(["-w", "new", "--title", "VPN Gate Observer"]);
+        add_observer_cli_args(&mut command, cli_binary, paths);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(0x0800_0000);
+        if command.spawn().is_ok() {
+            return Ok("Windows Terminal");
+        }
+    }
+
+    let powershell = vpngate_core::which_bin("powershell.exe")
+        .or_else(|| vpngate_core::which_bin("powershell"))
+        .unwrap_or_else(|| PathBuf::from("powershell.exe"));
+    let command_line = format!(
+        "& {} {} {} {}",
+        powershell_quote(&cli_binary.display().to_string()),
+        powershell_quote("--cache-dir"),
+        powershell_quote(&paths.cache_dir.display().to_string()),
+        powershell_quote("--observe"),
+    );
+    let mut command = Command::new(powershell);
+    command
+        .args(["-NoLogo", "-NoExit", "-Command", &command_line])
+        .creation_flags(0x0000_0010);
+    command
+        .spawn()
+        .map_err(|error| format!("could not open Windows Terminal or PowerShell: {error}"))?;
+    Ok("a PowerShell window")
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn powershell_quote(argument: &str) -> String {
+    format!("'{}'", argument.replace('\'', "''"))
+}
+
+#[cfg(target_os = "macos")]
+fn launch_legacy_observer_window(
+    cli_binary: &Path,
+    paths: &AppPaths,
+) -> Result<&'static str, String> {
+    let command_line = [
+        cli_binary.display().to_string(),
+        "--cache-dir".to_string(),
+        paths.cache_dir.display().to_string(),
+        "--observe".to_string(),
+    ]
+    .iter()
+    .map(|argument| shell_quote(argument))
+    .collect::<Vec<_>>()
+    .join(" ");
+    let script = format!(
+        "tell application \"Terminal\"\nactivate\ndo script \"{}\"\nend tell",
+        applescript_escape(&command_line)
+    );
+    let mut command = Command::new("/usr/bin/osascript");
+    command
+        .args(["-e", &script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
+        .spawn()
+        .map_err(|error| format!("could not open the macOS Terminal observer: {error}"))?;
+    Ok("the macOS Terminal window")
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+fn launch_legacy_observer_window(
+    _cli_binary: &Path,
+    _paths: &AppPaths,
+) -> Result<&'static str, String> {
+    Err("automatic terminal observers are not supported on this operating system".to_string())
 }
 
 fn probe_ui_control_protocol(binary: &Path) -> Result<u32, String> {
@@ -2182,12 +2491,12 @@ fn unix_identity() -> (String, String, String) {
     (query("-u"), query("-g"), query("-un"))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn applescript_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -2230,10 +2539,11 @@ fn strip_ansi(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        action_result_message, append_mirror_args, format_age, parse_ui_control_protocol_output,
-        protocol_labels, protocol_version_compatible, relay_matches, strip_ansi,
+        action_result_message, append_mirror_args, append_observer_log, connect_regions_fetch_args,
+        country_picker_label, format_age, parse_ui_control_protocol_output, protocol_labels,
+        protocol_version_compatible, relay_matches, strip_ansi,
     };
-    use vpngate_core::VpnServer;
+    use vpngate_core::{AppPaths, VpnServer};
 
     fn server() -> VpnServer {
         VpnServer {
@@ -2288,6 +2598,54 @@ mod tests {
     }
 
     #[test]
+    fn country_picker_includes_all_and_resolves_fetched_regions() {
+        let countries = vec![
+            ("JP".to_string(), "Japan".to_string()),
+            ("KR".to_string(), "Korea".to_string()),
+        ];
+        assert_eq!(country_picker_label("all", &countries), "All countries");
+        assert_eq!(country_picker_label("jp", &countries), "Japan (JP)");
+        assert_eq!(country_picker_label("JP,KR", &countries), "JP,KR");
+    }
+
+    #[test]
+    fn inline_region_fetch_forces_refresh_and_keeps_custom_mirrors() {
+        assert_eq!(
+            connect_regions_fetch_args("auto", "http://one/en/; http://two/en/"),
+            [
+                "countries",
+                "--proto",
+                "auto",
+                "--refresh",
+                "--mirror",
+                "http://one/en/",
+                "--mirror",
+                "http://two/en/",
+            ]
+        );
+    }
+
+    #[test]
+    fn observer_log_preserves_gui_output_lines() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let cache_dir = std::env::temp_dir().join(format!(
+            "vpngate-observer-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let paths = AppPaths::with_base_dir(cache_dir.clone());
+        append_observer_log(&paths, "=== Connect started ===").unwrap();
+        append_observer_log(&paths, "[Attempt 1/2] Testing relay.example").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&paths.ui_observer_log).unwrap(),
+            "=== Connect started ===\n[Attempt 1/2] Testing relay.example\n"
+        );
+        std::fs::remove_dir_all(cache_dir).unwrap();
+    }
+
+    #[test]
     fn synchronized_action_service_protocol_is_checked_explicitly() {
         assert_eq!(parse_ui_control_protocol_output("1\n"), Some(1));
         assert_eq!(parse_ui_control_protocol_output("unknown option\n"), None);
@@ -2325,11 +2683,12 @@ mod tests {
         assert_eq!(strip_ansi("\u{1b}[31mred\u{1b}[0m"), "red");
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
-    fn privileged_shell_arguments_are_quoted_for_osascript() {
-        use super::shell_quote;
+    fn terminal_arguments_are_escaped_for_windows_and_macos() {
+        use super::{applescript_escape, powershell_quote, shell_quote};
         assert_eq!(shell_quote("plain"), "'plain'");
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+        assert_eq!(powershell_quote("a'b"), "'a''b'");
+        assert_eq!(applescript_escape("\""), "\\\"");
     }
 }

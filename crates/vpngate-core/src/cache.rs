@@ -98,6 +98,8 @@ pub struct AppPaths {
     pub update_check: PathBuf,
     /// Shared cross-process exclusive UI controller lease and progress state.
     pub ui_control: PathBuf,
+    /// Append-only output stream mirrored by the GUI's read-only terminal companion.
+    pub ui_observer_log: PathBuf,
 }
 
 impl AppPaths {
@@ -124,6 +126,7 @@ impl AppPaths {
             l2tp_resolv_bak: cache_dir.join("resolv.conf.bak"),
             update_check: cache_dir.join("update_check.json"),
             ui_control: cache_dir.join("ui-control.json"),
+            ui_observer_log: cache_dir.join("ui-observer.log"),
             l2tp_run_dir,
             cache_dir,
         }

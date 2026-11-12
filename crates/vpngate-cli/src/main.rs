@@ -70,6 +70,7 @@ fn build_help_text() -> String {
                --no-resize       Disable dynamic terminal window resize sequences\n\
                --no-clear        Do not clear previous screen items before command execution\n\
                --no-update-check Skip the dashboard scan for a newer desktop\n\
+               --observe         Open a read-only live terminal companion for GUI operations\n\
            -y, --yes             With `update`/`upgrade`, install without an extra confirmation prompt\n\
            -h, --help            Print this help message\n",
         PRODUCT_VERSION
@@ -89,7 +90,9 @@ fn delegate_to_window_launcher(paths: &AppPaths, raw_args: &[String]) -> i32 {
             err("Could not determine vpngate executable path.");
             return 1;
         };
+        let is_observer = filtered.iter().any(|a| a == "--observe");
         let is_interactive = filtered.is_empty()
+            || is_observer
             || filtered
                 .iter()
                 .any(|a| matches!(a.as_str(), "-i" | "--interactive" | "menu" | "interactive"));
@@ -102,7 +105,7 @@ fn delegate_to_window_launcher(paths: &AppPaths, raw_args: &[String]) -> i32 {
             launch_args.push("--hold".to_string());
         }
 
-        if !vpngate_core::is_root_or_admin() && !commands::no_elevate_requested() {
+        if !is_observer && !vpngate_core::is_root_or_admin() && !commands::no_elevate_requested() {
             let mut uac_args = vec!["--uac-elevated".to_string()];
             uac_args.extend_from_slice(&launch_args);
             if commands::win_uac::run_elevated(&self_exe, &uac_args, false).is_ok() {
@@ -164,7 +167,7 @@ fn delegate_to_window_launcher(paths: &AppPaths, raw_args: &[String]) -> i32 {
         };
 
         let mut cmd = std::process::Command::new(launcher);
-        if !filtered.is_empty() {
+        if !filtered.is_empty() && !filtered.iter().any(|arg| arg == "--observe") {
             cmd.arg("--hold");
         }
         cmd.args(&filtered);
@@ -264,6 +267,24 @@ async fn dispatch_commands(
     control_token: Option<&str>,
 ) -> io::Result<i32> {
     let help_text = build_help_text();
+    if raw_args.iter().any(|arg| arg == "--observe") {
+        if raw_args
+            .iter()
+            .any(|arg| !matches!(arg.as_str(), "--observe" | "--no-resize" | "--no-clear"))
+        {
+            err(
+                "The read-only --observe mode cannot be combined with a command or connection options.",
+            );
+            return Ok(2);
+        }
+        if raw_args.iter().any(|arg| arg == "--no-resize") {
+            set_dynamic_resize(false);
+        }
+        if raw_args.iter().any(|arg| arg == "--no-clear") {
+            set_screen_clear(false);
+        }
+        return commands::interactive_observer(paths);
+    }
     if raw_args.is_empty() {
         return interactive_menu(paths, &help_text).await;
     }
