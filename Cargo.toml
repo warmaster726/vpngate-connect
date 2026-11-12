@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "crates/vpngate-core",
     "crates/vpngate-cli",
-    "crates/vpngate-launcher",
 ]
 exclude = ["web"]
 
@@ -11,7 +10,7 @@ exclude = ["web"]
 # Cargo crate SemVer (letter revisions like 0.4.0a live in assets/desktop-version.txt
 # and vpngate_core::PRODUCT_VERSION — Cargo itself cannot encode 0.4.0a).
 # Patch may exceed 9 (0.4.10, 0.4.15, …).
-version = "0.5.1"
+version = "0.5.2"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/warmaster726/vpngate-connect"

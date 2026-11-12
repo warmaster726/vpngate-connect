@@ -85,7 +85,7 @@ pub fn ovpn_dhcp_option_line(addr: &str) -> String {
 pub fn parse_dhcp_option_dns(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
-    for segment in text.split(|c: char| c == ',' || c == '\n' || c == '\r') {
+    for segment in text.split([',', '\n', '\r']) {
         let s = segment.trim().trim_matches('"');
         if s.is_empty() {
             continue;

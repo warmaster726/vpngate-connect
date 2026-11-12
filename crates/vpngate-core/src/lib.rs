@@ -59,7 +59,7 @@ pub use ikev1::{L2tpVerifyOutcome, probe_tcp, sweep_ikev1_sa_responders, verify_
 pub use ikev1_daemon::{run_ikev1_crypto_self_test, run_ikev1_daemon};
 pub use interactive_instance::{
     InteractiveInstanceError, InteractiveInstanceGuard, acquire_interactive_instance,
-    acquire_interactive_instances, validate_interactive_instance_handoff,
+    acquire_interactive_instances,
 };
 pub use parser::{
     OfficialMirrorSite, normalize_mirror_base_url, parse_sdise_csv_into, parse_vpngate_csv_into,

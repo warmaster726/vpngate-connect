@@ -1,14 +1,12 @@
-//! OS-backed singleton guard shared by the traditional CLI/GTK frontend and native GUI.
+//! OS-backed singleton guard for the native desktop GUI.
 //!
-//! Unlike operation-control leases, this lock is held only for the lifetime of an
-//! interactive frontend. Short-lived CLI worker commands do not acquire it.
+//! Unlike operation-control leases, this lock is held only for the lifetime of the
+//! GUI process. Short-lived CLI command-service workers do not acquire it.
 
 #[cfg(unix)]
 use std::fs;
 use std::fs::{File, OpenOptions, TryLockError};
-#[cfg(not(windows))]
-use std::io::Read;
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::cache::AppPaths;
@@ -25,10 +23,7 @@ pub enum InteractiveInstanceError {
 impl std::fmt::Display for InteractiveInstanceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::AlreadyRunning => write!(
-                f,
-                "another VPN Gate Connect interactive frontend is already running"
-            ),
+            Self::AlreadyRunning => write!(f, "another VPN Gate Connect window is already running"),
             Self::Io(error) => write!(f, "could not acquire the frontend instance lock: {error}"),
         }
     }
@@ -45,13 +40,11 @@ impl From<io::Error> for InteractiveInstanceError {
 /// Keeps the OS file lock until the owning frontend exits.
 pub struct InteractiveInstanceGuard {
     _lock_file: File,
-    handoff_token: String,
 }
 
 impl std::fmt::Debug for InteractiveInstanceGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InteractiveInstanceGuard")
-            .field("handoff_token", &"<redacted>")
             .finish_non_exhaustive()
     }
 }
@@ -76,7 +69,7 @@ pub fn acquire_interactive_instance(
         options.mode(PRIVATE_FILE_MODE);
     }
 
-    let mut file = options.open(&path)?;
+    let file = options.open(&path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -85,15 +78,10 @@ pub fn acquire_interactive_instance(
 
     match file.try_lock() {
         Ok(()) => {
-            let handoff_token = format!("{:032x}", rand::random::<u128>());
+            // Empty any token written by older GTK/VTE launcher versions.
             file.set_len(0)?;
-            file.seek(SeekFrom::Start(0))?;
-            file.write_all(handoff_token.as_bytes())?;
             file.sync_data()?;
-            Ok(InteractiveInstanceGuard {
-                _lock_file: file,
-                handoff_token,
-            })
+            Ok(InteractiveInstanceGuard { _lock_file: file })
         }
         Err(TryLockError::WouldBlock) => Err(InteractiveInstanceError::AlreadyRunning),
         Err(TryLockError::Error(error)) => Err(InteractiveInstanceError::Io(error)),
@@ -102,7 +90,7 @@ pub fn acquire_interactive_instance(
 
 /// Acquire the per-user singleton slot and, when a custom cache is selected, that
 /// cache's slot too. Locking the stable default path makes different cache overrides
-/// contend across GUI, console, GTK, and elevated launch paths.
+/// contend across GUI launches.
 pub fn acquire_interactive_instances(
     selected_paths: &AppPaths,
     default_cache_dir: &Path,
@@ -120,45 +108,6 @@ pub fn acquire_interactive_instances(
     Ok(guards)
 }
 
-impl InteractiveInstanceGuard {
-    /// Short-lived child handoff for a launcher process that owns this lock.
-    pub fn handoff_token(&self) -> &str {
-        &self.handoff_token
-    }
-}
-
-/// Confirms that a child received the current owner's token and the operating-system
-/// lock is still held. A stale or forged token cannot bypass the singleton lock.
-///
-/// The launcher handoff is used by the Linux GTK/VTE frontend. On Windows, the
-/// standard whole-file lock is mandatory, so a second handle cannot read the
-/// owner's token while validating; Windows frontends acquire the singleton
-/// directly and do not use this handoff path.
-pub fn validate_interactive_instance_handoff(paths: &AppPaths, token: &str) -> bool {
-    #[cfg(windows)]
-    {
-        let _ = (paths, token);
-        false
-    }
-    #[cfg(not(windows))]
-    {
-        if token.len() != 32 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return false;
-        }
-        let path = lock_path(paths);
-        let mut file = match OpenOptions::new().read(true).write(true).open(path) {
-            Ok(file) => file,
-            Err(_) => return false,
-        };
-        let mut stored = String::new();
-        if file.read_to_string(&mut stored).is_err() || stored != token {
-            return false;
-        }
-
-        matches!(file.try_lock(), Err(TryLockError::WouldBlock))
-    }
-}
-
 fn lock_path(paths: &AppPaths) -> PathBuf {
     paths.cache_dir.join("interactive-frontend.lock")
 }
@@ -167,7 +116,6 @@ fn lock_path(paths: &AppPaths) -> PathBuf {
 mod tests {
     use super::{
         InteractiveInstanceError, acquire_interactive_instance, acquire_interactive_instances,
-        validate_interactive_instance_handoff,
     };
     use crate::cache::AppPaths;
 
@@ -182,31 +130,12 @@ mod tests {
         let paths = AppPaths::with_base_dir(cache.clone());
 
         let first = acquire_interactive_instance(&paths).expect("first frontend acquires lock");
-        let handoff_token = first.handoff_token().to_string();
-        #[cfg(not(windows))]
-        assert!(validate_interactive_instance_handoff(
-            &paths,
-            &handoff_token
-        ));
-        #[cfg(windows)]
-        assert!(!validate_interactive_instance_handoff(
-            &paths,
-            &handoff_token
-        ));
-        assert!(!validate_interactive_instance_handoff(
-            &paths,
-            "not-the-token"
-        ));
         assert!(matches!(
             acquire_interactive_instance(&paths),
             Err(InteractiveInstanceError::AlreadyRunning)
         ));
 
         drop(first);
-        assert!(!validate_interactive_instance_handoff(
-            &paths,
-            &handoff_token
-        ));
         let second = acquire_interactive_instance(&paths).expect("lock is released on drop");
         drop(second);
         std::fs::remove_dir_all(cache).expect("temporary cache cleanup");

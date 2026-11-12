@@ -15,7 +15,7 @@ use crate::doh::resolve_ipv4_via_cloudflare_doh;
 
 /// Skip auto-prompt for this long after the user declines a given remote version.
 pub const UPDATE_DECLINE_SNOOZE_SECS: u64 = 24 * 3600;
-/// Re-use a successful scan for this long on the interactive dashboard.
+/// Re-use a successful anonymous scan for this long across desktop update checks.
 pub const UPDATE_CACHE_TTL_SECS: u64 = 6 * 3600;
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(12);
@@ -24,7 +24,7 @@ const CDN_CHECK_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Public desktop label. Cargo crate version stays SemVer; a trailing letter
 /// (`0.3.4a`) is a revision after that numeric patch for update prompts.
-pub const PRODUCT_VERSION: &str = "0.5.1";
+pub const PRODUCT_VERSION: &str = "0.5.2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DesktopVersion {
@@ -418,13 +418,13 @@ pub async fn check_remote_desktop_version() -> Result<RemoteDesktopVersion, Stri
     let urls = version_check_urls(&slug);
     let github: Vec<String> = urls
         .iter()
+        .filter(|&u| is_github_version_url(u))
         .cloned()
-        .filter(|u| is_github_version_url(u))
         .collect();
     let cdn: Vec<String> = urls
         .iter()
+        .filter(|&u| !is_github_version_url(u))
         .cloned()
-        .filter(|u| !is_github_version_url(u))
         .collect();
 
     // GitHub raw is the source of truth for public main. Do not let a stale
@@ -525,7 +525,7 @@ pub fn cache_is_fresh(cache: &UpdateCheckCache) -> bool {
     now_unix_secs().saturating_sub(cache.checked_at) < UPDATE_CACHE_TTL_SECS
 }
 
-/// Auto-prompt on the dashboard unless this remote version was declined recently.
+/// Auto-prompt on the desktop UI unless this remote version was declined recently.
 pub fn should_auto_prompt(cache: &UpdateCheckCache, remote: &DesktopVersion) -> bool {
     if cache.declined_version != remote.as_str() {
         return true;

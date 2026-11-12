@@ -1,11 +1,13 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::fs;
-use std::io::{self, IsTerminal};
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
-use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -13,35 +15,30 @@ use std::time::{Duration, Instant};
 use vpngate_core::{
     ActiveSessionState, AppPaths, ConnectSessionConfig, CooldownStore, CountrySummary,
     DEFAULT_COOLDOWN_SECS, DiscoveryClient, DiscoveryOptions, INTERRUPTED_EXIT, Ikev1StateInfo,
-    InteractiveInstanceError, MONITOR_INTERVAL_SECONDS, NM_PROFILE_PREFIX, OfficialMirrorSite,
-    PRODUCT_VERSION, ProgressEvent, ProtocolFilter, ServerCacheFile, SortBy, VpnServer,
-    acquire_interactive_instances, cached_newer_than_installed, cleanup_existing_vpn_with_progress,
-    default_repo_slug, detect_host_os_label, engage_candidates_with_progress,
-    fetch_public_url_text, filter_by_country, filter_by_protocol, find_openvpn_bin, fix_owner,
-    get_default_gateway, get_ppp_interfaces, get_public_ip_trace, get_running_monitor_pid,
-    get_running_openvpn_pid, get_servers_cached_with_progress, get_tun_interfaces,
-    installed_desktop_version, installer_script_urls, is_root_or_admin, load_cached_mirrors,
-    load_cooldowns, load_update_cache, load_watchdog_pref, normalize_mirror_base_url,
-    now_unix_secs, parse_dns_list, probe_tcp, prune_stale_state_if_dead, query_windows_natt_rule,
-    read_json_opt, record_update_declined, refresh_update_cache, resolve_user_home,
-    run_ikev1_crypto_self_test, save_cached_mirrors, save_cooldowns, save_watchdog_pref,
-    should_auto_prompt, sort_servers, spawn_auto_reconnect_monitor, stop_monitor_daemon,
-    summarize_countries, tunnel_aid_dns_cli, validate_interactive_instance_handoff,
-    verify_l2tp_psk_vpn, wait_for_cancel_file, which_bin,
+    MONITOR_INTERVAL_SECONDS, NM_PROFILE_PREFIX, OfficialMirrorSite, PRODUCT_VERSION,
+    ProgressEvent, ProtocolFilter, ServerCacheFile, SortBy, cached_newer_than_installed,
+    cleanup_existing_vpn_with_progress, default_repo_slug, detect_host_os_label,
+    engage_candidates_with_progress, fetch_public_url_text, filter_by_country, filter_by_protocol,
+    find_openvpn_bin, fix_owner, get_default_gateway, get_ppp_interfaces, get_public_ip_trace,
+    get_running_monitor_pid, get_running_openvpn_pid, get_servers_cached_with_progress,
+    get_tun_interfaces, installed_desktop_version, installer_script_urls, is_root_or_admin,
+    load_cached_mirrors, load_cooldowns, load_update_cache, load_watchdog_pref,
+    normalize_mirror_base_url, now_unix_secs, parse_dns_list, probe_tcp, prune_stale_state_if_dead,
+    query_windows_natt_rule, read_json_opt, record_update_declined, refresh_update_cache,
+    resolve_user_home, run_ikev1_crypto_self_test, save_cached_mirrors, save_cooldowns,
+    save_watchdog_pref, should_auto_prompt, sort_servers, spawn_auto_reconnect_monitor,
+    stop_monitor_daemon, summarize_countries, verify_l2tp_psk_vpn, wait_for_cancel_file, which_bin,
 };
 
 use crate::term_ui::{
-    Align, BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW, clear_screen_if_tty, clear_transient_line,
-    dynamic_resize_enabled, err, format_duration, format_thousands_u64, get_live_terminal_size,
-    info, is_stdout_tty, ok, print_line, prompt_input, render_dynamic_box, render_dynamic_table,
-    render_progress_event, request_window_resize, screen_clear_enabled, truncate_plain,
-    visible_len, warn, win_vt_enabled,
+    Align, BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW, clear_transient_line, err, format_duration,
+    format_thousands_u64, info, is_stdout_tty, ok, print_line, prompt_input, render_dynamic_box,
+    render_dynamic_table, render_progress_event, truncate_plain, warn,
 };
 
 static UAC_ALREADY_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 static NO_ELEVATE_REQUESTED: AtomicBool = AtomicBool::new(false);
 static SKIP_UPDATE_CHECK: AtomicBool = AtomicBool::new(false);
-static UPDATE_PROMPT_DONE: AtomicBool = AtomicBool::new(false);
 
 pub fn set_uac_already_attempted(val: bool) {
     UAC_ALREADY_ATTEMPTED.store(val, Ordering::Relaxed);
@@ -314,27 +311,6 @@ pub fn elevate_self(paths: &AppPaths, sub_args: &[String]) -> i32 {
     }
 }
 
-#[cfg(windows)]
-fn launch_elevated_interactive_console(paths: &AppPaths, default_cache_dir: &Path) -> bool {
-    let Ok(self_exe) = env::current_exe() else {
-        return false;
-    };
-    let mut args = vec![
-        "--uac-elevated".to_string(),
-        "--cache-dir".to_string(),
-        paths.cache_dir.display().to_string(),
-        "--interactive-default-cache-dir".to_string(),
-        default_cache_dir.display().to_string(),
-    ];
-    if !dynamic_resize_enabled() {
-        args.push("--no-resize".to_string());
-    }
-    if !screen_clear_enabled() {
-        args.push("--no-clear".to_string());
-    }
-    win_uac::run_elevated(&self_exe, &args, false).is_ok()
-}
-
 fn render_established_session_summary(st: &ActiveSessionState) -> io::Result<()> {
     ok(&format!(
         "ESTABLISHED VPN! Server: {BOLD}{}{RESET} ({} - {}) | Protocol: {BOLD}{}{RESET} [{}] | Egress IP: {GREEN}{}{RESET} ({})",
@@ -475,7 +451,6 @@ pub async fn cmd_countries(
     force_refresh: bool,
     custom_mirrors: &[String],
 ) -> io::Result<i32> {
-    clear_screen_if_tty();
     let extra = parse_custom_mirrors(custom_mirrors);
     let servers =
         match get_servers_cached_with_progress(paths, force_refresh, &extra, render_progress_event)
@@ -509,7 +484,6 @@ pub async fn cmd_list(
     force_refresh: bool,
     custom_mirrors: &[String],
 ) -> io::Result<i32> {
-    clear_screen_if_tty();
     let extra = parse_custom_mirrors(custom_mirrors);
     let servers =
         match get_servers_cached_with_progress(paths, force_refresh, &extra, render_progress_event)
@@ -655,7 +629,6 @@ pub async fn cmd_connect(paths: &AppPaths, args: &ConnectArgs) -> io::Result<i32
         .unwrap_or_else(|| load_watchdog_pref(paths));
 
     if !is_root_or_admin() {
-        clear_screen_if_tty();
         info(if cfg!(windows) {
             "Elevating privileges to Administrator to configure VPN network interface ..."
         } else {
@@ -691,12 +664,6 @@ pub async fn cmd_connect(paths: &AppPaths, args: &ConnectArgs) -> io::Result<i32
             sub.push("--cancel-file".to_string());
             sub.push(path.display().to_string());
         }
-        if !dynamic_resize_enabled() {
-            sub.push("--no-resize".to_string());
-        }
-        if !screen_clear_enabled() {
-            sub.push("--no-clear".to_string());
-        }
         sub.push(if auto_reconnect {
             "--autoreconnect".to_string()
         } else {
@@ -714,8 +681,6 @@ pub async fn cmd_connect(paths: &AppPaths, args: &ConnectArgs) -> io::Result<i32
         }
         return Ok(rc);
     }
-
-    clear_screen_if_tty();
     let extra = parse_custom_mirrors(&args.custom_mirrors);
     let servers = tokio::select! {
         biased;
@@ -795,19 +760,12 @@ pub async fn cmd_connect(paths: &AppPaths, args: &ConnectArgs) -> io::Result<i32
 
 pub async fn cmd_disconnect(paths: &AppPaths) -> io::Result<i32> {
     if !is_root_or_admin() {
-        clear_screen_if_tty();
         info(if cfg!(windows) {
             "Elevating privileges to Administrator to disconnect VPN ..."
         } else {
             "Elevating privileges with sudo to disconnect VPN ..."
         });
-        let mut sub = vec!["disconnect".to_string()];
-        if !dynamic_resize_enabled() {
-            sub.push("--no-resize".to_string());
-        }
-        if !screen_clear_enabled() {
-            sub.push("--no-clear".to_string());
-        }
+        let sub = vec!["disconnect".to_string()];
         let rc = elevate_self(paths, &sub);
         if cfg!(windows) && rc == 0 {
             ok(
@@ -824,8 +782,6 @@ pub async fn cmd_disconnect(paths: &AppPaths) -> io::Result<i32> {
         }
         return Ok(rc);
     }
-
-    clear_screen_if_tty();
     info("Tearing down active VPN tunnel and removing VPN Gate L2TP/OpenVPN profile residue ...");
     cleanup_existing_vpn_with_progress(paths, true, true, false, render_progress_event);
     ok(
@@ -854,7 +810,6 @@ fn clear_relay_cooldowns(paths: &AppPaths) -> io::Result<usize> {
 }
 
 pub fn cmd_reset_cooldowns(paths: &AppPaths) -> io::Result<i32> {
-    clear_screen_if_tty();
     let cleared = clear_relay_cooldowns(paths)?;
     if cleared == 0 {
         info("No active relay cooldown entries needed resetting.");
@@ -867,7 +822,6 @@ pub fn cmd_reset_cooldowns(paths: &AppPaths) -> io::Result<i32> {
 }
 
 pub async fn cmd_refresh(paths: &AppPaths, custom_mirrors: &[String]) -> io::Result<i32> {
-    clear_screen_if_tty();
     let mut cooldowns = load_cooldowns(paths);
     let cleared = cooldowns.clear_all();
     save_cooldowns(paths, &mut cooldowns);
@@ -922,7 +876,6 @@ pub async fn cmd_refresh(paths: &AppPaths, custom_mirrors: &[String]) -> io::Res
 }
 
 pub async fn cmd_mirrors(paths: &AppPaths, custom_mirrors: &[String]) -> io::Result<i32> {
-    clear_screen_if_tty();
     let _ = paths.ensure_dirs();
     let mut seeds = parse_custom_mirrors(custom_mirrors);
     for m in load_cached_mirrors(paths) {
@@ -1026,7 +979,6 @@ pub async fn cmd_mirrors(paths: &AppPaths, custom_mirrors: &[String]) -> io::Res
 }
 
 pub async fn cmd_status(paths: &AppPaths) -> io::Result<i32> {
-    clear_screen_if_tty();
     let _ = paths.ensure_dirs();
     prune_stale_state_if_dead(paths);
 
@@ -1173,7 +1125,6 @@ pub async fn cmd_status(paths: &AppPaths) -> io::Result<i32> {
 }
 
 pub fn cmd_watchdog(paths: &AppPaths, mode_raw: &str) -> i32 {
-    clear_screen_if_tty();
     prune_stale_state_if_dead(paths);
     let wd_pref = load_watchdog_pref(paths);
     let mon_pid = get_running_monitor_pid(paths);
@@ -1257,7 +1208,6 @@ pub fn cmd_watchdog(paths: &AppPaths, mode_raw: &str) -> i32 {
 }
 
 pub fn cmd_doctor(paths: &AppPaths) -> io::Result<i32> {
-    clear_screen_if_tty();
     let os_label = detect_host_os_label();
     let mut lines: Vec<Option<String>> = vec![
         Some(format!(
@@ -1383,43 +1333,24 @@ pub fn cmd_doctor(paths: &AppPaths) -> io::Result<i32> {
         )));
     }
 
-    // 4. Desktop Window / Console UI
-    if cfg!(target_os = "windows") {
-        let (cols, rows) = get_live_terminal_size(100, 30);
-        let vt_tag = if win_vt_enabled() {
-            "VT100 ANSI"
-        } else {
-            "ASCII Fallback"
-        };
-        let wt_note = if which_bin("wt").is_some() {
-            format!("Windows Terminal (`wt.exe`) + UTF-8 CP65001 ({vt_tag}, {cols}x{rows})")
-        } else {
-            format!("PowerShell Console UTF-8 CP65001 ({vt_tag}, {cols}x{rows})")
-        };
+    // 4. Native GUI companion. The CLI remains usable as a command service without it.
+    let gui_name = if cfg!(windows) {
+        "vpngate-gui.exe"
+    } else {
+        "vpngate-gui"
+    };
+    let gui_sibling = env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(gui_name)))
+        .filter(|path| path.is_file());
+    if let Some(gui) = gui_sibling.or_else(|| which_bin("vpngate-gui")) {
         lines.push(Some(format!(
-            "Console UI   : {GREEN}READY{RESET} — {wt_note}"
+            "Native GUI   : {GREEN}AVAILABLE{RESET} — `{}`",
+            gui.display()
         )));
-    } else if cfg!(target_os = "linux") {
-        let self_dir = env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
-        let launcher_ok = which_bin("vpngate-launcher").is_some()
-            || std::path::Path::new("/usr/local/bin/vpngate-launcher").is_file()
-            || self_dir
-                .as_ref()
-                .is_some_and(|d| d.join("vpngate-launcher").is_file());
-        if launcher_ok {
-            lines.push(Some(format!(
-                "GNOME Window : {GREEN}READY{RESET} — `vpngate-launcher` GTK4/VTE dark window"
-            )));
-        } else {
-            lines.push(Some(format!(
-                "GNOME Window : {YELLOW}CLI ONLY{RESET} — Run `sh ./install-vpngate.sh` to install GNOME launcher"
-            )));
-        }
     } else {
         lines.push(Some(format!(
-            "Console UI   : {GREEN}READY{RESET} — macOS Terminal UTF-8"
+            "Native GUI   : {DIM}not found{RESET} — install or build `vpngate-gui` (CLI service remains available)"
         )));
     }
 
@@ -1474,7 +1405,6 @@ pub fn cmd_doctor(paths: &AppPaths) -> io::Result<i32> {
 }
 
 pub async fn cmd_probe(ip_raw: &str) -> io::Result<i32> {
-    clear_screen_if_tty();
     let Ok(ip) = ip_raw.trim().parse::<Ipv4Addr>() else {
         err(&format!("Invalid IPv4 address: {ip_raw}"));
         return Ok(1);
@@ -1507,260 +1437,6 @@ pub async fn cmd_probe(ip_raw: &str) -> io::Result<i32> {
     ];
     render_dynamic_box(&lines, 2, 56)?;
     Ok(0)
-}
-
-fn prompt_protocol(allow_all: bool) -> io::Result<Option<ProtocolFilter>> {
-    clear_screen_if_tty();
-    if allow_all {
-        let box_lines = vec![
-            Some(format!("{CYAN}{BOLD}Select Protocol Filter{RESET}")),
-            None,
-            Some(format!(
-                " {CYAN}[1]{RESET} All Protocols Combined (L2TP/IPsec + OpenVPN UDP/TCP) {GREEN}[Default]{RESET}"
-            )),
-            Some(format!(
-                " {CYAN}[2]{RESET} L2TP/IPsec Only (Verified PSK='vpn', Zero IKEv2)"
-            )),
-            Some(format!(" {CYAN}[3]{RESET} OpenVPN UDP Only")),
-            Some(format!(" {CYAN}[4]{RESET} OpenVPN TCP Only")),
-            Some(format!(" {CYAN}[5]{RESET} OpenVPN Only (UDP + TCP)")),
-            None,
-            Some(format!(" {CYAN}[0]{RESET} Cancel / Back to Main Menu")),
-        ];
-        render_dynamic_box(&box_lines, 4, 68)?;
-        let Some(ans) = prompt_input(&format!(
-            "\nSelect protocol {BOLD}[1-5, Enter=all, 0=Back]{RESET}: "
-        )) else {
-            return Ok(None);
-        };
-        return Ok(match ans.to_ascii_lowercase().as_str() {
-            "0" | "q" | "back" | "cancel" => None,
-            "" | "1" | "all" => Some(ProtocolFilter::Auto),
-            "2" | "l2tp" => Some(ProtocolFilter::Only(vpngate_core::VpnProtocol::L2tpIpsec)),
-            "3" | "udp" | "openvpn-udp" => {
-                Some(ProtocolFilter::Only(vpngate_core::VpnProtocol::OpenVpnUdp))
-            }
-            "4" | "tcp" | "openvpn-tcp" => {
-                Some(ProtocolFilter::Only(vpngate_core::VpnProtocol::OpenVpnTcp))
-            }
-            "5" | "openvpn" => Some(ProtocolFilter::OpenVpnAny),
-            _ => Some(ProtocolFilter::Auto),
-        });
-    }
-
-    let l2tp_desc = if cfg!(target_os = "windows") {
-        "Windows 11 RASMAN/IKEEXT, Zero IKEv2"
-    } else {
-        "Built-In Rust IKEv1 + Kernel XFRM + xl2tpd"
-    };
-    let box_lines = vec![
-        Some(format!("{CYAN}{BOLD}Select Connection Protocol{RESET}")),
-        None,
-        Some(format!(
-            " {CYAN}[1]{RESET} Auto Hybrid (Try L2TP/IPsec -> OpenVPN UDP -> OpenVPN TCP) {GREEN}[Recommended]{RESET}"
-        )),
-        Some(format!(" {CYAN}[2]{RESET} L2TP/IPsec Only ({l2tp_desc})")),
-        Some(format!(" {CYAN}[3]{RESET} OpenVPN UDP Only")),
-        Some(format!(" {CYAN}[4]{RESET} OpenVPN TCP Only")),
-        Some(format!(
-            " {CYAN}[5]{RESET} OpenVPN Only (UDP -> TCP automatic fallback)"
-        )),
-        None,
-        Some(format!(" {CYAN}[0]{RESET} Cancel / Back to Main Menu")),
-    ];
-    render_dynamic_box(&box_lines, 4, 74)?;
-    let Some(ans) = prompt_input(&format!(
-        "\nSelect protocol {BOLD}[1-5, Enter=auto, 0=Back]{RESET}: "
-    )) else {
-        return Ok(None);
-    };
-    Ok(match ans.to_ascii_lowercase().as_str() {
-        "0" | "q" | "back" | "cancel" => None,
-        "" | "1" | "auto" => Some(ProtocolFilter::Auto),
-        "2" | "l2tp" => Some(ProtocolFilter::Only(vpngate_core::VpnProtocol::L2tpIpsec)),
-        "3" | "udp" | "openvpn-udp" => {
-            Some(ProtocolFilter::Only(vpngate_core::VpnProtocol::OpenVpnUdp))
-        }
-        "4" | "tcp" | "openvpn-tcp" => {
-            Some(ProtocolFilter::Only(vpngate_core::VpnProtocol::OpenVpnTcp))
-        }
-        "5" | "openvpn" => Some(ProtocolFilter::OpenVpnAny),
-        _ => Some(ProtocolFilter::Auto),
-    })
-}
-
-fn prompt_country(servers: &[VpnServer], proto: ProtocolFilter) -> io::Result<Option<String>> {
-    clear_screen_if_tty();
-    let filtered = filter_by_protocol(servers, proto);
-    let rows = summarize_countries(&filtered);
-    if rows.is_empty() {
-        warn("No countries available for that protocol filter.");
-        return Ok(None);
-    }
-    print_countries_table(&rows, proto.as_cli_str(), true)?;
-    print_line(&format!(
-        "  {CYAN}[A]{RESET} All Regions / Best Available Worldwide"
-    ));
-    print_line(&format!(
-        "  Several: {CYAN}1,4,7{RESET} or {CYAN}JP KR{RESET}  (union, same sort order)"
-    ));
-    print_line(&format!("  {CYAN}[0]{RESET} Cancel / Back to Main Menu"));
-    loop {
-        let Some(ans) = prompt_input(&format!(
-            "\nSelect region by {BOLD}Number (1-{}){RESET}, {BOLD}code(s) (JP or JP,KR){RESET}, {BOLD}A (All){RESET}, or {BOLD}0 (Back){RESET}: ",
-            rows.len()
-        )) else {
-            return Ok(None);
-        };
-        if ans.is_empty() || matches!(ans.to_ascii_lowercase().as_str(), "0" | "q" | "back") {
-            return Ok(None);
-        }
-        match interpret_country_selection(&ans, &rows, &filtered) {
-            Some(sel) => return Ok(Some(sel)),
-            None => warn(&format!(
-                "Invalid selection '{ans}'. Use 1-{}, JP, JP,KR or 1,4 — or 0 to cancel.",
-                rows.len()
-            )),
-        }
-    }
-}
-
-fn interpret_country_selection(
-    ans: &str,
-    rows: &[CountrySummary],
-    filtered: &[VpnServer],
-) -> Option<String> {
-    let trimmed = ans.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if matches!(
-        trimmed.to_ascii_lowercase().as_str(),
-        "a" | "all" | "*" | "worldwide"
-    ) {
-        return Some("all".to_string());
-    }
-    let has_list_sep = trimmed.contains(',') || trimmed.contains(';') || trimmed.contains('/');
-    let ws: Vec<&str> = trimmed.split_whitespace().collect();
-    let iso_or_idx = |t: &str| {
-        t.parse::<usize>().is_ok()
-            || (t.len() == 2 && t.chars().all(|c| c.is_ascii_alphabetic()))
-            || matches!(
-                t.to_ascii_lowercase().as_str(),
-                "a" | "all" | "*" | "worldwide"
-            )
-    };
-    let chunks: Vec<&str> = if has_list_sep {
-        trimmed
-            .split(|c: char| c == ',' || c == ';' || c == '/' || c.is_whitespace())
-            .filter(|s| !s.is_empty())
-            .collect()
-    } else if ws.len() > 1 && ws.iter().copied().all(iso_or_idx) {
-        ws
-    } else {
-        vec![trimmed]
-    };
-    if chunks.is_empty() {
-        return None;
-    }
-    let mut codes = Vec::new();
-    let mut seen = HashSet::new();
-    for chunk in chunks {
-        if matches!(
-            chunk.to_ascii_lowercase().as_str(),
-            "a" | "all" | "*" | "worldwide"
-        ) {
-            return Some("all".to_string());
-        }
-        if let Ok(idx) = chunk.parse::<usize>() {
-            if idx >= 1 && idx <= rows.len() {
-                let code = rows[idx - 1].country_short.clone();
-                if seen.insert(code.to_ascii_uppercase()) {
-                    codes.push(code);
-                }
-                continue;
-            }
-            return None;
-        }
-        let matched = filter_by_country(filtered, Some(chunk));
-        let Some(first) = matched.first() else {
-            return None;
-        };
-        let code = first.country_short.clone();
-        if seen.insert(code.to_ascii_uppercase()) {
-            codes.push(code);
-        }
-    }
-    if codes.is_empty() {
-        None
-    } else {
-        Some(codes.join(","))
-    }
-}
-
-fn prompt_sort() -> io::Result<Option<SortBy>> {
-    clear_screen_if_tty();
-    let box_lines = vec![
-        Some(format!(
-            "{CYAN}{BOLD}Select Server Priority / Sort Order{RESET}"
-        )),
-        None,
-        Some(format!(
-            " {CYAN}[1]{RESET} Highest Score (Overall stability & throughput) {GREEN}[Default]{RESET}"
-        )),
-        Some(format!(" {CYAN}[2]{RESET} Fastest Line Speed (Mbps)")),
-        Some(format!(" {CYAN}[3]{RESET} Lowest Ping Latency (ms)")),
-        None,
-        Some(format!(" {CYAN}[0]{RESET} Cancel / Back to Main Menu")),
-    ];
-    render_dynamic_box(&box_lines, 4, 66)?;
-    let Some(ans) = prompt_input(&format!(
-        "\nSelect sort order {BOLD}[1-3, Enter=1, 0=Back]{RESET}: "
-    )) else {
-        return Ok(None);
-    };
-    Ok(match ans.to_ascii_lowercase().as_str() {
-        "0" | "q" | "back" | "cancel" => None,
-        "" | "1" | "score" | "recommended" => Some(SortBy::Recommended),
-        "2" | "speed" => Some(SortBy::Speed),
-        "3" | "ping" => Some(SortBy::Ping),
-        _ => Some(SortBy::Recommended),
-    })
-}
-
-fn local_pool_summary_line(paths: &AppPaths) -> String {
-    let cd_cnt = load_cooldowns(paths).active_count();
-    let mirrors_cnt = load_cached_mirrors(paths).len();
-    let cd_tag = if cd_cnt > 0 {
-        format!("  |  Cooldowns: {YELLOW}{cd_cnt}{RESET}")
-    } else {
-        String::new()
-    };
-    let mir_tag = if mirrors_cnt > 0 {
-        format!("  |  Mirrors: {BOLD}{mirrors_cnt}{RESET}")
-    } else {
-        String::new()
-    };
-    if let Some(cache) = read_json_opt::<ServerCacheFile>(&paths.servers_cache)
-        && !cache.servers.is_empty()
-    {
-        let l2 = cache.servers.iter().filter(|s| s.l2tp).count();
-        let ov = cache.servers.iter().filter(|s| s.openvpn).count();
-        let age_m = now_unix_secs().saturating_sub(cache.timestamp) / 60;
-        format!(
-            "Pool     : {BOLD}{}{RESET} cached ({GREEN}{l2} L2TP{RESET}, {CYAN}{ov} OVPN{RESET} · {age_m}m ago){mir_tag}{cd_tag}",
-            cache.servers.len()
-        )
-    } else {
-        format!("Pool     : {DIM}Not fetched yet (auto-loads on selection){RESET}{mir_tag}{cd_tag}")
-    }
-}
-
-fn pause_for_dashboard(rc: i32) {
-    if rc == INTERRUPTED_EXIT {
-        return;
-    }
-    let _ = prompt_input("\nPress Enter to return to Dashboard...");
 }
 
 fn is_dev_tree_binary() -> bool {
@@ -1926,42 +1602,10 @@ pub enum UpgradeOffer {
 }
 
 pub async fn cmd_upgrade(paths: &AppPaths, assume_yes: bool) -> io::Result<i32> {
-    clear_screen_if_tty();
     match offer_desktop_upgrade(paths, true, assume_yes).await? {
         UpgradeOffer::Continue => Ok(0),
         UpgradeOffer::ExitAfterInstall => Ok(0),
         UpgradeOffer::Failed(rc) => Ok(rc),
-    }
-}
-
-fn desktop_update_status_line(paths: &AppPaths) -> String {
-    let local = installed_desktop_version();
-    match load_update_cache(paths) {
-        Some(cache) if !cache.last_error.is_empty() && cache.remote_version.is_empty() => {
-            format!(
-                "Update   : {YELLOW}CHECK FAILED{RESET} — run `{BOLD}vpngate update{RESET}` (anonymous HTTPS, no GitHub login)"
-            )
-        }
-        Some(cache) => {
-            if let Some(remote) = vpngate_core::DesktopVersion::parse(&cache.remote_version) {
-                if remote > local {
-                    format!(
-                        "Update   : {YELLOW}{BOLD}{} available{RESET} — you have {local}. Installing is strongly recommended.",
-                        cache.remote_version
-                    )
-                } else if remote < local {
-                    format!(
-                        "Update   : {CYAN}{local}{RESET} — newer than public main ({})",
-                        cache.remote_version
-                    )
-                } else {
-                    format!("Update   : {GREEN}up to date{RESET} — public main is {local}")
-                }
-            } else {
-                format!("Update   : {DIM}not checked yet{RESET}")
-            }
-        }
-        None => format!("Update   : {DIM}not checked yet{RESET}"),
     }
 }
 
@@ -1999,12 +1643,11 @@ pub async fn offer_desktop_upgrade(
         }
         return Ok(UpgradeOffer::Continue);
     }
-    if !force {
-        if let Some(cache) = load_update_cache(paths)
-            && !should_auto_prompt(&cache, &remote.version)
-        {
-            return Ok(UpgradeOffer::Continue);
-        }
+    if !force
+        && let Some(cache) = load_update_cache(paths)
+        && !should_auto_prompt(&cache, &remote.version)
+    {
+        return Ok(UpgradeOffer::Continue);
     }
     prompt_and_maybe_install(paths, &remote, assume_yes).await
 }
@@ -2092,338 +1735,6 @@ async fn prompt_and_maybe_install(
         Ok(UpgradeOffer::ExitAfterInstall)
     } else {
         Ok(UpgradeOffer::Failed(rc))
-    }
-}
-
-pub async fn interactive_menu(
-    paths: &AppPaths,
-    help_text: &str,
-    default_cache_dir: &Path,
-    handoff_token: Option<&str>,
-) -> io::Result<i32> {
-    let os_label = detect_host_os_label();
-
-    #[cfg(windows)]
-    if !is_root_or_admin() && is_stdout_tty() && !uac_already_attempted() && !no_elevate_requested()
-    {
-        info("Requesting Administrator privileges via Windows UAC ...");
-        if launch_elevated_interactive_console(paths, default_cache_dir) {
-            ok("Opened elevated Administrator VPN Gate console window.");
-            return Ok(0);
-        }
-        warn(
-            "UAC elevation was declined - continuing without pre-elevation; privileged actions may request credentials when needed.",
-        );
-        tokio::time::sleep(Duration::from_millis(900)).await;
-    }
-
-    let default_lock_paths = AppPaths::with_base_dir(default_cache_dir.to_path_buf());
-    let _interactive_instances = if handoff_token
-        .is_some_and(|token| validate_interactive_instance_handoff(&default_lock_paths, token))
-    {
-        Vec::new()
-    } else {
-        match acquire_interactive_instances(paths, default_cache_dir) {
-            Ok(guards) => guards,
-            Err(InteractiveInstanceError::AlreadyRunning) => {
-                err(
-                    "Another VPN Gate Connect frontend is already open. Close it before starting this one.",
-                );
-                return Ok(75);
-            }
-            Err(error) => {
-                err(&format!("Cannot start the interactive frontend: {error}"));
-                return Ok(2);
-            }
-        }
-    };
-
-    let mut startup_update_checked = false;
-
-    loop {
-        if is_stdout_tty() && !skip_update_check() && !startup_update_checked {
-            live_check_desktop_update(paths).await;
-            startup_update_checked = true;
-        }
-        clear_screen_if_tty();
-        prune_stale_state_if_dead(paths);
-
-        let mon_pid = get_running_monitor_pid(paths);
-        let wd_pref = load_watchdog_pref(paths);
-        let wd_str = if mon_pid > 0 {
-            format!("{GREEN}ARMED (PID {mon_pid}, {MONITOR_INTERVAL_SECONDS}s){RESET}")
-        } else if wd_pref {
-            format!("{CYAN}ON (Standby){RESET}")
-        } else {
-            format!("{DIM}OFF{RESET}")
-        };
-
-        let status_line = if let Some(st) = read_json_opt::<ActiveSessionState>(&paths.active_state)
-        {
-            format!(
-                "Tunnel   : {GREEN}● ACTIVE{RESET} -> {BOLD}{}{RESET} ({} · {})  |  Watchdog: {wd_str}",
-                st.hostname, st.country_short, st.protocol
-            )
-        } else {
-            let ppp = get_ppp_interfaces();
-            let tun = get_tun_interfaces();
-            let ovpn_pid = if cfg!(target_os = "windows") {
-                get_running_openvpn_pid(paths)
-            } else {
-                0
-            };
-            if let Some((dev, ip)) = ppp.iter().next() {
-                format!(
-                    "Tunnel   : {GREEN}● ACTIVE PPP LINK{RESET} ({dev} -> {ip})  |  Watchdog: {wd_str}"
-                )
-            } else if let Some((dev, ip)) = tun.iter().next() {
-                format!(
-                    "Tunnel   : {GREEN}● ACTIVE TUN LINK{RESET} ({dev} -> {ip})  |  Watchdog: {wd_str}"
-                )
-            } else if ovpn_pid > 0 {
-                format!(
-                    "Tunnel   : {GREEN}● ACTIVE OPENVPN{RESET} (PID {ovpn_pid})  |  Watchdog: {wd_str}"
-                )
-            } else {
-                format!("Tunnel   : {DIM}○ Disconnected{RESET}  |  Watchdog: {wd_str}")
-            }
-        };
-
-        let menu_lines = vec![
-            Some(format!(
-                "{CYAN}{BOLD}VPN Gate Console v{}{RESET}  ·  {os_label} (Auto: L2TP/IPsec -> OVPN UDP -> OVPN TCP)",
-                PRODUCT_VERSION
-            )),
-            Some(status_line),
-            Some(local_pool_summary_line(paths)),
-            Some(desktop_update_status_line(paths)),
-            None,
-            Some(format!(
-                " {CYAN}[1]{RESET} Quick Connect by Region (Recommended Auto: L2TP -> OVPN UDP -> TCP)"
-            )),
-            Some(format!(
-                " {CYAN}[2]{RESET} Browse & Pick Specific Server in a Country / Region"
-            )),
-            Some(format!(
-                " {CYAN}[3]{RESET} View Unified Countries & Regions Table (L2TP + OpenVPN)"
-            )),
-            Some(format!(
-                " {CYAN}[4]{RESET} Live Tunnel, IPsec SA & Public Egress Status"
-            )),
-            Some(format!(
-                " {CYAN}[5]{RESET} Toggle Auto-Reconnect Watchdog ({})",
-                if mon_pid > 0 || wd_pref {
-                    "Turn OFF"
-                } else {
-                    "Turn ON"
-                }
-            )),
-            Some(format!(
-                " {CYAN}[6]{RESET} Disconnect Active VPN & Restore Host Network"
-            )),
-            Some(format!(
-                " {CYAN}[7]{RESET} Refresh Server Pool Cache & Clear Server Cooldowns"
-            )),
-            Some(format!(
-                " {CYAN}[8]{RESET} Official VPNGate Mirror Sites (Live Probe & Add Custom Mirror)"
-            )),
-            Some(format!(
-                " {CYAN}[9]{RESET} System Readiness Check (`doctor`) & CLI Reference"
-            )),
-            None,
-            Some(format!(
-                " {CYAN}[0]{RESET} Exit Console {DIM}(Active VPN & Watchdog keep running in background){RESET}"
-            )),
-        ];
-        render_dynamic_box(&menu_lines, 5, 76)?;
-
-        if is_stdout_tty()
-            && !skip_update_check()
-            && startup_update_checked
-            && !UPDATE_PROMPT_DONE.load(Ordering::Relaxed)
-        {
-            UPDATE_PROMPT_DONE.store(true, Ordering::Relaxed);
-            match maybe_prompt_if_newer(paths, true).await? {
-                Some(UpgradeOffer::ExitAfterInstall) => return Ok(0),
-                Some(UpgradeOffer::Continue | UpgradeOffer::Failed(_)) => continue,
-                None => {}
-            }
-        }
-
-        let Some(choice) = prompt_input(&format!("\nSelect an action {BOLD}[0-9]{RESET}: ")) else {
-            print_line("");
-            if io::stdin().is_terminal() {
-                warn("Interrupted — still at the main menu.");
-                continue;
-            }
-            return Ok(0);
-        };
-
-        match choice.to_ascii_lowercase().as_str() {
-            "0" | "q" | "quit" | "exit" => return Ok(0),
-            "1" => {
-                clear_screen_if_tty();
-                let Ok(servers) =
-                    get_servers_cached_with_progress(paths, false, &[], render_progress_event)
-                        .await
-                else {
-                    err("Could not load server pool.");
-                    let _ = prompt_input("\nPress Enter to return to Dashboard...");
-                    continue;
-                };
-                let Some(proto) = prompt_protocol(false)? else {
-                    continue;
-                };
-                let Some(country) = prompt_country(&servers, proto)? else {
-                    continue;
-                };
-                let Some(sort_by) = prompt_sort()? else {
-                    continue;
-                };
-                let cargs = ConnectArgs {
-                    country,
-                    proto_filter: proto,
-                    sort_by,
-                    limit: 0,
-                    timeout_secs: 22,
-                    engine: "auto".to_string(),
-                    dns: tunnel_aid_dns_cli(),
-                    start_index: 1,
-                    force_refresh: false,
-                    auto_reconnect_override: None,
-                    custom_mirrors: Vec::new(),
-                    cancel_file: None,
-                };
-                let rc = cmd_connect(paths, &cargs).await?;
-                pause_for_dashboard(rc);
-            }
-            "2" => {
-                clear_screen_if_tty();
-                let Ok(servers) =
-                    get_servers_cached_with_progress(paths, false, &[], render_progress_event)
-                        .await
-                else {
-                    err("Could not load server pool.");
-                    let _ = prompt_input("\nPress Enter to return to Dashboard...");
-                    continue;
-                };
-                let Some(proto) = prompt_protocol(false)? else {
-                    continue;
-                };
-                let Some(country) = prompt_country(&servers, proto)? else {
-                    continue;
-                };
-                let Some(sort_by) = prompt_sort()? else {
-                    continue;
-                };
-                let mut candidates =
-                    filter_by_country(&filter_by_protocol(&servers, proto), Some(&country));
-                sort_servers(&mut candidates, sort_by, proto);
-                if candidates.is_empty() {
-                    warn("No matching servers found.");
-                    let _ = prompt_input("\nPress Enter to return to Dashboard...");
-                    continue;
-                }
-                let _ = cmd_list(paths, Some(&country), proto, sort_by, 35, false, &[]).await?;
-                let Some(ans) = prompt_input(&format!(
-                    "Enter {BOLD}A{RESET} to auto-test from #1, a {BOLD}Server # (1-{}){RESET} to start from that host, or {BOLD}0{RESET} to cancel: ",
-                    candidates.len()
-                )) else {
-                    continue;
-                };
-                let start_idx = if ans.eq_ignore_ascii_case("a") {
-                    1
-                } else if let Ok(n) = ans.parse::<usize>()
-                    && n >= 1
-                    && n <= candidates.len()
-                {
-                    n
-                } else if ans.is_empty()
-                    || matches!(ans.to_ascii_lowercase().as_str(), "0" | "q" | "back")
-                {
-                    continue;
-                } else {
-                    warn(&format!("Invalid server selection '{ans}'."));
-                    let _ = prompt_input("\nPress Enter to return to Dashboard...");
-                    continue;
-                };
-                let cargs = ConnectArgs {
-                    country,
-                    proto_filter: proto,
-                    sort_by,
-                    limit: 0,
-                    timeout_secs: 22,
-                    engine: "auto".to_string(),
-                    dns: tunnel_aid_dns_cli(),
-                    start_index: start_idx,
-                    force_refresh: false,
-                    auto_reconnect_override: None,
-                    custom_mirrors: Vec::new(),
-                    cancel_file: None,
-                };
-                let rc = cmd_connect(paths, &cargs).await?;
-                pause_for_dashboard(rc);
-            }
-            "3" => {
-                let Some(proto) = prompt_protocol(true)? else {
-                    continue;
-                };
-                let _ = cmd_countries(paths, proto, false, &[]).await?;
-                let _ = prompt_input("Press Enter to return to Dashboard...");
-            }
-            "4" => {
-                let _ = cmd_status(paths).await?;
-                let _ = prompt_input("\nPress Enter to return to Dashboard...");
-            }
-            "5" => {
-                let _ = cmd_watchdog(paths, "toggle");
-                let _ = prompt_input("\nPress Enter to return to Dashboard...");
-            }
-            "6" => {
-                let _ = cmd_disconnect(paths).await?;
-                let _ = prompt_input("\nPress Enter to return to Dashboard...");
-            }
-            "7" => {
-                let _ = cmd_refresh(paths, &[]).await?;
-                let _ = prompt_input("\nPress Enter to return to Dashboard...");
-            }
-            "8" => {
-                let _ = cmd_mirrors(paths, &[]).await?;
-                if let Some(ans) = prompt_input(&format!(
-                    "Enter a custom Mirror URL (e.g. {CYAN}http://host:port/en/{RESET}) to add & probe, or {BOLD}Enter{RESET} for Dashboard: "
-                )) && !ans.is_empty()
-                {
-                    let _ = cmd_mirrors(paths, &[ans]).await?;
-                    let _ = prompt_input("\nPress Enter to return to Dashboard...");
-                }
-            }
-            "9" => {
-                let (_rc, offer) = cmd_doctor_with_update(paths).await?;
-                match offer {
-                    UpgradeOffer::ExitAfterInstall => return Ok(0),
-                    UpgradeOffer::Failed(_) | UpgradeOffer::Continue => {}
-                }
-                if let Some(ans) = prompt_input(&format!(
-                    "\nPress {BOLD}H{RESET} to also view CLI command reference (`--help`), or {BOLD}Enter{RESET} for Dashboard: "
-                )) && ans.eq_ignore_ascii_case("h")
-                {
-                    clear_screen_if_tty();
-                    let max_help_w = help_text
-                        .lines()
-                        .map(visible_len)
-                        .max()
-                        .unwrap_or(80)
-                        .max(80);
-                    request_window_resize(max_help_w + 4, (help_text.lines().count() + 5).min(46));
-                    print_line(&format!("\n{help_text}"));
-                    let _ = prompt_input("\nPress Enter to return to Dashboard...");
-                }
-            }
-            _ => {
-                warn(&format!("Invalid option '{choice}'. Please choose 0-9."));
-                tokio::time::sleep(Duration::from_millis(800)).await;
-            }
-        }
     }
 }
 

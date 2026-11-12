@@ -16,15 +16,13 @@ pub const GREEN: &str = "\x1b[1;32m";
 pub const YELLOW: &str = "\x1b[1;33m";
 pub const CYAN: &str = "\x1b[1;36m";
 
-static DYNAMIC_RESIZE_ENABLED: AtomicBool = AtomicBool::new(true);
-static SCREEN_CLEAR_ENABLED: AtomicBool = AtomicBool::new(true);
 static LAST_TRANSIENT_VIS_LEN: AtomicUsize = AtomicUsize::new(0);
 static WIN_VT_ENABLED: AtomicBool = AtomicBool::new(!cfg!(windows));
 
 #[cfg(windows)]
 mod win_console {
     use std::ffi::c_void;
-    use std::ptr::{null, null_mut};
+    use std::ptr::null_mut;
 
     const CP_UTF8: u32 = 65001;
     const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
@@ -39,6 +37,7 @@ mod win_console {
 
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
+    #[allow(dead_code)]
     struct Coord {
         x: i16,
         y: i16,
@@ -55,6 +54,7 @@ mod win_console {
 
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
+    #[allow(dead_code)]
     struct ConsoleScreenBufferInfo {
         dw_size: Coord,
         dw_cursor_position: Coord,
@@ -84,21 +84,6 @@ mod win_console {
             console_output: *mut c_void,
             info: *mut ConsoleScreenBufferInfo,
         ) -> i32;
-        fn FillConsoleOutputCharacterW(
-            console_output: *mut c_void,
-            character: u16,
-            length: u32,
-            write_coord: Coord,
-            number_of_chars_written: *mut u32,
-        ) -> i32;
-        fn FillConsoleOutputAttribute(
-            console_output: *mut c_void,
-            attribute: u16,
-            length: u32,
-            write_coord: Coord,
-            number_of_attrs_written: *mut u32,
-        ) -> i32;
-        fn SetConsoleCursorPosition(console_output: *mut c_void, cursor_position: Coord) -> i32;
         fn CloseHandle(object: *mut c_void) -> i32;
     }
 
@@ -206,46 +191,8 @@ mod win_console {
             if cols > 0 && rows > 0 {
                 Some((cols as usize, rows as usize))
             } else {
-                let _ = null::<u8>();
                 None
             }
-        }
-    }
-
-    pub fn clear_console_buffer() {
-        let name = conout_wide();
-        // SAFETY: Clears active `CONOUT$` screen buffer via Win32 console APIs when VT sequences are unavailable.
-        unsafe {
-            let h_con = CreateFileW(
-                name.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                null_mut(),
-                OPEN_EXISTING,
-                0,
-                null_mut(),
-            );
-            if !is_valid_handle(h_con) {
-                return;
-            }
-            let mut csbi = ConsoleScreenBufferInfo::default();
-            if GetConsoleScreenBufferInfo(h_con, &mut csbi) != 0 {
-                let cells = u32::from(csbi.dw_size.x.max(0) as u16)
-                    .saturating_mul(u32::from(csbi.dw_size.y.max(0) as u16));
-                let origin = Coord { x: 0, y: 0 };
-                let mut written: u32 = 0;
-                let _ =
-                    FillConsoleOutputCharacterW(h_con, b' ' as u16, cells, origin, &mut written);
-                let _ = FillConsoleOutputAttribute(
-                    h_con,
-                    csbi.w_attributes,
-                    cells,
-                    origin,
-                    &mut written,
-                );
-                let _ = SetConsoleCursorPosition(h_con, origin);
-            }
-            let _ = CloseHandle(h_con);
         }
     }
 }
@@ -280,22 +227,6 @@ pub fn ensure_windows_vt_mode() -> bool {
 
 pub fn win_vt_enabled() -> bool {
     WIN_VT_ENABLED.load(Ordering::Relaxed)
-}
-
-pub fn set_dynamic_resize(enabled: bool) {
-    DYNAMIC_RESIZE_ENABLED.store(enabled, Ordering::Relaxed);
-}
-
-pub fn dynamic_resize_enabled() -> bool {
-    DYNAMIC_RESIZE_ENABLED.load(Ordering::Relaxed)
-}
-
-pub fn set_screen_clear(enabled: bool) {
-    SCREEN_CLEAR_ENABLED.store(enabled, Ordering::Relaxed);
-}
-
-pub fn screen_clear_enabled() -> bool {
-    SCREEN_CLEAR_ENABLED.load(Ordering::Relaxed)
 }
 
 pub fn is_stdout_tty() -> bool {
@@ -713,82 +644,9 @@ pub fn get_live_terminal_size(fallback_cols: usize, fallback_rows: usize) -> (us
     (cols, rows)
 }
 
-#[cfg(unix)]
-fn discover_launcher_resize_sock() -> Option<std::path::PathBuf> {
-    if let Ok(sock) = env::var("VPNGATE_RESIZE_SOCK") {
-        let p = std::path::PathBuf::from(sock.trim());
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    // Fallback across `sudo`: inspect controlling TTY marker in `<user_home>/.cache/vpngate/ui_socks/`
-    unsafe {
-        let ptr = libc::ttyname(libc::STDOUT_FILENO);
-        if ptr.is_null() {
-            return None;
-        }
-        let tty_str = std::ffi::CStr::from_ptr(ptr).to_string_lossy();
-        let key = tty_str.trim_start_matches('/').replace('/', "_");
-        let marker = vpngate_core::AppPaths::resolve()
-            .cache_dir
-            .join("ui_socks")
-            .join(format!("{key}.json"));
-        let raw = std::fs::read_to_string(marker).ok()?;
-        let val: serde_json::Value = serde_json::from_str(&raw).ok()?;
-        let sock_str = val.get("sock")?.as_str()?;
-        let p = std::path::PathBuf::from(sock_str);
-        p.exists().then_some(p)
-    }
-}
-
-pub fn request_window_resize(needed_cols: usize, needed_rows: usize) {
-    // Match Python v5.3: never emit CSI `8;r;ct` resize sequences on Windows 11 PowerShell / conhost
-    // (prevents literal escape sequences and scrollbar/viewport jumping; boxes/tables fit to `CONOUT$`).
-    if cfg!(windows) || !dynamic_resize_enabled() || !is_stdout_tty() {
-        return;
-    }
-    let (cur_c, cur_r) = get_live_terminal_size(100, 30);
-    let target_c = cur_c.max(needed_cols).min(170);
-    let target_r = cur_r.max(needed_rows).min(50);
-
-    #[cfg(unix)]
-    if let Some(sock_path) = discover_launcher_resize_sock()
-        && let Ok(dgram) = std::os::unix::net::UnixDatagram::unbound()
-    {
-        let payload = format!(r#"{{"cols":{target_c},"rows":{target_r}}}"#);
-        let _ = dgram.send_to(payload.as_bytes(), sock_path);
-    }
-
-    if target_c > cur_c || target_r > cur_r {
-        let _ = write!(io::stdout(), "\x1b[8;{target_r};{target_c}t");
-        let _ = io::stdout().flush();
-    }
-}
-
-pub fn clear_screen_if_tty() {
-    clear_transient_line();
-    if !screen_clear_enabled() || !is_stdout_tty() {
-        return;
-    }
-    #[cfg(windows)]
-    {
-        if ensure_windows_vt_mode() {
-            let _ = write!(io::stdout(), "\x1b[2J\x1b[H");
-            let _ = io::stdout().flush();
-        } else {
-            win_console::clear_console_buffer();
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = write!(io::stdout(), "\x1b[2J\x1b[3J\x1b[H");
-        let _ = io::stdout().flush();
-    }
-}
-
 pub fn render_dynamic_box(
     lines: &[Option<String>],
-    extra_rows_below: usize,
+    _extra_rows_below: usize,
     min_inner: usize,
 ) -> io::Result<()> {
     clear_transient_line();
@@ -803,11 +661,6 @@ pub fn render_dynamic_box(
     for l in cleaned_lines.iter().flatten() {
         natural_inner = natural_inner.max(visible_len(l));
     }
-    request_window_resize(
-        natural_inner + 6,
-        cleaned_lines.len() + 2 + extra_rows_below,
-    );
-
     let (term_cols, _) = get_live_terminal_size(natural_inner + 6, 30);
     let mut inner_w = natural_inner;
     if is_stdout_tty() && term_cols > 16 {
@@ -863,7 +716,7 @@ pub fn render_dynamic_table(
     flex_cols: &HashMap<usize, usize>,
     col_colors: &HashMap<usize, &str>,
     footer_lines: &[String],
-    extra_rows_below: usize,
+    _extra_rows_below: usize,
 ) -> io::Result<()> {
     clear_transient_line();
     let _ = ensure_windows_vt_mode();
@@ -889,11 +742,6 @@ pub fn render_dynamic_table(
 
     let mut gap = 2usize;
     let natural_width: usize = widths.iter().sum::<usize>() + gap * ncols.saturating_sub(1);
-    request_window_resize(
-        natural_width + 2,
-        clean_rows.len() + clean_footers.len() + 6 + extra_rows_below,
-    );
-
     let (term_cols, _) = get_live_terminal_size(natural_width + 2, 30);
     let avail_cols = if cfg!(windows) && term_cols > 24 {
         term_cols - 2

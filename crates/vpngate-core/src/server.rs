@@ -101,7 +101,7 @@ pub fn split_country_query(raw: &str) -> Vec<String> {
         return Vec::new();
     }
     let mut parts: Vec<String> = q
-        .split(|c: char| c == ',' || c == ';' || c == '/')
+        .split([',', ';', '/'])
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();

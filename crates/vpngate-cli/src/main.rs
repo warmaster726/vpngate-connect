@@ -1,5 +1,5 @@
-//! `vpngate` — Single-Binary Cross-Platform Desktop CLI & Interactive Console
-//! Replicating the Python `v5.3` dual-mode CLI + `[0-9]` Console UX with 100% pure-Rust IKEv1/XFRM.
+//! `vpngate` — Cross-platform VPN Gate command service for the native desktop GUI.
+//! Provides scripted CLI commands backed by the pure-Rust IKEv1/XFRM engine.
 //! 64-bit native (`x86_64` and `aarch64`). 32-bit is not supported.
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -12,17 +12,14 @@ mod term_ui;
 
 use std::env;
 use std::io;
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 
 use commands::{
     ConnectArgs, UpgradeOffer, cmd_connect, cmd_countries, cmd_disconnect, cmd_doctor_with_update,
     cmd_list, cmd_mirrors, cmd_probe, cmd_refresh, cmd_reset_cooldowns, cmd_status, cmd_upgrade,
-    cmd_watchdog, interactive_menu, set_no_elevate_requested, set_skip_update_check,
-    set_uac_already_attempted,
+    cmd_watchdog, set_no_elevate_requested, set_skip_update_check, set_uac_already_attempted,
 };
-use term_ui::{err, init_console, print_line, prompt_input, set_dynamic_resize, set_screen_clear};
+use term_ui::{err, init_console, print_line};
 use vpngate_core::{
     AppPaths, PRODUCT_VERSION, ProtocolFilter, SortBy, assert_supported_native_host,
     run_ikev1_daemon, run_monitor_daemon, tunnel_aid_dns_cli,
@@ -30,209 +27,88 @@ use vpngate_core::{
 
 fn build_help_text() -> String {
     format!(
-        "vpngate v{} — 64-bit SoftEther VPN Gate Client (Auto: L2TP/IPsec -> OVPN UDP -> OVPN TCP)\n\n\
-         USAGE:\n\
-           vpngate                              Launch Interactive Console Dashboard [0-9]\n\
-           vpngate countries [-p PROTO] [-r]    List available countries & protocol counts\n\
-           vpngate list [-c CC] [-p PROTO] [-s SORT] [-n LIMIT] [-r]\n\
-           vpngate connect -c <CC[,CC]|all> [-p PROTO] [-s SORT] [-n LIMIT] [--start N] [-a]\n\
-           vpngate mirrors [--mirror URL]       Discover & live-probe Official VPNGate Mirror Sites\n\
-           vpngate status                       Show active tunnel, XFRM SA, watchdog & egress IP\n\
-           vpngate refresh                      Clear 30m server cooldowns & force live pool update\n\
-           vpngate cooldowns reset              Clear relay cooldowns without refreshing the pool\n\
-           vpngate watchdog [on|off|status]     Manage 15s Auto-Reconnect Watchdog\n\
-           vpngate doctor                       Run crypto, L2TP/XFRM, OpenVPN & network diagnostics\n\
-           vpngate probe <IPv4>                 Run 1-RTT IKEv1 PSK='vpn' + TCP/443 pre-flight check\n\
-           vpngate disconnect                   Tear down active VPN & restore host DNS/routes/firewall\n\
-           vpngate update [-y]                  Scan public main for a newer desktop (no GitHub login) and replace this install\n\
-           vpngate upgrade [-y]                 Same as `vpngate update`\n\n\
-         SHORTHAND FLAGS (Python v5.3 Compatible):\n\
-           -i, --interactive     Launch Interactive Console Dashboard\n\
-           -L, --list-countries  Show unified countries & regions table\n\
-           -l, --list            List matching relay servers\n\
-           -c, --country <CC>    Country code(s) or name (JP, JP,KR, repeat -c, all)\n\
-           -p, --proto <PROTO>   auto (default) | l2tp | openvpn-udp | openvpn-tcp | openvpn\n\
-           -s, --sort <SORT>     score (default) | speed | ping\n\
-           -n, --limit <N>       Max servers to list or try (0 = all)\n\
-           -t, --timeout <SEC>   Per-attempt tunnel timeout in seconds (default: 22)\n\
-           -e, --engine <ENG>    auto | nm | daemon\n\
-               --dns <IPS>       Extra tunnel DNS, merged with connection-pushed resolvers\n\
-                                 (default: Cloudflare+Google IPv4/IPv6)\n\
-               --start <N>       1-based server index in sorted list to start connecting from\n\
-           -M, --mirrors         Discover & live-probe Official VPNGate Mirror Sites\n\
-               --mirror <URL>    Add/use an Official VPNGate Mirror URL (e.g. http://host:port/en/)\n\
-           -r, --refresh         Force live pool refresh from vpngate.net / mirrors\n\
-           -a, --autoreconnect   Enable 15s Auto-Reconnect Watchdog for this session\n\
-               --no-autoreconnect Disable Auto-Reconnect Watchdog for this session\n\
-           -S, --status          Show live VPN tunnel & public egress IP status\n\
-           -D, --doctor          Run system & crypto diagnostics\n\
-           -d, --disconnect      Disconnect active VPN Gate tunnel\n\
-           -w, --window          Launch inside dedicated GNOME GTK/VTE or Windows Terminal window\n\
-               --no-resize       Disable dynamic terminal window resize sequences\n\
-               --no-clear        Do not clear previous screen items before command execution\n\
-               --no-update-check Skip the dashboard scan for a newer desktop\n\
-           -y, --yes             With `update`/`upgrade`, install without an extra confirmation prompt\n\
-           -h, --help            Print this help message\n",
-        PRODUCT_VERSION
+        r#"vpngate v{PRODUCT_VERSION} — VPN Gate command service
+
+USAGE:
+  vpngate [GLOBAL OPTIONS] COMMAND [OPTIONS]
+  vpngate --help
+
+COMMANDS:
+  countries [-p PROTO] [-r]       List available countries and protocol counts
+  list [-c CC] [-p PROTO] [-s SORT] [-n LIMIT] [-r]
+                                  List matching relay servers
+  connect -c <CC[,CC]|all> [-p PROTO] [-s SORT] [-n LIMIT] [--start N] [-a]
+                                  Connect using L2TP/IPsec, then OpenVPN UDP/TCP
+  mirrors [--mirror URL]          Discover and live-probe Official VPN Gate mirrors
+  status                          Show tunnel, XFRM SA, watchdog, and egress status
+  refresh                         Refresh the relay pool and clear cooldowns
+  cooldowns reset                 Clear relay cooldowns without refreshing the pool
+  watchdog [on|off|status]        Manage the auto-reconnect watchdog
+  doctor                          Run crypto, tunnel, OpenVPN, and network diagnostics
+  probe <IPv4>                    Run the IKEv1 PSK='vpn' and TCP/443 pre-flight check
+  disconnect                      Tear down VPN and restore host DNS/routes/firewall
+  update [-y]                     Check for and install a newer desktop version
+  upgrade [-y]                    Alias for `update`
+
+COMMAND FLAGS:
+  -L, --list-countries            List countries and regions
+  -l, --list                      List matching relay servers
+  -c, --country <CC>              Region code/name; repeat or comma-separate; `all` is supported
+  -p, --proto <PROTO>             auto | l2tp | openvpn-udp | openvpn-tcp | openvpn
+  -s, --sort <SORT>               score | speed | ping | recommended
+  -n, --limit <N>                 Maximum relays to list/try (0 = all)
+  -t, --timeout <SEC>             Per-attempt tunnel timeout (default: 22 seconds)
+  -e, --engine <ENG>              auto | nm | daemon
+      --dns <IPS>                  Extra DNS merged with connection-pushed resolvers
+  -M, --mirrors                   Discover and probe official mirror sites
+      --mirror <URL>               Add/use an Official VPN Gate mirror URL
+  -r, --refresh                   Force a live relay-pool refresh
+  -a, --autoreconnect             Enable the 15-second reconnect watchdog for this session
+      --no-autoreconnect           Disable the reconnect watchdog for this session
+  -S, --status                    Show connection status
+  -D, --doctor                    Run system diagnostics
+  -d, --disconnect                Disconnect the active tunnel
+  -y, --yes                       Skip the update-install confirmation prompt
+
+GLOBAL OPTIONS:
+      --cache-dir <PATH>           Use a specific cache/state directory
+      --no-elevate, --read-only    Do not request privilege elevation
+      --no-update-check            Skip the update check after `doctor`
+      --cancel-file <PATH>         Cancel an in-progress connection when this file appears
+  -h, --help                      Show this command reference
+  -v, --version                   Show the desktop version
+
+With no command, this reference is printed. The CLI does not launch an interactive dashboard."#
     )
-}
-
-fn delegate_to_window_launcher(
-    paths: &AppPaths,
-    default_cache_dir: &Path,
-    raw_args: &[String],
-) -> i32 {
-    let filtered: Vec<String> = raw_args
-        .iter()
-        .filter(|a| a.as_str() != "-w" && a.as_str() != "--window")
-        .cloned()
-        .collect();
-
-    #[cfg(windows)]
-    {
-        let Ok(self_exe) = env::current_exe() else {
-            err("Could not determine vpngate executable path.");
-            return 1;
-        };
-        let is_interactive = filtered.is_empty()
-            || filtered
-                .iter()
-                .any(|a| matches!(a.as_str(), "-i" | "--interactive" | "menu" | "interactive"));
-        let mut launch_args = vec![
-            "--cache-dir".to_string(),
-            paths.cache_dir.display().to_string(),
-            "--interactive-default-cache-dir".to_string(),
-            default_cache_dir.display().to_string(),
-        ];
-        launch_args.extend(filtered);
-        if !is_interactive {
-            launch_args.push("--hold".to_string());
-        }
-
-        if !vpngate_core::is_root_or_admin() && !commands::no_elevate_requested() {
-            let mut uac_args = vec!["--uac-elevated".to_string()];
-            uac_args.extend_from_slice(&launch_args);
-            if commands::win_uac::run_elevated(&self_exe, &uac_args, false).is_ok() {
-                return 0;
-            }
-        }
-
-        if let Some(wt) = vpngate_core::which_bin("wt") {
-            let mut cmd = std::process::Command::new(wt);
-            cmd.args(["--title", "VPN Gate"])
-                .arg(self_exe)
-                .args(&launch_args);
-            return i32::from(cmd.spawn().is_err());
-        }
-
-        let ps_bin = vpngate_core::which_bin("pwsh")
-            .or_else(|| vpngate_core::which_bin("powershell"))
-            .unwrap_or_else(|| PathBuf::from("powershell.exe"));
-        let mut quoted = vec![format!(
-            "'{}'",
-            self_exe.display().to_string().replace('\'', "''")
-        )];
-        for a in &launch_args {
-            quoted.push(format!("'{}'", a.replace('\'', "''")));
-        }
-        let ps_line = format!("& {}", quoted.join(" "));
-        let mut cmd = std::process::Command::new("cmd");
-        cmd.args(["/c", "start", "VPN Gate"])
-            .arg(ps_bin)
-            .args([
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                &ps_line,
-            ])
-            .creation_flags(0x0800_0000);
-        i32::from(cmd.spawn().is_err())
-    }
-
-    #[cfg(not(windows))]
-    {
-        let self_dir = env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
-        let mut cands = Vec::new();
-        if let Some(d) = self_dir {
-            cands.push(d.join("vpngate-launcher"));
-        }
-        cands.push(PathBuf::from("/usr/local/bin/vpngate-launcher"));
-        if let Some(w) = vpngate_core::which_bin("vpngate-launcher") {
-            cands.push(w);
-        }
-
-        let Some(launcher) = cands.into_iter().find(|p| p.is_file()) else {
-            err("Could not find 'vpngate-launcher'. Run `sh ./install-vpngate.sh` first.");
-            return 1;
-        };
-
-        let mut cmd = std::process::Command::new(launcher);
-        cmd.arg("--cache-dir")
-            .arg(&paths.cache_dir)
-            .arg("--interactive-default-cache-dir")
-            .arg(default_cache_dir);
-        if !filtered.is_empty() {
-            cmd.arg("--hold");
-        }
-        cmd.args(&filtered);
-        cmd.status().ok().and_then(|s| s.code()).unwrap_or(1)
-    }
 }
 
 async fn dispatch() -> io::Result<i32> {
     let raw_all: Vec<String> = env::args().skip(1).collect();
-    let is_daemon = matches!(
-        raw_all.first().map(String::as_str),
-        Some("_monitor" | "_ikev1")
-    );
-    init_console(!is_daemon);
+    init_console(false);
     if let Err(msg) = assert_supported_native_host() {
         err(&msg);
         return Ok(1);
     }
 
-    // Pre-scan global cache/window/UAC flags.
+    // Consume global path/elevation/update flags before command dispatch.
     let mut cache_dir_override: Option<PathBuf> = None;
-    let mut interactive_default_cache_dir: Option<PathBuf> = None;
-    let mut hold_on_exit = false;
     let mut raw_args: Vec<String> = Vec::with_capacity(raw_all.len());
     let mut idx = 0usize;
     while idx < raw_all.len() {
         match raw_all[idx].as_str() {
             "--cache-dir" => {
                 idx += 1;
-                if let Some(dir) = raw_all.get(idx)
-                    && !dir.trim().is_empty()
-                {
-                    cache_dir_override = Some(PathBuf::from(dir));
+                match raw_all.get(idx).filter(|dir| !dir.trim().is_empty()) {
+                    Some(dir) => cache_dir_override = Some(PathBuf::from(dir)),
+                    None => {
+                        err("--cache-dir requires a path.");
+                        return Ok(2);
+                    }
                 }
             }
-            "--interactive-default-cache-dir" => {
-                idx += 1;
-                if let Some(dir) = raw_all.get(idx)
-                    && !dir.trim().is_empty()
-                {
-                    interactive_default_cache_dir = Some(PathBuf::from(dir));
-                } else {
-                    err("--interactive-default-cache-dir requires a path.");
-                    return Ok(2);
-                }
-            }
-            "--hold" => {
-                hold_on_exit = true;
-            }
-            "--uac-elevated" => {
-                set_uac_already_attempted(true);
-            }
-            "--no-elevate" | "--read-only" => {
-                set_no_elevate_requested(true);
-            }
-            "--no-update-check" => {
-                set_skip_update_check(true);
-            }
+            "--uac-elevated" => set_uac_already_attempted(true),
+            "--no-elevate" | "--read-only" => set_no_elevate_requested(true),
+            "--no-update-check" => set_skip_update_check(true),
             other => raw_args.push(other.to_string()),
         }
         idx += 1;
@@ -242,52 +118,23 @@ async fn dispatch() -> io::Result<i32> {
         Some(dir) => AppPaths::with_base_dir(dir),
         None => AppPaths::resolve(),
     };
-    let default_cache_dir =
-        interactive_default_cache_dir.unwrap_or_else(AppPaths::default_cache_dir);
-    let interactive_instance_token = env::var("VPNGATE_INTERACTIVE_INSTANCE_TOKEN").ok();
-    // Internal background daemons (exact match with Python v5.3 architecture)
+
+    // Internal background daemons are still served by this command binary.
     if raw_args.first().map(String::as_str) == Some("_monitor") {
         return Ok(run_monitor_daemon(&paths).await);
     }
     if raw_args.len() >= 3 && raw_args[0] == "_ikev1" {
         return Ok(run_ikev1_daemon(&raw_args[1], Path::new(&raw_args[2])).await);
     }
-    if raw_args.iter().any(|a| a == "-w" || a == "--window") {
-        return Ok(delegate_to_window_launcher(
-            &paths,
-            &default_cache_dir,
-            &raw_args,
-        ));
-    }
 
-    let rc = dispatch_commands(
-        &paths,
-        &raw_args,
-        &default_cache_dir,
-        interactive_instance_token.as_deref(),
-    )
-    .await?;
-    if hold_on_exit && term_ui::is_stdout_tty() {
-        let _ = prompt_input("\nPress Enter to close this window...");
-    }
-    Ok(rc)
+    dispatch_commands(&paths, &raw_args).await
 }
 
-async fn dispatch_commands(
-    paths: &AppPaths,
-    raw_args: &[String],
-    default_cache_dir: &Path,
-    interactive_instance_token: Option<&str>,
-) -> io::Result<i32> {
+async fn dispatch_commands(paths: &AppPaths, raw_args: &[String]) -> io::Result<i32> {
     let help_text = build_help_text();
     if raw_args.is_empty() {
-        return interactive_menu(
-            paths,
-            &help_text,
-            default_cache_dir,
-            interactive_instance_token,
-        )
-        .await;
+        print_line(&help_text);
+        return Ok(0);
     }
 
     let mut subcmd = String::new();
@@ -303,7 +150,6 @@ async fn dispatch_commands(
     let mut auto_reconnect_override: Option<bool> = None;
     let mut custom_mirrors: Vec<String> = Vec::new();
     let mut cancel_file: Option<PathBuf> = None;
-    let mut flag_interactive = false;
     let mut flag_countries = false;
     let mut flag_list = false;
     let mut flag_mirrors = false;
@@ -325,10 +171,7 @@ async fn dispatch_commands(
                 print_line(&format!("vpngate {}", PRODUCT_VERSION));
                 return Ok(0);
             }
-            "--no-resize" => set_dynamic_resize(false),
-            "--no-clear" => set_screen_clear(false),
             "-y" | "--yes" => flag_yes = true,
-            "-i" | "--interactive" => flag_interactive = true,
             "-L" | "--list-countries" => flag_countries = true,
             "-l" | "--list" => flag_list = true,
             "-M" | "--mirrors" => flag_mirrors = true,
@@ -431,16 +274,6 @@ async fn dispatch_commands(
     });
     let sort_by = SortBy::from_cli_str(&sort_str).unwrap_or(SortBy::Recommended);
 
-    if flag_interactive || matches!(subcmd.as_str(), "menu" | "interactive") {
-        return interactive_menu(
-            paths,
-            &help_text,
-            default_cache_dir,
-            interactive_instance_token,
-        )
-        .await;
-    }
-
     let operation =
         if flag_disconnect || matches!(subcmd.as_str(), "disconnect" | "down" | "stop" | "d") {
             Some("Disconnect")
@@ -475,13 +308,15 @@ async fn dispatch_commands(
             None
         };
     if operation.is_none() {
-        return interactive_menu(
-            paths,
-            &help_text,
-            default_cache_dir,
-            interactive_instance_token,
-        )
-        .await;
+        let command = subcmd.trim();
+        if command.is_empty() {
+            print_line(&help_text);
+            return Ok(0);
+        }
+        err(&format!(
+            "Unknown command '{command}'. Run `vpngate --help` for usage."
+        ));
+        return Ok(2);
     }
     if flag_disconnect || matches!(subcmd.as_str(), "disconnect" | "down" | "stop" | "d") {
         return cmd_disconnect(paths).await;
@@ -569,13 +404,8 @@ async fn dispatch_commands(
         return cmd_refresh(paths, &custom_mirrors).await;
     }
 
-    interactive_menu(
-        paths,
-        &help_text,
-        default_cache_dir,
-        interactive_instance_token,
-    )
-    .await
+    err("Unsupported command. Run `vpngate --help` for usage.");
+    Ok(2)
 }
 
 #[tokio::main]

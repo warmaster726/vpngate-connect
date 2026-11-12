@@ -33,17 +33,17 @@ show_help() {
 Usage: sh ./install-vpngate.sh [OPTIONS]
    or: ./install-vpngate.sh [OPTIONS]
 
-Installs, upgrades, or removes the single-binary Rust VPN Gate Desktop Suite
+Installs, upgrades, or removes the Rust VPN Gate Connect desktop suite
 on Linux (Kali, Debian, Ubuntu, Mint, Pop!_OS, Fedora, Arch) and macOS.
 64-bit native (x86_64 and ARM64/Apple Silicon). No 32-bit. No Rosetta. Compiles from source.
 
 Options:
-  (no arguments)       Clean legacy residues, install OS packages, build/install `vpngate`, wipe temp build cache, and run `doctor`
-  --uninstall, -u      Disconnect active VPNs, remove binaries/launchers/caches, and verify zero residues
+  (no arguments)       Clean legacy residues, install runtime packages, build/install CLI + GUI, wipe temp build cache, and run `doctor`
+  --uninstall, -u      Disconnect active VPNs, remove binaries/desktop entries/caches, and verify zero residues
   --purge-packages     With --uninstall on Linux, also purge dedicated L2TP helper package (xl2tpd)
   --skip-apt           Skip system package installation step (alias: --skip-deps)
-  --keep-toolchain     Keep compile tools (Rust toolchain and any C linker we install) after building `vpngate`
-  --remove-toolchain   Remove compile tools after building `vpngate` (default when there is no prompt)
+  --keep-toolchain     Keep compile tools (Rust toolchain and any C linker we install) after building the CLI and GUI
+  --remove-toolchain   Remove compile tools after building the CLI and GUI (default when there is no prompt)
   --repo <owner/repo>  GitHub repository slug when downloading source archive outside a local checkout
   --branch <name>     Source branch for archive downloads (default: VPNGATE_BRANCH or main)
   --help, -h           Show this help message and exit
@@ -51,8 +51,8 @@ Options:
 A local checkout is always built as checked out, including non-main branches.
 When no local source is present, --branch overrides VPNGATE_BRANCH; the default is main.
 When Rust (`cargo`) or a C linker (`gcc`) must be bootstrapped, an interactive
-install asks whether to keep those compile tools or delete them after `vpngate`
-is built. Pre-existing toolchains are never removed. Non-interactive runs
+install asks whether to keep those compile tools or delete them after the CLI
+service and native GUI are built. Pre-existing toolchains are never removed. Non-interactive runs
 default to removing tools this installer added.
 EOF
 }
@@ -284,15 +284,15 @@ cleanup_previous_residues() {
        sudo test -f "${cache_cand}/monitor.pid" ||
        sudo test -d "/run/vpngate-l2tp"; then
       if [ -x /usr/local/bin/vpngate ] && [ ! -L /usr/local/bin/vpngate ]; then
-        sudo env VPNGATE_CACHE_DIR="${cache_cand}" /usr/local/bin/vpngate disconnect --no-resize >/dev/null 2>&1 || true
+        sudo env VPNGATE_CACHE_DIR="${cache_cand}" /usr/local/bin/vpngate disconnect >/dev/null 2>&1 || true
         record_cleaned "Disconnected active/stale Rust vpngate session (${cache_cand})"
       fi
     fi
   done
 
-  # 2. Terminate orphaned background daemons (_monitor, _ikev1, vpngate-launcher, openvpn, xl2tpd, pppd) on Linux.
-  # Never kill this installer or its ancestors (the GUI vpngate-launcher / VTE
-  # vpngate). Doing so SIGHUPs the in-place upgrade and the window just closes.
+  # 2. Terminate orphaned background daemons (_monitor, _ikev1, legacy GTK/VTE launcher,
+  # openvpn, xl2tpd, pppd) on Linux. Never kill this installer or its ancestors: doing so
+  # could SIGHUP an in-place upgrade or the GUI that launched it.
   if [ -d /proc ]; then
     vg_killed_procs="$(
       sudo VG_SELF="$$" VG_PPID="${PPID:-0}" /bin/sh -c '
@@ -439,6 +439,17 @@ cleanup_previous_residues() {
       sudo rm -rf /run/vpngate-l2tp
       record_cleaned "Removed stale runtime directory: /run/vpngate-l2tp"
     fi
+
+    # Retire the terminal dashboard launcher and its desktop entry from older installs.
+    for retired_item in \
+      /usr/local/bin/vpngate-launcher \
+      /usr/local/bin/vpngate-launcher.py \
+      /usr/share/applications/vpngate.desktop; do
+      if [ -e "${retired_item}" ] || [ -L "${retired_item}" ]; then
+        sudo rm -f "${retired_item}"
+        record_cleaned "Removed retired terminal UI artifact: ${retired_item}"
+      fi
+    done
   fi
 
   # 5. Remove duplicate user-local shadow binaries/desktop entries
@@ -620,7 +631,7 @@ if [ "${NEED_RUST}" -eq 1 ] || [ "${NEED_CC_PKG}" -eq 1 ]; then
   TOOLS_LIST=""
   if [ "${NEED_RUST}" -eq 1 ]; then
     TOOLS_LIST="${TOOLS_LIST}
-  - Rust toolchain (rustup, cargo, rustc) — used only to compile vpngate"
+  - Rust toolchain (rustup, cargo, rustc) — used to compile the CLI service and native GUI"
   fi
   if [ "${NEED_CC_PKG}" -eq 1 ]; then
     TOOLS_LIST="${TOOLS_LIST}
@@ -683,19 +694,17 @@ if [ "${SKIP_DEPS}" -eq 0 ]; then
       ca-certificates \
       tar </dev/null
     sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -o APT::Keep-Downloaded-Packages=false --no-install-recommends \
-      libgtk-4-1 \
-      libvte-2.91-gtk4-0 \
       network-manager-openvpn \
       network-manager-openvpn-gnome \
       libnotify-bin </dev/null 2>/dev/null || true
   elif command -v dnf >/dev/null 2>&1; then
     info "Installing required OpenVPN, L2TP/PPP & runtime packages via dnf ..."
     sudo dnf install -y openvpn xl2tpd ppp iproute curl ca-certificates tar </dev/null
-    sudo dnf install -y NetworkManager-openvpn NetworkManager-openvpn-gnome libnotify gtk4 vte291-gtk4 </dev/null 2>/dev/null || true
+    sudo dnf install -y NetworkManager-openvpn NetworkManager-openvpn-gnome libnotify </dev/null 2>/dev/null || true
   elif command -v pacman >/dev/null 2>&1; then
     info "Installing required OpenVPN, L2TP/PPP & runtime packages via pacman ..."
     sudo pacman -Sy --needed --noconfirm openvpn xl2tpd ppp iproute2 curl ca-certificates tar </dev/null
-    sudo pacman -S --needed --noconfirm networkmanager-openvpn libnotify gtk4 vte4 </dev/null 2>/dev/null || true
+    sudo pacman -S --needed --noconfirm networkmanager-openvpn libnotify </dev/null 2>/dev/null || true
   fi
 fi
 
@@ -726,38 +735,36 @@ if [ "${NEED_CC_PKG}" -eq 1 ]; then
   fi
 fi
 
-# 1c. Linux GTK4/VTE headers — compile-only, needed to build vpngate-launcher
+# 1c. Native GUI headers — compile-only, needed to build vpngate-gui
 if [ "${HOST_UNAME}" = "Linux" ] && [ "${SKIP_DEPS}" -eq 0 ]; then
   if command -v apt-get >/dev/null 2>&1; then
-    for gtk_pkg in libgtk-4-dev libvte-2.91-gtk4-dev pkg-config \
-      libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+    for gui_pkg in pkg-config libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
       libx11-dev libxrandr-dev libxi-dev libxcursor-dev libxinerama-dev \
       libegl1-mesa-dev libgl1-mesa-dev libfontconfig1-dev; do
-      if ! dpkg-query -W -f='${Status}' "${gtk_pkg}" 2>/dev/null | grep -q 'install ok installed'; then
-        INSTALLED_COMPILE_PKGS="${INSTALLED_COMPILE_PKGS} ${gtk_pkg}"
+      if ! dpkg-query -W -f='${Status}' "${gui_pkg}" 2>/dev/null | grep -q 'install ok installed'; then
+        INSTALLED_COMPILE_PKGS="${INSTALLED_COMPILE_PKGS} ${gui_pkg}"
       fi
     done
-    info "Installing compile-only GTK/VTE and native GUI headers for vpngate-launcher and vpngate-gui ..."
+    info "Installing compile-only native GUI headers for vpngate-gui ..."
     sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -o APT::Keep-Downloaded-Packages=false \
-      libgtk-4-dev libvte-2.91-gtk4-dev pkg-config \
+      pkg-config \
       libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
       libx11-dev libxrandr-dev libxi-dev libxcursor-dev libxinerama-dev \
       libegl1-mesa-dev libgl1-mesa-dev libfontconfig1-dev </dev/null
   elif command -v dnf >/dev/null 2>&1; then
-    for gtk_pkg in gtk4-devel vte291-gtk4-devel pkgconf-pkg-config \
-      wayland-devel libxkbcommon-devel libxkbcommon-x11-devel \
+    for gui_pkg in pkgconf-pkg-config wayland-devel libxkbcommon-devel libxkbcommon-x11-devel \
       libX11-devel libXrandr-devel libXi-devel libXcursor-devel libXinerama-devel \
       mesa-libEGL-devel mesa-libGL-devel fontconfig-devel; do
-      if ! rpm -q "${gtk_pkg}" >/dev/null 2>&1; then
-        INSTALLED_COMPILE_PKGS="${INSTALLED_COMPILE_PKGS} ${gtk_pkg}"
+      if ! rpm -q "${gui_pkg}" >/dev/null 2>&1; then
+        INSTALLED_COMPILE_PKGS="${INSTALLED_COMPILE_PKGS} ${gui_pkg}"
       fi
     done
-    sudo dnf install -y gtk4-devel vte291-gtk4-devel pkgconf-pkg-config \
+    sudo dnf install -y pkgconf-pkg-config \
       wayland-devel libxkbcommon-devel libxkbcommon-x11-devel \
       libX11-devel libXrandr-devel libXi-devel libXcursor-devel libXinerama-devel \
       mesa-libEGL-devel mesa-libGL-devel fontconfig-devel </dev/null 2>/dev/null || true
   elif command -v pacman >/dev/null 2>&1; then
-    sudo pacman -S --needed --noconfirm gtk4 vte4 pkgconf wayland libxkbcommon \
+    sudo pacman -S --needed --noconfirm pkgconf wayland libxkbcommon \
       libx11 libxrandr libxi libxcursor libxinerama mesa fontconfig </dev/null 2>/dev/null || true
   fi
 fi
@@ -766,7 +773,6 @@ fi
 WORK_SRC_DIR="${SCRIPT_DIR}"
 BIN_SRC=""
 GUI_SRC=""
-LAUNCHER_SRC=""
 LOCAL_BRANCH=""
 if [ -f "${WORK_SRC_DIR}/Cargo.toml" ] && command -v git >/dev/null 2>&1; then
   LOCAL_BRANCH="$(git -C "${WORK_SRC_DIR}" branch --show-current 2>/dev/null || true)"
@@ -884,10 +890,6 @@ if [ -f "${WORK_SRC_DIR}/Cargo.toml" ]; then
     fi
 
     CARGO_DIR_BIN="$(dirname "${CARGO_BIN}")"
-    LAUNCHER_PKG=""
-    if [ "${HOST_UNAME}" = "Linux" ]; then
-      LAUNCHER_PKG="-p vpngate-launcher"
-    fi
     info "Building optimized ${HOST_ARCH} 'vpngate' from Rust workspace (${WORK_SRC_DIR}) ..."
     if [ "$(id -u)" -eq 0 ] && [ "${TARGET_USER}" != "root" ]; then
       # shellcheck disable=SC2086
@@ -896,7 +898,7 @@ if [ -f "${WORK_SRC_DIR}/Cargo.toml" ]; then
         ${BUILD_RUSTUP_HOME:+RUSTUP_HOME="${BUILD_RUSTUP_HOME}"} \
         ${BUILD_CARGO_HOME:+CARGO_HOME="${BUILD_CARGO_HOME}"} \
         "${CARGO_BIN}" build --release ${LOCKED_FLAG} \
-        -p vpngate-cli ${LAUNCHER_PKG} \
+        -p vpngate-cli \
         --target "${RUST_HOST_TRIPLE}" \
         --manifest-path "${WORK_SRC_DIR}/Cargo.toml" \
         --target-dir "${EFFECTIVE_TARGET_DIR}"
@@ -907,14 +909,12 @@ if [ -f "${WORK_SRC_DIR}/Cargo.toml" ]; then
         ${BUILD_RUSTUP_HOME:+RUSTUP_HOME="${BUILD_RUSTUP_HOME}"} \
         ${BUILD_CARGO_HOME:+CARGO_HOME="${BUILD_CARGO_HOME}"} \
         "${CARGO_BIN}" build --release ${LOCKED_FLAG} \
-        -p vpngate-cli ${LAUNCHER_PKG} \
+        -p vpngate-cli \
         --target "${RUST_HOST_TRIPLE}" \
         --manifest-path "${WORK_SRC_DIR}/Cargo.toml" \
         --target-dir "${EFFECTIVE_TARGET_DIR}"
     fi
     BIN_SRC="${EFFECTIVE_TARGET_DIR}/${RUST_HOST_TRIPLE}/release/vpngate"
-    LAUNCHER_SRC="${EFFECTIVE_TARGET_DIR}/${RUST_HOST_TRIPLE}/release/vpngate-launcher"
-
     GUI_MANIFEST="${WORK_SRC_DIR}/crates/vpngate-gui/Cargo.toml"
     GUI_LOCKED_FLAG=""
     if [ -f "${WORK_SRC_DIR}/crates/vpngate-gui/Cargo.lock" ]; then
@@ -946,17 +946,11 @@ if [ -f "${WORK_SRC_DIR}/Cargo.toml" ]; then
     if [ -x "${WORK_SRC_DIR}/target/${RUST_HOST_TRIPLE}/release/vpngate-gui" ]; then
       GUI_SRC="${WORK_SRC_DIR}/target/${RUST_HOST_TRIPLE}/release/vpngate-gui"
     fi
-    if [ -x "${WORK_SRC_DIR}/target/${RUST_HOST_TRIPLE}/release/vpngate-launcher" ]; then
-      LAUNCHER_SRC="${WORK_SRC_DIR}/target/${RUST_HOST_TRIPLE}/release/vpngate-launcher"
-    fi
   fi
 elif [ -x "${WORK_SRC_DIR}/vpngate" ]; then
   BIN_SRC="${WORK_SRC_DIR}/vpngate"
   if [ -x "${WORK_SRC_DIR}/vpngate-gui" ]; then
     GUI_SRC="${WORK_SRC_DIR}/vpngate-gui"
-  fi
-  if [ -x "${WORK_SRC_DIR}/vpngate-launcher" ]; then
-    LAUNCHER_SRC="${WORK_SRC_DIR}/vpngate-launcher"
   fi
 fi
 
@@ -1018,7 +1012,7 @@ if [ -n "${GUI_SRC}" ] && [ -f "${GUI_SRC}" ]; then
   info "Installing the native GUI binary to /usr/local/bin/vpngate-gui ..."
   sudo install -m 0755 "${GUI_SRC}" /usr/local/bin/vpngate-gui
 else
-  warn "This source/prebuilt package did not include vpngate-gui; only the traditional launch path was installed."
+  warn "This source/prebuilt package did not include vpngate-gui; the CLI action service was installed without its GUI."
 fi
 # Drop leftover `cargo install` copies so PATH cannot keep serving old binaries.
 CARGO_SHADOW="${TARGET_HOME}/.cargo/bin/vpngate"
@@ -1048,22 +1042,11 @@ elif [ "${TOOLCHAIN_POLICY}" = "keep" ]; then
   fi
 fi
 
-if [ "${HOST_UNAME}" = "Linux" ] && [ -x "${LAUNCHER_SRC:-}" ]; then
-  info "Installing GNOME GTK4/VTE window launcher (/usr/local/bin/vpngate-launcher) ..."
-  sudo rm -f /usr/local/bin/vpngate-launcher /usr/local/bin/vpngate-launcher.py
-  sudo install -m 0755 "${LAUNCHER_SRC}" /usr/local/bin/vpngate-launcher
-
-  if [ -f "${WORK_SRC_DIR}/vpngate.desktop" ]; then
-    info "Installing traditional GNOME Desktop Entry (/usr/share/applications/vpngate.desktop) ..."
-    sudo mkdir -p /usr/share/applications
-    install_lf_file "${WORK_SRC_DIR}/vpngate.desktop" /usr/share/applications/vpngate.desktop 0644
-  fi
-fi
 
 if [ "${HOST_UNAME}" = "Linux" ] \
   && [ -x /usr/local/bin/vpngate-gui ] \
   && [ -f "${WORK_SRC_DIR}/vpngate-gui.desktop" ]; then
-  info "Installing separate GUI Desktop Entry (/usr/share/applications/vpngate-gui.desktop) ..."
+  info "Installing primary GUI Desktop Entry (/usr/share/applications/vpngate-gui.desktop) ..."
   sudo mkdir -p /usr/share/applications
   install_lf_file "${WORK_SRC_DIR}/vpngate-gui.desktop" /usr/share/applications/vpngate-gui.desktop 0644
 fi
@@ -1130,17 +1113,14 @@ echo ""
 ok "Installation complete! Running 'vpngate doctor' readiness check:"
 # The frontend singleton lock is created by the launched user-facing app, never by this installer.
 if [ "$(id -u)" -eq 0 ] && [ "${TARGET_USER}" != "root" ]; then
-  sudo -u "${TARGET_USER}" env VPNGATE_CACHE_DIR="${USER_CACHE_DIR}" /usr/local/bin/vpngate doctor --no-resize || true
+  sudo -u "${TARGET_USER}" env VPNGATE_CACHE_DIR="${USER_CACHE_DIR}" /usr/local/bin/vpngate doctor || true
 else
-  VPNGATE_CACHE_DIR="${USER_CACHE_DIR}" /usr/local/bin/vpngate doctor --no-resize || true
+  VPNGATE_CACHE_DIR="${USER_CACHE_DIR}" /usr/local/bin/vpngate doctor || true
 fi
 echo ""
-ok "Traditional interactive launch path: vpngate"
+ok "CLI command service is installed: vpngate"
 if [ -x /usr/local/bin/vpngate-gui ]; then
-  ok "Separate native GUI launch path: vpngate-gui"
-fi
-if [ "${HOST_UNAME}" = "Linux" ]; then
-  ok "Or launch the traditional UI in its GTK/VTE window with: vpngate -w"
+  ok "Primary native desktop GUI is installed: vpngate-gui"
 fi
 }
 

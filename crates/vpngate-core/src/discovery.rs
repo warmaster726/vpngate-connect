@@ -16,7 +16,7 @@ use crate::parser::{
 };
 use crate::server::VpnServer;
 
-/// Live command execution progress events (exact parity with Python `v5.3` console UX).
+/// Live progress and status events emitted by discovery and connection operations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
 pub enum ProgressEvent {

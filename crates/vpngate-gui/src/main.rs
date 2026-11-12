@@ -22,9 +22,8 @@ use vpngate_core::{
     ActiveSessionState, AppPaths, InteractiveInstanceError, PRODUCT_VERSION, ProtocolFilter,
     RemoteDesktopVersion, SortBy, VpnServer, acquire_interactive_instances, cpu_isa_label,
     detect_host_os_label, filter_by_country, filter_by_protocol, installed_desktop_version,
-    is_root_or_admin, load_cached_mirrors, load_update_cache, now_unix_secs, read_json_opt,
-    record_update_declined, refresh_update_cache, should_auto_prompt, sort_servers,
-    summarize_countries, tunnel_aid_dns_cli,
+    is_root_or_admin, load_cached_mirrors, now_unix_secs, read_json_opt, refresh_update_cache,
+    sort_servers, summarize_countries, tunnel_aid_dns_cli,
 };
 
 const APP_ID: &str = "net.vpngate.connect";
@@ -33,6 +32,7 @@ const IDLE_STATE_POLL_INTERVAL: Duration = Duration::from_secs(15);
 const CACHE_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_RELAY_ROWS: usize = 100;
 const MAX_LOG_LINES: usize = 600;
+const CONNECT_ATTEMPT_TIMEOUT_SECS: u64 = 22;
 static CANCEL_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 fn main() -> eframe::Result {
@@ -190,7 +190,7 @@ enum ToolAction {
 
 enum CommandEvent {
     Output(String),
-    UpdateCheck(UpdateCheckMode, Result<RemoteDesktopVersion, String>),
+    UpdateCheck(Result<RemoteDesktopVersion, String>),
     Finished(i32),
     Failed(String),
 }
@@ -202,6 +202,26 @@ struct CommandWorker {
     cancellable: bool,
     cancel_requested: bool,
     cancel_file: Option<PathBuf>,
+}
+
+struct OperationProgress {
+    operation: String,
+    message: String,
+    fraction: Option<f32>,
+    completed: bool,
+    succeeded: bool,
+}
+
+impl OperationProgress {
+    fn new(operation: &str) -> Self {
+        Self {
+            operation: operation.to_string(),
+            message: format!("Starting {operation}…"),
+            fraction: None,
+            completed: false,
+            succeeded: false,
+        }
+    }
 }
 
 struct GuiApp {
@@ -224,6 +244,7 @@ struct GuiApp {
     worker: Option<CommandWorker>,
     command_log: VecDeque<String>,
     status_message: String,
+    operation_progress: Option<OperationProgress>,
     host_label: String,
     native_arch: &'static str,
     elevated: bool,
@@ -233,7 +254,6 @@ struct GuiApp {
     connect_protocol: String,
     connect_sort: String,
     connect_limit: usize,
-    connect_timeout_secs: u64,
     connect_engine: String,
     connect_dns: String,
     connect_start_index: usize,
@@ -280,6 +300,7 @@ impl GuiApp {
             worker: None,
             command_log: VecDeque::new(),
             status_message: String::new(),
+            operation_progress: None,
             host_label: detect_host_os_label(),
             native_arch: cpu_isa_label(),
             elevated: is_root_or_admin(),
@@ -289,7 +310,6 @@ impl GuiApp {
             connect_protocol: "auto".to_string(),
             connect_sort: "score".to_string(),
             connect_limit: 0,
-            connect_timeout_secs: 22,
             connect_engine: "auto".to_string(),
             connect_dns: tunnel_aid_dns_cli(),
             connect_start_index: 1,
@@ -389,7 +409,7 @@ impl GuiApp {
             "--limit".to_string(),
             self.connect_limit.to_string(),
             "--timeout".to_string(),
-            self.connect_timeout_secs.to_string(),
+            CONNECT_ATTEMPT_TIMEOUT_SECS.to_string(),
             "--engine".to_string(),
             self.connect_engine.clone(),
             "--dns".to_string(),
@@ -471,6 +491,7 @@ impl GuiApp {
             let _ = fs::remove_file(path);
         }
         self.command_log.clear();
+        self.operation_progress = Some(OperationProgress::new(operation));
         self.push_log(format!("Starting {operation}…"));
         self.status_message.clear();
 
@@ -502,6 +523,7 @@ impl GuiApp {
             return;
         }
         self.command_log.clear();
+        self.operation_progress = Some(OperationProgress::new("Check desktop updates"));
         self.push_log("Checking for desktop updates…".to_string());
         self.status_message.clear();
 
@@ -518,7 +540,7 @@ impl GuiApp {
                 )),
                 Err(error) => Err(format!("Could not start the update-check runtime: {error}")),
             };
-            let _ = sender.send(CommandEvent::UpdateCheck(mode, result));
+            let _ = sender.send(CommandEvent::UpdateCheck(result));
         });
         self.worker = Some(CommandWorker {
             receiver,
@@ -723,9 +745,7 @@ impl GuiApp {
                 self.pending_update = Some(kind);
             }
         } else if dismissed {
-            if let Some(remote) = self.update_offer.take() {
-                record_update_declined(&self.paths, &remote);
-            }
+            self.update_offer = None;
             self.pending_update = None;
         }
     }
@@ -742,43 +762,35 @@ impl GuiApp {
                 CommandEvent::Output(line) => {
                     let clean = strip_ansi(&line);
                     if !clean.trim().is_empty() {
+                        self.update_operation_progress(&clean);
                         self.push_log(clean);
                     }
                 }
-                CommandEvent::UpdateCheck(mode, Ok(remote)) => {
+                CommandEvent::UpdateCheck(Ok(remote)) => {
                     if remote.version > installed_desktop_version() {
-                        let should_prompt = mode == UpdateCheckMode::Diagnostics
-                            || load_update_cache(&self.paths)
-                                .is_none_or(|cache| should_auto_prompt(&cache, &remote.version));
-                        if should_prompt {
-                            let message = format!(
-                                "Desktop update v{} is available; installing it is strongly recommended.",
-                                remote.raw
-                            );
-                            self.push_log(message.clone());
-                            self.status_message = message;
-                            self.update_offer = Some(remote);
-                            self.pending_update = Some(UpdateKind::Update);
-                        } else {
-                            let message = format!(
-                                "Desktop update v{} is available; its reminder is snoozed after your earlier choice.",
-                                remote.raw
-                            );
-                            self.push_log(message.clone());
-                            self.status_message = message;
-                        }
+                        let message = format!(
+                            "Desktop update v{} is available; installing it is strongly recommended.",
+                            remote.raw
+                        );
+                        self.push_log(message.clone());
+                        self.status_message = message.clone();
+                        self.finish_operation_progress(&message, true);
+                        self.update_offer = Some(remote);
+                        self.pending_update = Some(UpdateKind::Update);
                     } else {
                         let message =
                             format!("VPN Gate Connect is up to date (v{PRODUCT_VERSION}).");
                         self.push_log(message.clone());
-                        self.status_message = message;
+                        self.status_message = message.clone();
+                        self.finish_operation_progress(&message, true);
                     }
                     finished = true;
                 }
-                CommandEvent::UpdateCheck(_, Err(error)) => {
+                CommandEvent::UpdateCheck(Err(error)) => {
                     let message = format!("Desktop update check did not complete: {error}");
                     self.push_log(message.clone());
-                    self.status_message = message;
+                    self.status_message = message.clone();
+                    self.finish_operation_progress(&message, false);
                     finished = true;
                 }
                 CommandEvent::Finished(code) => {
@@ -792,7 +804,8 @@ impl GuiApp {
                         self.push_log(format!("Technical result status: {code}"));
                     }
                     self.push_log(message.clone());
-                    self.status_message = message;
+                    self.status_message = message.clone();
+                    self.finish_operation_progress(&message, code == 0);
                     finished = true;
                 }
                 CommandEvent::Failed(error) => {
@@ -803,7 +816,8 @@ impl GuiApp {
                         .unwrap_or("Action");
                     let message = format!("Could not start {operation}: {error}");
                     self.push_log(message.clone());
-                    self.status_message = message;
+                    self.status_message = message.clone();
+                    self.finish_operation_progress(&message, false);
                     finished = true;
                 }
             }
@@ -827,6 +841,86 @@ impl GuiApp {
                 self.pending_update_check = Some(UpdateCheckMode::Diagnostics);
             }
         }
+    }
+
+    fn update_operation_progress(&mut self, line: &str) {
+        let Some((fraction, message)) = progress_update_from_output(line) else {
+            return;
+        };
+        if let Some(progress) = &mut self.operation_progress {
+            if let Some(fraction) = fraction {
+                progress.fraction = Some(fraction);
+            }
+            progress.message = message;
+        }
+    }
+
+    fn finish_operation_progress(&mut self, message: &str, succeeded: bool) {
+        if let Some(progress) = &mut self.operation_progress {
+            progress.message = compact_progress_message(message);
+            progress.completed = true;
+            progress.succeeded = succeeded;
+            if succeeded {
+                progress.fraction = Some(1.0);
+            }
+        }
+    }
+
+    fn operation_progress_panel(&self, ui: &mut egui::Ui) {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Operation progress").strong());
+                if let Some(worker) = &self.worker {
+                    ui.label(
+                        RichText::new(format!(
+                            "Running · {}s",
+                            worker.started_at.elapsed().as_secs()
+                        ))
+                        .weak()
+                        .small(),
+                    );
+                }
+            });
+
+            if let Some(progress) = &self.operation_progress {
+                ui.label(RichText::new(&progress.operation).strong());
+                if !progress.message.is_empty() {
+                    ui.label(RichText::new(&progress.message).weak());
+                }
+
+                let running = self.worker.is_some();
+                let fill = progress
+                    .fraction
+                    .unwrap_or(if running { 0.28 } else { 0.0 });
+                let bar = egui::ProgressBar::new(fill)
+                    .desired_width(ui.available_width())
+                    .animate(running && progress.fraction.is_none());
+                if progress.fraction.is_some() || progress.succeeded {
+                    ui.add(bar.show_percentage());
+                } else {
+                    ui.add(bar);
+                }
+
+                if progress.completed {
+                    ui.colored_label(
+                        if progress.succeeded {
+                            Color32::from_rgb(44, 154, 84)
+                        } else {
+                            Color32::from_rgb(190, 125, 30)
+                        },
+                        if progress.succeeded {
+                            "Complete"
+                        } else {
+                            "Stopped"
+                        },
+                    );
+                }
+            } else {
+                ui.label(
+                    RichText::new("Progress appears here while an operation is running.").weak(),
+                );
+            }
+        });
     }
 
     fn push_log(&mut self, line: String) {
@@ -861,7 +955,7 @@ impl GuiApp {
             if !self.status_message.is_empty() {
                 ui.label(RichText::new(&self.status_message).weak());
             }
-            egui::CollapsingHeader::new("Technical details")
+            egui::CollapsingHeader::new("Raw command output")
                 .default_open(false)
                 .show(ui, |ui| {
                     egui::ScrollArea::vertical()
@@ -1042,9 +1136,13 @@ impl GuiApp {
                     &mut fetch_regions_clicked,
                 );
                 self.session_status_panel(&mut columns[1]);
+                columns[1].add_space(8.0);
+                self.operation_progress_panel(&mut columns[1]);
             });
         } else {
             self.session_status_panel(ui);
+            ui.add_space(8.0);
+            self.operation_progress_panel(ui);
             ui.add_space(8.0);
             self.connection_options_panel(
                 ui,
@@ -1231,14 +1329,6 @@ impl GuiApp {
                                     egui::DragValue::new(&mut self.connect_limit)
                                         .range(0..=1000)
                                         .suffix(" relays (0 = all)"),
-                                );
-                                ui.end_row();
-
-                                ui.label("Attempt timeout");
-                                ui.add(
-                                    egui::DragValue::new(&mut self.connect_timeout_secs)
-                                        .range(5..=300)
-                                        .suffix(" s"),
                                 );
                                 ui.end_row();
 
@@ -1580,6 +1670,8 @@ impl GuiApp {
             self.start_connect();
         }
         ui.add_space(8.0);
+        self.operation_progress_panel(ui);
+        ui.add_space(8.0);
         self.activity_details_panel(ui, 150.0);
     }
 
@@ -1721,6 +1813,8 @@ impl GuiApp {
             );
         }
         ui.add_space(10.0);
+        self.operation_progress_panel(ui);
+        ui.add_space(8.0);
         self.activity_details_panel(ui, 260.0);
     }
 
@@ -1779,18 +1873,7 @@ impl GuiApp {
                     ui.end_row();
                 });
         });
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.label(RichText::new("Current GUI operation").strong());
-            if let Some(worker) = &self.worker {
-                ui.label(format!(
-                    "{} · elapsed {}s",
-                    worker.operation,
-                    worker.started_at.elapsed().as_secs()
-                ));
-            } else {
-                ui.label("No operation is currently running in this window.");
-            }
-        });
+        self.operation_progress_panel(ui);
         ui.add_space(10.0);
         self.activity_details_panel(ui, 340.0);
     }
@@ -2012,6 +2095,55 @@ fn format_age(seconds: u64) -> String {
     }
 }
 
+fn compact_progress_message(message: &str) -> String {
+    let compact = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= 120 {
+        return compact;
+    }
+    let mut truncated = compact.chars().take(117).collect::<String>();
+    truncated.push('…');
+    truncated
+}
+
+fn progress_update_from_output(line: &str) -> Option<(Option<f32>, String)> {
+    let clean = strip_ansi(line);
+    let clean = clean.trim();
+
+    if let Some(attempt_start) = clean.find("[Attempt ") {
+        let rest = &clean[attempt_start + "[Attempt ".len()..];
+        if let Some(close) = rest.find(']') {
+            let (attempt, total) = rest[..close].split_once('/')?;
+            let attempt = attempt.parse::<usize>().ok()?;
+            let total = total.parse::<usize>().ok()?;
+            if total > 0 {
+                let fraction = (attempt.min(total) as f32 / total as f32) * 0.9;
+                let detail = rest[close + 1..]
+                    .trim()
+                    .strip_prefix("Testing ")
+                    .unwrap_or(rest[close + 1..].trim());
+                return Some((
+                    Some(fraction),
+                    compact_progress_message(&format!(
+                        "Relay attempt {attempt}/{total} · {detail}"
+                    )),
+                ));
+            }
+        }
+    }
+
+    for prefix in ["[*] ", "[+] ", "[!] ", "[-] ", "[stderr] "] {
+        if let Some(message) = clean.strip_prefix(prefix) {
+            let message = if prefix == "[stderr] " {
+                format!("Issue: {message}")
+            } else {
+                message.to_string()
+            };
+            return Some((None, compact_progress_message(&message)));
+        }
+    }
+    None
+}
+
 fn country_selection_is_all(selection: &str) -> bool {
     selection.trim().eq_ignore_ascii_case("all")
 }
@@ -2117,13 +2249,13 @@ fn action_result_message(operation: &str, code: i32) -> String {
     match code {
         0 => format!("{operation} completed."),
         2 => format!(
-            "{operation} was rejected. Expand Technical details to see the command-line reason."
+            "{operation} was rejected. Expand Raw command output to see the command-line reason."
         ),
         75 => format!(
             "{operation} did not start because another VPN Gate Connect frontend is already running. Close it and retry."
         ),
         _ => format!(
-            "{operation} did not complete (status {code}). Expand Technical details for more information."
+            "{operation} did not complete (status {code}). Expand Raw command output for more information."
         ),
     }
 }
@@ -2404,10 +2536,10 @@ fn strip_ansi(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        action_result_message, append_mirror_args, connect_regions_fetch_args,
-        country_picker_label, country_selection_contains, country_selection_summary, format_age,
-        protocol_labels, relay_matches, selected_relay_start_index, set_country_selection,
-        strip_ansi,
+        CONNECT_ATTEMPT_TIMEOUT_SECS, action_result_message, append_mirror_args,
+        connect_regions_fetch_args, country_picker_label, country_selection_contains,
+        country_selection_summary, format_age, progress_update_from_output, protocol_labels,
+        relay_matches, selected_relay_start_index, set_country_selection, strip_ansi,
     };
     use vpngate_core::{ProtocolFilter, SortBy, VpnServer};
 
@@ -2548,6 +2680,28 @@ mod tests {
     }
 
     #[test]
+    fn progress_parser_turns_attempts_and_status_lines_into_ui_updates() {
+        let (fraction, message) = progress_update_from_output(
+            "\u{1b}[1;36m[Attempt 3/10] Testing relay.example (192.0.2.3) | JP (Japan)\u{1b}[0m",
+        )
+        .unwrap();
+        assert!((fraction.unwrap() - 0.27).abs() < 0.001);
+        assert!(message.contains("Relay attempt 3/10"));
+        assert!(message.contains("relay.example"));
+
+        let (fraction, message) =
+            progress_update_from_output("[+] Loaded 24 relays from cache").unwrap();
+        assert!(fraction.is_none());
+        assert_eq!(message, "Loaded 24 relays from cache");
+        assert!(progress_update_from_output("JP Japan 42 relays 12 Mbps").is_none());
+    }
+
+    #[test]
+    fn connection_attempt_timeout_is_implicit_in_the_gui() {
+        assert_eq!(CONNECT_ATTEMPT_TIMEOUT_SECS, 22);
+    }
+
+    #[test]
     fn inline_region_fetch_forces_refresh_and_keeps_custom_mirrors() {
         assert_eq!(
             connect_regions_fetch_args("auto", "http://one/en/; http://two/en/"),
@@ -2568,7 +2722,7 @@ mod tests {
     fn action_failures_are_explained_without_cli_exit_code_jargon() {
         let message = action_result_message("List relays", 2);
         assert!(message.contains("List relays was rejected"));
-        assert!(message.contains("Technical details"));
+        assert!(message.contains("Raw command output"));
         assert!(!message.contains("exit code 2"));
         assert!(action_result_message("Connect", 0).contains("Connect completed"));
     }

@@ -4,13 +4,13 @@ members = ["."]
 
 [package]
 name = "vpngate-gui"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
 repository = "https://github.com/warmaster726/vpngate-connect"
 authors = ["warmaster726 <warmaster726@users.noreply.github.com>"]
-description = "Opt-in functional eframe/egui GUI for VPN Gate Connect"
+description = "Native eframe/egui desktop GUI for VPN Gate Connect"
 publish = false
 
 [dependencies]
