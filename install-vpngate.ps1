@@ -297,6 +297,38 @@ $StartMenuLnk   = if ($TargetStartMenuLnk -and $TargetStartMenuLnk.Trim()) { $Ta
 $GuiStartMenuLnk = Join-Path (Split-Path -Parent $StartMenuLnk) 'VPN Gate Connect GUI.lnk'
 $LegacyStartMenuLnk = Join-Path (Split-Path -Parent $StartMenuLnk) 'VPN Gate.lnk'
 
+function ConvertTo-WindowsCommandLineArgument([string]$Value) {
+    if ($null -eq $Value) { $Value = '' }
+    $quoteChar = [char]34
+    $slashChar = [char]92
+    $builder = New-Object System.Text.StringBuilder
+    [void]$builder.Append($quoteChar)
+    $backslashCount = 0
+    foreach ($character in $Value.ToCharArray()) {
+        if ($character -eq $slashChar) {
+            $backslashCount++
+            continue
+        }
+        if ($character -eq $quoteChar) {
+            for ($idx = 0; $idx -lt (2 * $backslashCount + 1); $idx++) {
+                [void]$builder.Append($slashChar)
+            }
+            [void]$builder.Append($quoteChar)
+        } else {
+            for ($idx = 0; $idx -lt $backslashCount; $idx++) {
+                [void]$builder.Append($slashChar)
+            }
+            [void]$builder.Append($character)
+        }
+        $backslashCount = 0
+    }
+    for ($idx = 0; $idx -lt (2 * $backslashCount); $idx++) {
+        [void]$builder.Append($slashChar)
+    }
+    [void]$builder.Append($quoteChar)
+    return $builder.ToString()
+}
+
 # Automatically elevate via Windows UAC when invoked from a non-Admin PowerShell session
 if ((-not $IsAdmin) -and (-not $UserOnly) -and (-not $ElevatedChild) -and $PSCommandPath -and (Test-Path -LiteralPath $PSCommandPath)) {
     Write-Info "Administrator privileges are required on Windows 11 for NAT-T, OpenVPN & Firewall setup."
@@ -334,8 +366,13 @@ if ((-not $IsAdmin) -and (-not $UserOnly) -and (-not $ElevatedChild) -and $PSCom
         $FwdArgs.Add($ForwardBranch)
     }
 
+    # Start-Process joins ArgumentList items into one string; quote each token so
+    # user paths such as 'Start Menu' survive the UAC child-process boundary.
+    $FwdArgLine = (@($FwdArgs.ToArray() | ForEach-Object {
+        ConvertTo-WindowsCommandLineArgument -Value ([string]$_)
+    }) -join ' ')
     try {
-        $ElevProc = Start-Process -FilePath $PsHostExe -ArgumentList $FwdArgs.ToArray() -WorkingDirectory $CallerWorkDir -Verb RunAs -Wait -PassThru
+        $ElevProc = Start-Process -FilePath $PsHostExe -ArgumentList $FwdArgLine -WorkingDirectory $CallerWorkDir -Verb RunAs -Wait -PassThru
     } catch {
         Write-Err "Windows UAC elevation was cancelled or blocked ($($_.Exception.Message))."
         Write-Host "    Right-click PowerShell -> 'Run as Administrator' and re-run .\install-vpngate.ps1" -ForegroundColor Yellow
