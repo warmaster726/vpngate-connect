@@ -24,7 +24,7 @@ const CDN_CHECK_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Public desktop label. Cargo crate version stays SemVer; a trailing letter
 /// (`0.3.4a`) is a revision after that numeric patch for update prompts.
-pub const PRODUCT_VERSION: &str = "0.5.0";
+pub const PRODUCT_VERSION: &str = "0.5.1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DesktopVersion {

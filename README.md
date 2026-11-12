@@ -18,7 +18,7 @@ Censorship-resilient **SoftEther VPN Gate** desktop client engineered around a *
   - **IP-Pinned Cloudflare DoH (`1.1.1.1:443`) & Leak Protection**: Bypasses ISP DNS poisoning, uses tunnel DNS from the connection plus Cloudflare (`1.1.1.1`, `1.0.0.1`) and Google (`8.8.8.8`, `8.8.4.4`) including their IPv6 counterparts, and restores host routes, `/etc/resolv.conf` / `systemd-resolved`, and IPv6 state cleanly on teardown.
 - **Two Separate Desktop Launch Paths: Traditional Console and Native GUI**
   - The traditional `vpngate` dashboard remains available, including `-w` and the Linux GNOME GTK4/VTE host (`vpngate-launcher`). It retains the Python v5.3-compatible menu, command/flag interface, live progress and tables.
-  - `vpngate-gui` is a separate eframe/egui application for Linux, Windows 11, and macOS, with practical Connect, Relays, More actions, and System pages plus light/dark themes.
+  - `vpngate-gui` is a separate eframe/egui application for Linux, Windows 11, and macOS, with practical Connect, Relays, More actions, and System pages, light/dark themes, and a searchable checkbox list for selecting multiple regions.
   - Both frontends use one per-user OS file lock: the traditional UI and GUI are mutually exclusive, and a second launch receives a clear notice. GUI cancellation keeps the tunnel rollback behavior; the old shared-control/observer integration is removed.
   - The GTK/VTE host retains its dark header, live tunnel badge, and one-click egress-IP copy chip.
 
@@ -29,7 +29,7 @@ Censorship-resilient **SoftEther VPN Gate** desktop client engineered around a *
 | Branch | Status | Description |
 | :--- | :--- | :--- |
 | **`main`** | **Active (Default)** | Public **0.4.x** Pure-Rust 64-bit Desktop Edition; it remains unchanged until an authorized merge from `develop`. |
-| **`develop`** | **Active (integration)** | Desktop **0.5.0** preparation: separate console/GUI launch paths and a shared one-frontend-at-a-time guard. Push integration work here first. |
+| **`develop`** | **Active (integration)** | Desktop **0.5.1**: searchable multi-region GUI selection and a more usable responsive Connect layout. Push integration work here first. |
 
 ---
 
@@ -105,7 +105,7 @@ cargo build --release --locked -p vpngate-cli --target x86_64-unknown-linux-gnu
 
 ## Separate Traditional and GUI Launch Paths
 
-Desktop 0.5.0 keeps the traditional dashboard and the native GUI as distinct applications:
+Desktop 0.5.1 keeps the traditional dashboard and the native GUI as distinct applications, with multi-region selection in the GUI:
 
 - **VPN Gate Connect** — run `vpngate` for the terminal dashboard. On Linux, `vpngate -w` opens the same traditional UI in the retained GTK4/VTE window; Windows Terminal remains available through `-w`.
 - **VPN Gate Connect GUI** — run `vpngate-gui` for the eframe/egui interface on Linux, Windows 11, or macOS. The GUI supports light and dark themes and exposes connect, relay browsing, tools, status, diagnostics, watchdog, disconnect, and desktop update actions.

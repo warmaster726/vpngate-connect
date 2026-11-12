@@ -229,6 +229,7 @@ struct GuiApp {
     elevated: bool,
 
     connect_country: String,
+    connect_region_search: String,
     connect_protocol: String,
     connect_sort: String,
     connect_limit: usize,
@@ -284,6 +285,7 @@ impl GuiApp {
             elevated: is_root_or_admin(),
 
             connect_country: "all".to_string(),
+            connect_region_search: String::new(),
             connect_protocol: "auto".to_string(),
             connect_sort: "score".to_string(),
             connect_limit: 0,
@@ -1023,24 +1025,90 @@ impl GuiApp {
     }
 
     fn connect_page(&mut self, ui: &mut egui::Ui) {
+        let countries = self.available_countries();
+        let mut connect_clicked = false;
+        let mut disconnect_clicked = false;
+        let mut fetch_regions_clicked = false;
+
+        // Keep connection setup and live session details side by side when there is
+        // room, but return to a single column on compact windows.
+        if ui.available_width() >= 760.0 {
+            ui.columns(2, |columns| {
+                self.connection_options_panel(
+                    &mut columns[0],
+                    &countries,
+                    &mut connect_clicked,
+                    &mut disconnect_clicked,
+                    &mut fetch_regions_clicked,
+                );
+                self.session_status_panel(&mut columns[1]);
+            });
+        } else {
+            self.session_status_panel(ui);
+            ui.add_space(8.0);
+            self.connection_options_panel(
+                ui,
+                &countries,
+                &mut connect_clicked,
+                &mut disconnect_clicked,
+                &mut fetch_regions_clicked,
+            );
+        }
+
+        if self.cli_binary.is_none() {
+            ui.colored_label(
+                Color32::from_rgb(190, 125, 30),
+                self.action_service_notice(),
+            );
+        }
+        if let Some(worker) = &self.worker
+            && worker.cancellable
+        {
+            let mut cancel_clicked = false;
+            let enabled = !worker.cancel_requested;
+            ui.horizontal(|ui| {
+                ui.colored_label(
+                    Color32::from_rgb(190, 125, 30),
+                    "Connect is running. Cancelling performs the normal tunnel rollback.",
+                );
+                cancel_clicked = ui
+                    .add_enabled(enabled, egui::Button::new("Cancel connect"))
+                    .clicked();
+            });
+            if cancel_clicked {
+                self.cancel_connect();
+            }
+        }
+
+        if fetch_regions_clicked {
+            self.fetch_connect_regions();
+        } else if connect_clicked {
+            self.start_connect();
+        } else if disconnect_clicked {
+            self.execute_tool_action(ToolAction::Disconnect);
+        }
+
+        ui.add_space(8.0);
+        self.activity_details_panel(ui, 180.0);
+    }
+
+    fn session_status_panel(&self, ui: &mut egui::Ui) {
         egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.label(RichText::new("Current session").strong());
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
                 let (label, color) = self.status_badge();
                 let (dot_rect, _) =
                     ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
                 ui.painter().circle_filled(dot_rect.center(), 5.0, color);
-                ui.vertical(|ui| {
-                    ui.label(RichText::new(label).strong().size(18.0));
-                    ui.label(
-                        RichText::new("Live session state from the shared desktop cache").weak(),
-                    );
-                });
+                ui.label(RichText::new(label).strong().size(18.0));
             });
-            ui.add_space(6.0);
+
             if let Some(session) = &self.session {
+                ui.add_space(6.0);
                 egui::Grid::new("session_details")
                     .num_columns(2)
-                    .spacing([20.0, 6.0])
+                    .spacing([14.0, 6.0])
                     .show(ui, |ui| {
                         detail_row(ui, "Profile", &session.profile_name);
                         detail_row(ui, "Protocol", &session.protocol);
@@ -1064,66 +1132,34 @@ impl GuiApp {
                         }
                     });
             } else {
+                ui.add_space(4.0);
                 ui.label("No active VPN session was found.");
+                ui.label(RichText::new("Choose regions below and connect when ready.").weak());
             }
         });
+    }
 
-        ui.add_space(10.0);
+    fn connection_options_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        countries: &[(String, String)],
+        connect_clicked: &mut bool,
+        disconnect_clicked: &mut bool,
+        fetch_regions_clicked: &mut bool,
+    ) {
         let blocked = self.actions_blocked();
-        let countries = self.available_countries();
-        let selected_country_label = country_picker_label(&self.connect_country, &countries);
-        let region_cache_label = self
-            .cache_timestamp
-            .map(|timestamp| {
-                format!(
-                    "{} regions · cache {}",
-                    countries.len(),
-                    format_age(now_unix_secs().saturating_sub(timestamp))
-                )
-            })
-            .unwrap_or_else(|| "No region cache yet".to_string());
-        let mut connect_clicked = false;
-        let mut disconnect_clicked = false;
-        let mut fetch_regions_clicked = false;
         ui.add_enabled_ui(!blocked, |ui| {
             egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.label(RichText::new("Connection options").strong());
-                egui::Grid::new("connect_options")
-                    .num_columns(2)
-                    .spacing([12.0, 8.0])
-                    .show(ui, |ui| {
-                        ui.label("Country / region");
-                        ui.horizontal_wrapped(|ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.connect_country)
-                                    .desired_width(150.0)
-                                    .hint_text("all or JP,KR"),
-                            );
-                            egui::ComboBox::from_id_salt("connect_country_picker")
-                                .selected_text(selected_country_label)
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut self.connect_country,
-                                        "all".to_string(),
-                                        "All countries",
-                                    );
-                                    for (code, name) in &countries {
-                                        ui.selectable_value(
-                                            &mut self.connect_country,
-                                            code.clone(),
-                                            format!("{name} ({code})"),
-                                        );
-                                    }
-                                });
-                            fetch_regions_clicked = ui
-                                .button("Fetch regions")
-                                .on_hover_text("Refresh the live relay pool and update this region picker without leaving Connect")
-                                .clicked();
-                            ui.label(RichText::new(&region_cache_label).weak().small());
-                        });
-                        ui.end_row();
+                ui.label(RichText::new("Connection setup").strong());
+                ui.label(RichText::new("Choose one or more regions, then connect.").weak());
+                ui.add_space(6.0);
 
-                        ui.label("Protocol");
+                self.region_selection_panel(ui, countries, fetch_regions_clicked);
+
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("Protocol").weak().small());
                         egui::ComboBox::from_id_salt("connect_protocol")
                             .selected_text(&self.connect_protocol)
                             .show_ui(ui, |ui| {
@@ -1137,9 +1173,10 @@ impl GuiApp {
                                     );
                                 }
                             });
-                        ui.end_row();
-
-                        ui.label("Sort order");
+                    });
+                    ui.add_space(12.0);
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("Sort order").weak().small());
                         egui::ComboBox::from_id_salt("connect_sort")
                             .selected_text(&self.connect_sort)
                             .show_ui(ui, |ui| {
@@ -1151,41 +1188,43 @@ impl GuiApp {
                                     );
                                 }
                             });
-                        ui.end_row();
-
-                        ui.label("Auto-reconnect");
-                        egui::ComboBox::from_id_salt("connect_watchdog")
-                            .selected_text(match self.connect_autoreconnect.as_str() {
-                                "on" => "Enable",
-                                "off" => "Disable",
-                                _ => "Use saved preference",
-                            })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut self.connect_autoreconnect,
-                                    "default".to_string(),
-                                    "Use saved preference",
-                                );
-                                ui.selectable_value(
-                                    &mut self.connect_autoreconnect,
-                                    "on".to_string(),
-                                    "Enable for this session",
-                                );
-                                ui.selectable_value(
-                                    &mut self.connect_autoreconnect,
-                                    "off".to_string(),
-                                    "Disable for this session",
-                                );
-                            });
-                        ui.end_row();
                     });
+                });
+
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Auto-reconnect").weak());
+                    egui::ComboBox::from_id_salt("connect_watchdog")
+                        .selected_text(match self.connect_autoreconnect.as_str() {
+                            "on" => "Enable",
+                            "off" => "Disable",
+                            _ => "Use saved preference",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.connect_autoreconnect,
+                                "default".to_string(),
+                                "Use saved preference",
+                            );
+                            ui.selectable_value(
+                                &mut self.connect_autoreconnect,
+                                "on".to_string(),
+                                "Enable for this session",
+                            );
+                            ui.selectable_value(
+                                &mut self.connect_autoreconnect,
+                                "off".to_string(),
+                                "Disable for this session",
+                            );
+                        });
+                });
 
                 egui::CollapsingHeader::new("Advanced connection options")
                     .default_open(false)
                     .show(ui, |ui| {
                         egui::Grid::new("connect_advanced")
                             .num_columns(2)
-                            .spacing([12.0, 8.0])
+                            .spacing([10.0, 8.0])
                             .show(ui, |ui| {
                                 ui.label("Try at most");
                                 ui.add(
@@ -1227,14 +1266,14 @@ impl GuiApp {
                                 ui.label("Extra DNS servers");
                                 ui.add(
                                     egui::TextEdit::singleline(&mut self.connect_dns)
-                                        .desired_width(320.0),
+                                        .desired_width(220.0),
                                 );
                                 ui.end_row();
 
                                 ui.label("Custom mirrors");
                                 ui.add(
                                     egui::TextEdit::singleline(&mut self.connect_mirrors)
-                                        .desired_width(320.0)
+                                        .desired_width(220.0)
                                         .hint_text("URLs separated by semicolon"),
                                 );
                                 ui.end_row();
@@ -1246,9 +1285,16 @@ impl GuiApp {
                     });
 
                 ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    connect_clicked = ui.button(RichText::new("Connect").strong()).clicked();
-                    disconnect_clicked = ui.button("Disconnect").clicked();
+                ui.horizontal_wrapped(|ui| {
+                    *connect_clicked = ui
+                        .add_enabled(
+                            !self.connect_country.trim().is_empty(),
+                            egui::Button::new(RichText::new("Connect").strong())
+                                .min_size(egui::vec2(112.0, 34.0))
+                                .fill(ui.visuals().selection.bg_fill),
+                        )
+                        .clicked();
+                    *disconnect_clicked = ui.button("Disconnect").clicked();
                     if ui.button("Browse relays").clicked() {
                         self.page = Page::Relays;
                     }
@@ -1258,44 +1304,112 @@ impl GuiApp {
                 });
             });
         });
+    }
 
-        if self.cli_binary.is_none() {
-            ui.colored_label(
-                Color32::from_rgb(190, 125, 30),
-                self.action_service_notice(),
-            );
-        }
-        if !self.status_message.is_empty() {
-            ui.label(RichText::new(&self.status_message).weak());
-        }
-        if let Some(worker) = &self.worker
-            && worker.cancellable
-        {
-            let mut cancel_clicked = false;
-            let enabled = !worker.cancel_requested;
-            ui.horizontal(|ui| {
-                ui.colored_label(
-                    Color32::from_rgb(190, 125, 30),
-                    "Connect is running. Cancelling performs the normal tunnel rollback.",
+    fn region_selection_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        countries: &[(String, String)],
+        fetch_regions_clicked: &mut bool,
+    ) {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Regions").strong());
+                ui.label(
+                    RichText::new(country_picker_label(&self.connect_country, countries)).strong(),
                 );
-                cancel_clicked = ui
-                    .add_enabled(enabled, egui::Button::new("Cancel connect"))
-                    .clicked();
             });
-            if cancel_clicked {
-                self.cancel_connect();
-            }
-        }
 
-        if fetch_regions_clicked {
-            self.fetch_connect_regions();
-        } else if connect_clicked {
-            self.start_connect();
-        } else if disconnect_clicked {
-            self.execute_tool_action(ToolAction::Disconnect);
-        }
-        ui.add_space(8.0);
-        self.activity_details_panel(ui, 180.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Codes or names");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.connect_country)
+                        .desired_width(150.0)
+                        .hint_text("all or JP,KR"),
+                );
+                *fetch_regions_clicked = ui
+                    .button("Fetch regions")
+                    .on_hover_text(
+                        "Refresh the relay pool and update this checklist without leaving Connect",
+                    )
+                    .clicked();
+                let cache_label = self
+                    .cache_timestamp
+                    .map(|timestamp| {
+                        format!(
+                            "{} regions · cache {}",
+                            countries.len(),
+                            format_age(now_unix_secs().saturating_sub(timestamp))
+                        )
+                    })
+                    .unwrap_or_else(|| "No region cache yet".to_string());
+                ui.label(RichText::new(cache_label).weak().small());
+            });
+
+            ui.horizontal_wrapped(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.connect_region_search)
+                        .desired_width(190.0)
+                        .hint_text("Search available regions"),
+                );
+                let mut all_selected = country_selection_is_all(&self.connect_country);
+                if ui.checkbox(&mut all_selected, "All countries").changed() {
+                    self.connect_country = if all_selected {
+                        "all".to_string()
+                    } else {
+                        String::new()
+                    };
+                }
+                if ui.button("Clear selection").clicked() {
+                    self.connect_country.clear();
+                }
+                ui.label(
+                    RichText::new(country_selection_summary(&self.connect_country))
+                        .weak()
+                        .small(),
+                );
+            });
+
+            egui::ScrollArea::vertical()
+                .max_height(184.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    if countries.is_empty() {
+                        ui.label(
+                            RichText::new(
+                                "No regions are cached yet. Fetch regions or enter codes above.",
+                            )
+                            .weak(),
+                        );
+                        return;
+                    }
+
+                    let query = self.connect_region_search.trim().to_string();
+                    let matches = countries
+                        .iter()
+                        .filter(|(code, name)| {
+                            query.is_empty()
+                                || contains_ascii_case_insensitive(code, &query)
+                                || contains_ascii_case_insensitive(name, &query)
+                        })
+                        .collect::<Vec<_>>();
+                    if matches.is_empty() {
+                        ui.label(RichText::new("No matching regions.").weak());
+                        return;
+                    }
+
+                    for (code, name) in matches {
+                        let mut selected =
+                            country_selection_contains(&self.connect_country, code, name);
+                        if ui
+                            .checkbox(&mut selected, format!("{name} ({code})"))
+                            .changed()
+                        {
+                            set_country_selection(&mut self.connect_country, code, name, selected);
+                        }
+                    }
+                });
+        });
     }
 
     fn relays_page(&mut self, ui: &mut egui::Ui) {
@@ -1898,21 +2012,76 @@ fn format_age(seconds: u64) -> String {
     }
 }
 
-fn country_picker_label(selection: &str, countries: &[(String, String)]) -> String {
-    let selection = selection.trim();
-    if selection.eq_ignore_ascii_case("all") {
+fn country_selection_is_all(selection: &str) -> bool {
+    selection.trim().eq_ignore_ascii_case("all")
+}
+
+fn country_selection_values(selection: &str) -> Vec<String> {
+    if country_selection_is_all(selection) {
+        return Vec::new();
+    }
+
+    let mut values = Vec::new();
+    for value in selection
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if !values
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(value))
+        {
+            values.push(value.to_string());
+        }
+    }
+    values
+}
+
+fn country_selection_summary(selection: &str) -> String {
+    if country_selection_is_all(selection) {
         return "All countries".to_string();
     }
-    if let Some((code, name)) = countries
-        .iter()
-        .find(|(code, _)| code.eq_ignore_ascii_case(selection))
-    {
-        return format!("{name} ({code})");
+    match country_selection_values(selection).len() {
+        0 => "No regions selected".to_string(),
+        1 => "1 region selected".to_string(),
+        count => format!("{count} regions selected"),
     }
-    if selection.is_empty() {
-        "Choose a region".to_string()
-    } else {
-        selection.to_string()
+}
+
+fn country_selection_contains(selection: &str, code: &str, name: &str) -> bool {
+    !country_selection_is_all(selection)
+        && country_selection_values(selection)
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(code) || value.eq_ignore_ascii_case(name))
+}
+
+fn set_country_selection(selection: &mut String, code: &str, name: &str, selected: bool) {
+    let mut values = country_selection_values(selection)
+        .into_iter()
+        .filter(|value| !value.eq_ignore_ascii_case(code) && !value.eq_ignore_ascii_case(name))
+        .collect::<Vec<_>>();
+    if selected {
+        values.push(code.to_string());
+    }
+    *selection = values.join(",");
+}
+
+fn country_picker_label(selection: &str, countries: &[(String, String)]) -> String {
+    if country_selection_is_all(selection) {
+        return "All countries".to_string();
+    }
+
+    let values = country_selection_values(selection);
+    match values.as_slice() {
+        [] => "Choose one or more regions".to_string(),
+        [value] => countries
+            .iter()
+            .find(|(code, name)| {
+                code.eq_ignore_ascii_case(value) || name.eq_ignore_ascii_case(value)
+            })
+            .map(|(code, name)| format!("{name} ({code})"))
+            .unwrap_or_else(|| value.clone()),
+        _ => format!("{} regions selected", values.len()),
     }
 }
 
@@ -2236,8 +2405,9 @@ fn strip_ansi(text: &str) -> String {
 mod tests {
     use super::{
         action_result_message, append_mirror_args, connect_regions_fetch_args,
-        country_picker_label, format_age, protocol_labels, relay_matches,
-        selected_relay_start_index, strip_ansi,
+        country_picker_label, country_selection_contains, country_selection_summary, format_age,
+        protocol_labels, relay_matches, selected_relay_start_index, set_country_selection,
+        strip_ansi,
     };
     use vpngate_core::{ProtocolFilter, SortBy, VpnServer};
 
@@ -2343,7 +2513,38 @@ mod tests {
         ];
         assert_eq!(country_picker_label("all", &countries), "All countries");
         assert_eq!(country_picker_label("jp", &countries), "Japan (JP)");
-        assert_eq!(country_picker_label("JP,KR", &countries), "JP,KR");
+        assert_eq!(
+            country_picker_label("Japan,KR", &countries),
+            "2 regions selected"
+        );
+        assert_eq!(
+            country_picker_label("", &countries),
+            "Choose one or more regions"
+        );
+        assert_eq!(country_selection_summary("JP,KR"), "2 regions selected");
+    }
+
+    #[test]
+    fn region_checklist_adds_and_removes_multiple_regions() {
+        let mut selection = "all".to_string();
+        set_country_selection(&mut selection, "JP", "Japan", true);
+        assert_eq!(selection, "JP");
+        set_country_selection(&mut selection, "KR", "Korea", true);
+        assert_eq!(selection, "JP,KR");
+        assert!(country_selection_contains(&selection, "JP", "Japan"));
+        assert!(country_selection_contains(&selection, "KR", "Korea"));
+
+        set_country_selection(&mut selection, "JP", "Japan", false);
+        assert_eq!(selection, "KR");
+        set_country_selection(&mut selection, "KR", "Korea", false);
+        assert!(selection.is_empty());
+        assert_eq!(country_selection_summary(&selection), "No regions selected");
+
+        selection = "jp,korea,FR".to_string();
+        set_country_selection(&mut selection, "JP", "Japan", false);
+        assert_eq!(selection, "korea,FR");
+        set_country_selection(&mut selection, "KR", "Korea", false);
+        assert_eq!(selection, "FR");
     }
 
     #[test]
