@@ -1041,7 +1041,12 @@ fi
 
 echo ""
 ok "Installation complete! Running 'vpngate doctor' readiness check:"
-sudo env VPNGATE_CACHE_DIR="${USER_CACHE_DIR}" /usr/local/bin/vpngate doctor --no-resize || true
+# Keep the private shared-control lock owned by the interactive user, not root.
+if [ "$(id -u)" -eq 0 ] && [ "${TARGET_USER}" != "root" ]; then
+  sudo -u "${TARGET_USER}" env VPNGATE_CACHE_DIR="${USER_CACHE_DIR}" /usr/local/bin/vpngate doctor --no-resize || true
+else
+  VPNGATE_CACHE_DIR="${USER_CACHE_DIR}" /usr/local/bin/vpngate doctor --no-resize || true
+fi
 echo ""
 ok "Launch interactive console anytime with:  vpngate"
 if [ "${HOST_UNAME}" = "Linux" ]; then
