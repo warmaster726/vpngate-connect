@@ -848,9 +848,7 @@ impl GuiApp {
             return;
         };
         if let Some(progress) = &mut self.operation_progress {
-            if let Some(fraction) = fraction {
-                progress.fraction = Some(fraction);
-            }
+            progress.fraction = fraction;
             progress.message = message;
         }
     }
@@ -888,17 +886,21 @@ impl GuiApp {
                     ui.label(RichText::new(&progress.message).weak());
                 }
 
-                let running = self.worker.is_some();
-                let fill = progress
-                    .fraction
-                    .unwrap_or(if running { 0.28 } else { 0.0 });
-                let bar = egui::ProgressBar::new(fill)
-                    .desired_width(ui.available_width())
-                    .animate(running && progress.fraction.is_none());
-                if progress.fraction.is_some() || progress.succeeded {
-                    ui.add(bar.show_percentage());
-                } else {
-                    ui.add(bar);
+                if let Some(fraction) = progress.fraction {
+                    ui.add(
+                        egui::ProgressBar::new(fraction)
+                            .desired_width(ui.available_width())
+                            .show_percentage(),
+                    );
+                } else if self.worker.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new());
+                        ui.label(
+                            RichText::new("In progress · completion not measured")
+                                .weak()
+                                .small(),
+                        );
+                    });
                 }
 
                 if progress.completed {
@@ -2116,13 +2118,12 @@ fn progress_update_from_output(line: &str) -> Option<(Option<f32>, String)> {
             let attempt = attempt.parse::<usize>().ok()?;
             let total = total.parse::<usize>().ok()?;
             if total > 0 {
-                let fraction = (attempt.min(total) as f32 / total as f32) * 0.9;
                 let detail = rest[close + 1..]
                     .trim()
                     .strip_prefix("Testing ")
                     .unwrap_or(rest[close + 1..].trim());
                 return Some((
-                    Some(fraction),
+                    None,
                     compact_progress_message(&format!(
                         "Relay attempt {attempt}/{total} · {detail}"
                     )),
@@ -2680,12 +2681,12 @@ mod tests {
     }
 
     #[test]
-    fn progress_parser_turns_attempts_and_status_lines_into_ui_updates() {
+    fn progress_parser_keeps_relay_attempts_indeterminate() {
         let (fraction, message) = progress_update_from_output(
             "\u{1b}[1;36m[Attempt 3/10] Testing relay.example (192.0.2.3) | JP (Japan)\u{1b}[0m",
         )
         .unwrap();
-        assert!((fraction.unwrap() - 0.27).abs() < 0.001);
+        assert_eq!(fraction, None);
         assert!(message.contains("Relay attempt 3/10"));
         assert!(message.contains("relay.example"));
 
