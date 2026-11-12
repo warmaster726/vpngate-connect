@@ -69,9 +69,10 @@ pub use server::{
     VpnServer, filter_by_country, filter_by_protocol, sort_servers, split_country_query,
 };
 pub use ui_control::{
-    UiControlAccess, UiControlError, UiControlExecutorGuard, UiControlLease, UiControlSnapshot,
-    acquire_ui_control, join_ui_control, report_ui_control_phase, ui_control_cancel_requested,
-    ui_control_status, ui_control_token_for_process, wait_for_ui_control_cancel,
+    UI_CONTROL_PROTOCOL_VERSION, UiControlAccess, UiControlError, UiControlExecutorGuard,
+    UiControlLease, UiControlSnapshot, acquire_ui_control, join_ui_control,
+    report_ui_control_phase, ui_control_cancel_requested, ui_control_status,
+    ui_control_token_for_process, wait_for_ui_control_cancel,
 };
 pub use update::{
     DesktopVersion, PRODUCT_VERSION, RemoteDesktopVersion, UpdateCheckCache, cache_is_fresh,

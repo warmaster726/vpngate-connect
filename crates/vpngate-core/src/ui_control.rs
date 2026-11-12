@@ -14,6 +14,9 @@ use serde::{Deserialize, Serialize};
 use crate::cache::{AppPaths, fix_owner, now_unix_secs};
 use crate::desktop_tunnel::is_pid_alive;
 
+/// Increment when the private GUI-to-desktop-service control handshake changes.
+pub const UI_CONTROL_PROTOCOL_VERSION: u32 = 1;
+
 #[cfg(unix)]
 const CONTROL_FILE_MODE: u32 = 0o600;
 

@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![forbid(unsafe_code)]
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -16,8 +16,8 @@ use eframe::egui::{self, Color32, RichText};
 use vpngate_core::cache::ServerCacheFile;
 use vpngate_core::{
     ActiveSessionState, AppPaths, PRODUCT_VERSION, ProtocolFilter, RemoteDesktopVersion, SortBy,
-    UiControlError, UiControlLease, UiControlSnapshot, VpnServer, acquire_ui_control,
-    cpu_isa_label, detect_host_os_label, filter_by_country, filter_by_protocol,
+    UI_CONTROL_PROTOCOL_VERSION, UiControlError, UiControlLease, UiControlSnapshot, VpnServer,
+    acquire_ui_control, cpu_isa_label, detect_host_os_label, filter_by_country, filter_by_protocol,
     installed_desktop_version, is_root_or_admin, load_cached_mirrors, load_update_cache,
     now_unix_secs, read_json_opt, record_update_declined, refresh_update_cache, should_auto_prompt,
     sort_servers, summarize_countries, tunnel_aid_dns_cli, ui_control_status,
@@ -68,7 +68,7 @@ impl Page {
         match self {
             Self::Connect => "Connect",
             Self::Relays => "Relays",
-            Self::Tools => "CLI functions",
+            Self::Tools => "More actions",
             Self::Activity => "System & activity",
         }
     }
@@ -79,9 +79,9 @@ impl Page {
                 "Choose one or more regions and connect with the desktop tunnel engine"
             }
             Self::Relays => "Browse, filter, list, and start a connection from a ranked relay",
-            Self::Tools => "Run the existing vpngate commands from this window",
+            Self::Tools => "Manage relay discovery, diagnostics, and connection preferences",
             Self::Activity => {
-                "Live tunnel state, shared controller, diagnostics, and command output"
+                "Live tunnel state, shared control, system checks, and recent activity"
             }
         }
     }
@@ -90,7 +90,7 @@ impl Page {
         match self {
             Self::Connect => "Connect",
             Self::Relays => "Relays",
-            Self::Tools => "CLI functions",
+            Self::Tools => "More actions",
             Self::Activity => "System",
         }
     }
@@ -128,7 +128,7 @@ enum ToolAction {
     Probe,
     Disconnect,
     Watchdog(&'static str),
-    CliHelp,
+    Help,
 }
 
 enum CommandEvent {
@@ -149,6 +149,7 @@ struct CommandWorker {
 struct GuiApp {
     paths: AppPaths,
     cli_binary: Option<PathBuf>,
+    cli_notice: Option<String>,
     page: Page,
     theme: egui::ThemePreference,
     session: Option<ActiveSessionState>,
@@ -202,9 +203,11 @@ impl GuiApp {
         install_platform_font(&cc.egui_ctx);
 
         let paths = AppPaths::resolve();
+        let (cli_binary, cli_notice) = resolve_cli_binary();
         let mut app = Self {
             paths,
-            cli_binary: resolve_cli_binary(),
+            cli_binary,
+            cli_notice,
             page: Page::Connect,
             theme: egui::ThemePreference::System,
             session: None,
@@ -286,6 +289,12 @@ impl GuiApp {
                 .control_status
                 .as_ref()
                 .is_some_and(|state| state.owner_pid != std::process::id())
+    }
+
+    fn action_service_notice(&self) -> &str {
+        self.cli_notice.as_deref().unwrap_or(
+            "The synchronized desktop action service is unavailable. Install the desktop components together and restart this app.",
+        )
     }
 
     fn control_badge(&self) -> Option<(String, Color32)> {
@@ -453,7 +462,7 @@ impl GuiApp {
             return;
         }
         let Some(cli_binary) = self.cli_binary.clone() else {
-            self.status_message = "Could not locate `vpngate`. Build/install the CLI beside this GUI or add it to PATH.".to_string();
+            self.status_message = self.action_service_notice().to_string();
             return;
         };
 
@@ -474,7 +483,7 @@ impl GuiApp {
             }
         };
         let token = lease.token().to_string();
-        lease.set_phase("Starting CLI operation");
+        lease.set_phase("Starting desktop operation");
         self.command_log.clear();
         self.push_log(format!("Starting {operation}…"));
         self.status_message.clear();
@@ -498,10 +507,6 @@ impl GuiApp {
 
     fn start_update_check(&mut self, mode: UpdateCheckMode) {
         if self.worker.is_some() || self.control_lease.is_some() {
-            return;
-        }
-        if self.cli_binary.is_none() {
-            self.pending_update_check = None;
             return;
         }
         let lease = match acquire_ui_control(&self.paths, "GUI", "Check desktop updates") {
@@ -565,7 +570,7 @@ impl GuiApp {
                 worker.cancel_requested = true;
             }
             self.push_log(
-                "Cancellation requested — the CLI will roll back tunnel changes before returning."
+                "Cancellation requested — tunnel changes will be rolled back before returning."
                     .to_string(),
             );
             self.status_message = "Cancelling and rolling back…".to_string();
@@ -644,8 +649,8 @@ impl GuiApp {
                     needs_privilege,
                 );
             }
-            ToolAction::CliHelp => {
-                self.start_cli_command("CLI help", vec!["--help".to_string()], false, false);
+            ToolAction::Help => {
+                self.start_cli_command("Help and usage", vec!["--help".to_string()], false, false);
             }
         }
     }
@@ -676,10 +681,9 @@ impl GuiApp {
                             .small(),
                     );
                 } else {
-                    ui.label(format!(
-                        "Run `vpngate {}`? The installer may replace the current desktop binary.",
-                        kind.command()
-                    ));
+                    ui.label(
+                        "Continue with the desktop installer? It may replace this installation.",
+                    );
                     ui.label(
                         RichText::new(
                             "The update is downloaded anonymously from the public repository.",
@@ -695,10 +699,7 @@ impl GuiApp {
                 );
                 ui.add_space(8.0);
                 if self.cli_binary.is_none() {
-                    ui.colored_label(
-                        Color32::from_rgb(190, 125, 30),
-                        "The `vpngate` CLI binary is required to install updates.",
-                    );
+                    ui.colored_label(Color32::from_rgb(190, 125, 30), self.action_service_notice());
                 }
                 ui.horizontal(|ui| {
                     if ui
@@ -787,19 +788,28 @@ impl GuiApp {
                     finished = true;
                 }
                 CommandEvent::Finished(code) => {
-                    let message = if code == vpngate_core::INTERRUPTED_EXIT {
-                        "Connect cancelled; rollback completed or tunnel state was left unchanged."
-                            .to_string()
-                    } else {
-                        format!("Command finished with exit code {code}.")
-                    };
+                    let operation = self
+                        .worker
+                        .as_ref()
+                        .map(|worker| worker.operation.as_str())
+                        .unwrap_or("Action");
+                    let message = action_result_message(operation, code);
+                    if code != 0 {
+                        self.push_log(format!("Technical result status: {code}"));
+                    }
                     self.push_log(message.clone());
                     self.status_message = message;
                     finished = true;
                 }
                 CommandEvent::Failed(error) => {
-                    self.push_log(format!("Could not start command: {error}"));
-                    self.status_message = format!("Could not start command: {error}");
+                    let operation = self
+                        .worker
+                        .as_ref()
+                        .map(|worker| worker.operation.as_str())
+                        .unwrap_or("Action");
+                    let message = format!("Could not start {operation}: {error}");
+                    self.push_log(message.clone());
+                    self.status_message = message;
                     finished = true;
                 }
             }
@@ -832,10 +842,10 @@ impl GuiApp {
         }
     }
 
-    fn command_output_panel(&mut self, ui: &mut egui::Ui, max_height: f32) {
+    fn activity_details_panel(&mut self, ui: &mut egui::Ui, max_height: f32) {
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Command output").strong());
+                ui.label(RichText::new("Recent activity").strong());
                 if let Some(worker) = &self.worker {
                     ui.label(
                         RichText::new(format!(
@@ -855,17 +865,21 @@ impl GuiApp {
             if !self.status_message.is_empty() {
                 ui.label(RichText::new(&self.status_message).weak());
             }
-            egui::ScrollArea::vertical()
-                .max_height(max_height)
-                .stick_to_bottom(true)
+            egui::CollapsingHeader::new("Technical details")
+                .default_open(false)
                 .show(ui, |ui| {
-                    if self.command_log.is_empty() {
-                        ui.label(RichText::new("No command has run in this window yet.").weak());
-                    } else {
-                        for line in &self.command_log {
-                            ui.monospace(line);
-                        }
-                    }
+                    egui::ScrollArea::vertical()
+                        .max_height(max_height)
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            if self.command_log.is_empty() {
+                                ui.label(RichText::new("No recent details.").weak());
+                            } else {
+                                for line in &self.command_log {
+                                    ui.monospace(line);
+                                }
+                            }
+                        });
                 });
         });
     }
@@ -954,8 +968,8 @@ impl GuiApp {
                     self.page = Page::Activity;
                     ui.close();
                 }
-                if ui.button("CLI reference").clicked() {
-                    self.execute_tool_action(ToolAction::CliHelp);
+                if ui.button("Help and usage").clicked() {
+                    self.execute_tool_action(ToolAction::Help);
                     ui.close();
                 }
                 ui.separator();
@@ -1163,7 +1177,7 @@ impl GuiApp {
                         ui.end_row();
                     });
 
-                egui::CollapsingHeader::new("Advanced CLI-compatible options")
+                egui::CollapsingHeader::new("Advanced connection options")
                     .default_open(false)
                     .show(ui, |ui| {
                         egui::Grid::new("connect_advanced")
@@ -1235,7 +1249,7 @@ impl GuiApp {
                     if ui.button("Browse relays").clicked() {
                         self.page = Page::Relays;
                     }
-                    if ui.button("More CLI functions").clicked() {
+                    if ui.button("More actions").clicked() {
                         self.page = Page::Tools;
                     }
                 });
@@ -1243,7 +1257,10 @@ impl GuiApp {
         });
 
         if self.cli_binary.is_none() {
-            ui.colored_label(Color32::from_rgb(190, 125, 30), "The `vpngate` CLI binary was not found. Build/install it beside this GUI or make it available in PATH.");
+            ui.colored_label(
+                Color32::from_rgb(190, 125, 30),
+                self.action_service_notice(),
+            );
         }
         if !self.status_message.is_empty() {
             ui.label(RichText::new(&self.status_message).weak());
@@ -1273,7 +1290,7 @@ impl GuiApp {
             self.execute_tool_action(ToolAction::Disconnect);
         }
         ui.add_space(8.0);
-        self.command_output_panel(ui, 180.0);
+        self.activity_details_panel(ui, 180.0);
     }
 
     fn relays_page(&mut self, ui: &mut egui::Ui) {
@@ -1311,7 +1328,7 @@ impl GuiApp {
                         .desired_width(150.0)
                         .hint_text("host, country, IP"),
                 );
-                run_list = ui.button("Run CLI list").clicked();
+                run_list = ui.button("Load relay data").clicked();
                 reload = ui.button("Reload cache").clicked();
             });
         });
@@ -1355,7 +1372,7 @@ impl GuiApp {
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.label(RichText::new("No cached relays").strong());
                 ui.label(
-                    "Run `countries`, `list`, `refresh`, or connect to populate the shared cache.",
+                    "Load relay data from More actions or start a connection to populate the shared pool.",
                 );
             });
         } else if relays.is_empty() {
@@ -1440,7 +1457,7 @@ impl GuiApp {
             self.start_connect();
         }
         ui.add_space(8.0);
-        self.command_output_panel(ui, 150.0);
+        self.activity_details_panel(ui, 150.0);
     }
 
     fn tools_page(&mut self, ui: &mut egui::Ui) {
@@ -1448,7 +1465,7 @@ impl GuiApp {
         let mut action = None;
         ui.add_enabled_ui(!blocked, |ui| {
             egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.label(RichText::new("Shared command options").strong());
+                ui.label(RichText::new("Action filters").strong());
                 egui::Grid::new("tool_options")
                     .num_columns(4)
                     .spacing([10.0, 8.0])
@@ -1515,28 +1532,28 @@ impl GuiApp {
 
             ui.add_space(8.0);
             ui.horizontal_wrapped(|ui| {
-                if ui.button("Countries (-L)").clicked() {
+                if ui.button("Countries").clicked() {
                     action = Some(ToolAction::Countries);
                 }
-                if ui.button("List relays (-l)").clicked() {
+                if ui.button("List relays").clicked() {
                     action = Some(ToolAction::List);
                 }
-                if ui.button("Discover mirrors (-M)").clicked() {
+                if ui.button("Find mirrors").clicked() {
                     action = Some(ToolAction::Mirrors);
                 }
-                if ui.button("Refresh pool (-r)").clicked() {
+                if ui.button("Refresh relay pool").clicked() {
                     action = Some(ToolAction::Refresh);
                 }
-                if ui.button("Status (-S)").clicked() {
+                if ui.button("Connection status").clicked() {
                     action = Some(ToolAction::Status);
                 }
-                if ui.button("Doctor (-D)").clicked() {
+                if ui.button("System check").clicked() {
                     action = Some(ToolAction::Doctor);
                 }
-                if ui.button("Probe IPv4").clicked() {
+                if ui.button("Check relay address").clicked() {
                     action = Some(ToolAction::Probe);
                 }
-                if ui.button("Disconnect (-d)").clicked() {
+                if ui.button("Disconnect").clicked() {
                     action = Some(ToolAction::Disconnect);
                 }
             });
@@ -1553,13 +1570,13 @@ impl GuiApp {
                 if ui.button("Watchdog toggle").clicked() {
                     action = Some(ToolAction::Watchdog("toggle"));
                 }
-                if ui.button("CLI help").clicked() {
-                    action = Some(ToolAction::CliHelp);
+                if ui.button("Help and usage").clicked() {
+                    action = Some(ToolAction::Help);
                 }
-                if ui.button("Update…").clicked() {
+                if ui.button("Update desktop…").clicked() {
                     self.request_update(UpdateKind::Update);
                 }
-                if ui.button("Upgrade alias…").clicked() {
+                if ui.button("Upgrade desktop…").clicked() {
                     self.request_update(UpdateKind::Upgrade);
                 }
             });
@@ -1570,11 +1587,11 @@ impl GuiApp {
         if self.cli_binary.is_none() {
             ui.colored_label(
                 Color32::from_rgb(190, 125, 30),
-                "CLI functions require the existing `vpngate` binary.",
+                self.action_service_notice(),
             );
         }
         ui.add_space(10.0);
-        self.command_output_panel(ui, 260.0);
+        self.activity_details_panel(ui, 260.0);
     }
 
     fn activity_page(&mut self, ui: &mut egui::Ui) {
@@ -1597,12 +1614,12 @@ impl GuiApp {
                     );
                     detail_row(
                         ui,
-                        "CLI binary",
+                        "Action service",
                         &self
                             .cli_binary
                             .as_ref()
                             .map(|path| path.display().to_string())
-                            .unwrap_or_else(|| "Not found".to_string()),
+                            .unwrap_or_else(|| "Unavailable".to_string()),
                     );
                     detail_row(
                         ui,
@@ -1660,7 +1677,7 @@ impl GuiApp {
             }
         });
         ui.add_space(10.0);
-        self.command_output_panel(ui, 340.0);
+        self.activity_details_panel(ui, 340.0);
     }
 
     fn status_badge(&self) -> (&str, Color32) {
@@ -1887,7 +1904,28 @@ fn append_mirror_args(args: &mut Vec<String>, value: &str) {
     }
 }
 
-fn resolve_cli_binary() -> Option<PathBuf> {
+fn action_result_message(operation: &str, code: i32) -> String {
+    if code == vpngate_core::INTERRUPTED_EXIT {
+        return format!(
+            "{operation} was canceled. Tunnel changes were rolled back or left unchanged."
+        );
+    }
+
+    match code {
+        0 => format!("{operation} completed."),
+        2 => format!(
+            "{operation} was rejected. Expand Technical details to see the reason; if service compatibility is reported, update both desktop components."
+        ),
+        75 => format!(
+            "{operation} did not start because another app window currently controls the connection. Wait for it to finish, then retry."
+        ),
+        _ => format!(
+            "{operation} did not complete (status {code}). Expand Technical details for more information."
+        ),
+    }
+}
+
+fn resolve_cli_binary() -> (Option<PathBuf>, Option<String>) {
     let mut candidates = Vec::new();
     let executable = std::env::current_exe().ok();
     if let Some(executable) = executable.as_ref() {
@@ -1919,7 +1957,64 @@ fn resolve_cli_binary() -> Option<PathBuf> {
         candidates.push(PathBuf::from("/usr/local/bin/vpngate"));
         candidates.push(PathBuf::from("/opt/homebrew/bin/vpngate"));
     }
-    candidates.into_iter().find(|path| path.is_file())
+
+    let mut seen = HashSet::new();
+    let mut found_candidate = false;
+    let mut unsupported_protocol = None;
+    let mut probe_failure = None;
+    for path in candidates {
+        if !path.is_file() || !seen.insert(path.clone()) {
+            continue;
+        }
+        found_candidate = true;
+        match probe_ui_control_protocol(&path) {
+            Ok(version) if protocol_version_compatible(version) => return (Some(path), None),
+            Ok(version) => unsupported_protocol = Some(version),
+            Err(error) => probe_failure = Some(error),
+        }
+    }
+
+    let notice = if let Some(version) = unsupported_protocol {
+        format!(
+            "The installed desktop service uses synchronization protocol {version}, but this app requires protocol {UI_CONTROL_PROTOCOL_VERSION}. Update or install the desktop components together, then restart this app."
+        )
+    } else if found_candidate {
+        format!(
+            "An installed desktop service could not confirm shared-control support ({}). Update or install the desktop components together, then restart this app.",
+            probe_failure.unwrap_or_else(|| "compatibility check failed".to_string())
+        )
+    } else {
+        "The synchronized desktop action service was not found. Install it beside this app or make it available in PATH.".to_string()
+    };
+    (None, Some(notice))
+}
+
+fn probe_ui_control_protocol(binary: &Path) -> Result<u32, String> {
+    let mut command = Command::new(binary);
+    command
+        .arg("--ui-control-protocol-version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000);
+
+    let output = command
+        .output()
+        .map_err(|error| format!("could not launch the service: {error}"))?;
+    if !output.status.success() {
+        return Err("service does not support the shared-control handshake".to_string());
+    }
+    parse_ui_control_protocol_output(&String::from_utf8_lossy(&output.stdout))
+        .ok_or_else(|| "service returned an invalid synchronization protocol version".to_string())
+}
+
+fn parse_ui_control_protocol_output(output: &str) -> Option<u32> {
+    output.trim().parse().ok()
+}
+
+fn protocol_version_compatible(version: u32) -> bool {
+    version == UI_CONTROL_PROTOCOL_VERSION
 }
 
 fn build_cli_command(
@@ -2134,7 +2229,10 @@ fn strip_ansi(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{append_mirror_args, format_age, protocol_labels, relay_matches, strip_ansi};
+    use super::{
+        action_result_message, append_mirror_args, format_age, parse_ui_control_protocol_output,
+        protocol_labels, protocol_version_compatible, relay_matches, strip_ansi,
+    };
     use vpngate_core::VpnServer;
 
     fn server() -> VpnServer {
@@ -2187,6 +2285,23 @@ mod tests {
         assert_eq!(format_age(42), "42s old");
         assert_eq!(format_age(120), "2m old");
         assert_eq!(format_age(7200), "2h old");
+    }
+
+    #[test]
+    fn synchronized_action_service_protocol_is_checked_explicitly() {
+        assert_eq!(parse_ui_control_protocol_output("1\n"), Some(1));
+        assert_eq!(parse_ui_control_protocol_output("unknown option\n"), None);
+        assert!(protocol_version_compatible(1));
+        assert!(!protocol_version_compatible(2));
+    }
+
+    #[test]
+    fn action_failures_are_explained_without_cli_exit_code_jargon() {
+        let message = action_result_message("List relays", 2);
+        assert!(message.contains("List relays was rejected"));
+        assert!(message.contains("Technical details"));
+        assert!(!message.contains("exit code 2"));
+        assert!(action_result_message("Connect", 0).contains("Connect completed"));
     }
 
     #[test]

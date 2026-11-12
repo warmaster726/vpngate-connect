@@ -1,7 +1,20 @@
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use vpngate_core::{AppPaths, acquire_ui_control, ui_control_status};
+use vpngate_core::{AppPaths, UI_CONTROL_PROTOCOL_VERSION, acquire_ui_control, ui_control_status};
+
+#[test]
+fn reports_shared_ui_control_protocol_version() {
+    let output = Command::new(env!("CARGO_BIN_EXE_vpngate"))
+        .arg("--ui-control-protocol-version")
+        .output()
+        .expect("query shared UI control protocol");
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        UI_CONTROL_PROTOCOL_VERSION.to_string()
+    );
+}
 
 #[test]
 fn delegated_cli_command_joins_gui_lease_and_other_cli_is_observe_only() {

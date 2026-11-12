@@ -188,6 +188,7 @@ async fn dispatch() -> io::Result<i32> {
     let mut cache_dir_override: Option<PathBuf> = None;
     let mut hold_on_exit = false;
     let mut control_token = env::var("VPNGATE_UI_CONTROL_TOKEN").ok();
+    let mut report_ui_control_protocol = false;
     let mut raw_args: Vec<String> = Vec::with_capacity(raw_all.len());
     let mut idx = 0usize;
     while idx < raw_all.len() {
@@ -214,6 +215,9 @@ async fn dispatch() -> io::Result<i32> {
                     control_token = Some(token.clone());
                 }
             }
+            "--ui-control-protocol-version" => {
+                report_ui_control_protocol = true;
+            }
             "--no-elevate" | "--read-only" => {
                 set_no_elevate_requested(true);
             }
@@ -230,6 +234,11 @@ async fn dispatch() -> io::Result<i32> {
         None => AppPaths::resolve(),
     };
     term_ui::set_ui_control_paths(paths.clone());
+
+    if report_ui_control_protocol {
+        print_line(&vpngate_core::UI_CONTROL_PROTOCOL_VERSION.to_string());
+        return Ok(0);
+    }
 
     // Internal background daemons (exact match with Python v5.3 architecture)
     if raw_args.first().map(String::as_str) == Some("_monitor") {
