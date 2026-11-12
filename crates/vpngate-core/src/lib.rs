@@ -23,6 +23,7 @@ pub mod parser;
 pub mod profile;
 pub mod protocol;
 pub mod server;
+pub mod ui_control;
 pub mod update;
 
 pub use cache::{
@@ -39,12 +40,11 @@ pub use country::{
 pub use desktop_tunnel::{
     ConnectSessionConfig, GatewayInfo, INTERRUPTED_EXIT, NM_PROFILE_PREFIX, WIN_VPN_PROFILE_NAME,
     assert_supported_native_host, cleanup_existing_vpn, cleanup_existing_vpn_with_progress,
-    cpu_isa_label, detect_host_os_label,
-    engage_candidates, engage_candidates_with_progress, find_openvpn_bin, get_default_gateway,
-    get_ppp_interfaces, get_running_monitor_pid, get_running_openvpn_pid, get_tun_interfaces,
-    is_root_or_admin, probe_linux_l2tp_kernel_support, prune_stale_state_if_dead,
-    query_windows_natt_rule, run_monitor_daemon, spawn_auto_reconnect_monitor,
-    stop_monitor_daemon, which_bin,
+    cpu_isa_label, detect_host_os_label, engage_candidates, engage_candidates_with_progress,
+    find_openvpn_bin, get_default_gateway, get_ppp_interfaces, get_running_monitor_pid,
+    get_running_openvpn_pid, get_tun_interfaces, is_root_or_admin, probe_linux_l2tp_kernel_support,
+    prune_stale_state_if_dead, query_windows_natt_rule, run_monitor_daemon,
+    spawn_auto_reconnect_monitor, stop_monitor_daemon, which_bin,
 };
 pub use discovery::{
     DiscoveryClient, DiscoveryOptions, DiscoveryOutcome, MirrorProbeResult, ProgressEvent,
@@ -68,12 +68,16 @@ pub use protocol::{
 pub use server::{
     VpnServer, filter_by_country, filter_by_protocol, sort_servers, split_country_query,
 };
+pub use ui_control::{
+    UiControlAccess, UiControlError, UiControlExecutorGuard, UiControlLease, UiControlSnapshot,
+    acquire_ui_control, join_ui_control, report_ui_control_phase, ui_control_cancel_requested,
+    ui_control_status, ui_control_token_for_process, wait_for_ui_control_cancel,
+};
 pub use update::{
-    DesktopVersion, RemoteDesktopVersion, UpdateCheckCache, PRODUCT_VERSION, cache_is_fresh,
+    DesktopVersion, PRODUCT_VERSION, RemoteDesktopVersion, UpdateCheckCache, cache_is_fresh,
     cached_newer_than_installed, cached_remote_version, cargo_toml_check_urls,
     check_remote_desktop_version, default_repo_slug, fetch_public_url_text,
-    installer_script_urls, installed_desktop_version, load_update_cache,
-    parse_version_payload, parse_workspace_package_version, record_update_declined,
-    record_update_failure, record_update_scan, refresh_update_cache, should_auto_prompt,
-    version_check_urls,
+    installed_desktop_version, installer_script_urls, load_update_cache, parse_version_payload,
+    parse_workspace_package_version, record_update_declined, record_update_failure,
+    record_update_scan, refresh_update_cache, should_auto_prompt, version_check_urls,
 };

@@ -96,6 +96,8 @@ pub struct AppPaths {
     pub l2tp_resolv_bak: PathBuf,
     pub l2tp_run_dir: PathBuf,
     pub update_check: PathBuf,
+    /// Shared cross-process exclusive UI controller lease and progress state.
+    pub ui_control: PathBuf,
 }
 
 impl AppPaths {
@@ -121,6 +123,7 @@ impl AppPaths {
             l2tp_route: cache_dir.join("l2tp_route.json"),
             l2tp_resolv_bak: cache_dir.join("resolv.conf.bak"),
             update_check: cache_dir.join("update_check.json"),
+            ui_control: cache_dir.join("ui-control.json"),
             l2tp_run_dir,
             cache_dir,
         }

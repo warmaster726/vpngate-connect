@@ -22,9 +22,9 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(12);
 const GITHUB_CHECK_TIMEOUT: Duration = Duration::from_secs(12);
 const CDN_CHECK_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// Public desktop label. Cargo crate version stays SemVer (`0.4.5`); a trailing
+/// Public desktop label. Cargo crate version stays SemVer (`0.4.6`); a trailing
 /// letter (`0.4.4a`) would be a revision *after* that patch, used for update prompts.
-pub const PRODUCT_VERSION: &str = "0.4.5";
+pub const PRODUCT_VERSION: &str = "0.4.6";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DesktopVersion {
@@ -165,8 +165,7 @@ pub fn cargo_toml_check_urls(slug: &str) -> Vec<String> {
 
 pub fn is_github_version_url(url: &str) -> bool {
     let u = url.to_ascii_lowercase();
-    u.contains("raw.githubusercontent.com/")
-        || (u.contains("github.com/") && u.contains("/raw/"))
+    u.contains("raw.githubusercontent.com/") || (u.contains("github.com/") && u.contains("/raw/"))
 }
 
 /// Anonymous HTTPS endpoints only (no GitHub API, no tokens, no 2FA).
@@ -180,13 +179,9 @@ pub fn version_check_urls(slug: &str) -> Vec<String> {
         urls.push(format!(
             "https://raw.githubusercontent.com/{slug}/refs/heads/main/{file}"
         ));
-        urls.push(format!(
-            "https://github.com/{slug}/raw/main/{file}"
-        ));
+        urls.push(format!("https://github.com/{slug}/raw/main/{file}"));
         urls.push(format!("https://cdn.jsdelivr.net/gh/{slug}@main/{file}"));
-        urls.push(format!(
-            "https://fastly.jsdelivr.net/gh/{slug}@main/{file}"
-        ));
+        urls.push(format!("https://fastly.jsdelivr.net/gh/{slug}@main/{file}"));
     }
     urls
 }
@@ -358,10 +353,7 @@ pub fn pick_highest_version(hits: &[(String, String)]) -> Option<RemoteDesktopVe
     best
 }
 
-async fn first_parsed_version(
-    urls: &[String],
-    timeout: Duration,
-) -> Option<RemoteDesktopVersion> {
+async fn first_parsed_version(urls: &[String], timeout: Duration) -> Option<RemoteDesktopVersion> {
     let mut set = tokio::task::JoinSet::new();
     for url in urls.iter().cloned() {
         set.spawn(async move {
@@ -572,10 +564,7 @@ mod tests {
         assert!(a < next);
         assert_eq!(a.to_string(), "0.3.4a");
         assert_eq!(plain.to_string(), "0.3.4");
-        assert_eq!(
-            parse_version_payload("0.3.4a\n").as_deref(),
-            Some("0.3.4a")
-        );
+        assert_eq!(parse_version_payload("0.3.4a\n").as_deref(), Some("0.3.4a"));
     }
 
     #[test]
@@ -615,10 +604,7 @@ edition = "2024"
             parse_workspace_package_version(toml).as_deref(),
             Some("0.2.18")
         );
-        assert_eq!(
-            parse_version_payload("0.2.20\n").as_deref(),
-            Some("0.2.20")
-        );
+        assert_eq!(parse_version_payload("0.2.20\n").as_deref(), Some("0.2.20"));
         assert!(parse_version_payload("<html>404</html>").is_none());
         assert!(parse_version_payload("<!DOCTYPE html>").is_none());
     }

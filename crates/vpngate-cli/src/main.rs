@@ -17,16 +17,15 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 
 use commands::{
-    ConnectArgs, UpgradeOffer, cmd_connect, cmd_countries, cmd_disconnect, cmd_doctor_with_update,
-    cmd_list, cmd_mirrors, cmd_probe, cmd_refresh, cmd_status, cmd_upgrade, cmd_watchdog,
-    interactive_menu,
-    set_no_elevate_requested, set_skip_update_check, set_uac_already_attempted,
+    ConnectArgs, UpgradeOffer, acquire_command_control, cmd_connect, cmd_countries, cmd_disconnect,
+    cmd_doctor_with_update, cmd_list, cmd_mirrors, cmd_probe, cmd_refresh, cmd_status, cmd_upgrade,
+    cmd_watchdog, interactive_menu, set_no_elevate_requested, set_skip_update_check,
+    set_uac_already_attempted,
 };
 use term_ui::{err, init_console, print_line, prompt_input, set_dynamic_resize, set_screen_clear};
 use vpngate_core::{
-    AppPaths, PRODUCT_VERSION, ProtocolFilter, SortBy, assert_supported_native_host,
-    tunnel_aid_dns_cli,
-    run_ikev1_daemon, run_monitor_daemon,
+    AppPaths, PRODUCT_VERSION, ProtocolFilter, SortBy, UiControlError,
+    assert_supported_native_host, run_ikev1_daemon, run_monitor_daemon, tunnel_aid_dns_cli,
 };
 
 fn build_help_text() -> String {
@@ -133,7 +132,13 @@ fn delegate_to_window_launcher(paths: &AppPaths, raw_args: &[String]) -> i32 {
         let mut cmd = std::process::Command::new("cmd");
         cmd.args(["/c", "start", "VPN Gate"])
             .arg(ps_bin)
-            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps_line])
+            .args([
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                &ps_line,
+            ])
             .creation_flags(0x0800_0000);
         i32::from(cmd.spawn().is_err())
     }
@@ -169,16 +174,20 @@ fn delegate_to_window_launcher(paths: &AppPaths, raw_args: &[String]) -> i32 {
 
 async fn dispatch() -> io::Result<i32> {
     let raw_all: Vec<String> = env::args().skip(1).collect();
-    let is_daemon = matches!(raw_all.first().map(String::as_str), Some("_monitor" | "_ikev1"));
+    let is_daemon = matches!(
+        raw_all.first().map(String::as_str),
+        Some("_monitor" | "_ikev1")
+    );
     init_console(!is_daemon);
     if let Err(msg) = assert_supported_native_host() {
         err(&msg);
         return Ok(1);
     }
 
-    // Pre-scan global `--cache-dir <DIR>`, `--hold`, and Windows UAC flags before dispatching
+    // Pre-scan global cache/window/UAC flags and the private shared-control token.
     let mut cache_dir_override: Option<PathBuf> = None;
     let mut hold_on_exit = false;
+    let mut control_token = env::var("VPNGATE_UI_CONTROL_TOKEN").ok();
     let mut raw_args: Vec<String> = Vec::with_capacity(raw_all.len());
     let mut idx = 0usize;
     while idx < raw_all.len() {
@@ -197,6 +206,14 @@ async fn dispatch() -> io::Result<i32> {
             "--uac-elevated" => {
                 set_uac_already_attempted(true);
             }
+            "--ui-control-token" => {
+                idx += 1;
+                if let Some(token) = raw_all.get(idx)
+                    && !token.trim().is_empty()
+                {
+                    control_token = Some(token.clone());
+                }
+            }
             "--no-elevate" | "--read-only" => {
                 set_no_elevate_requested(true);
             }
@@ -212,6 +229,7 @@ async fn dispatch() -> io::Result<i32> {
         Some(dir) => AppPaths::with_base_dir(dir),
         None => AppPaths::resolve(),
     };
+    term_ui::set_ui_control_paths(paths.clone());
 
     // Internal background daemons (exact match with Python v5.3 architecture)
     if raw_args.first().map(String::as_str) == Some("_monitor") {
@@ -224,14 +242,18 @@ async fn dispatch() -> io::Result<i32> {
         return Ok(delegate_to_window_launcher(&paths, &raw_args));
     }
 
-    let rc = dispatch_commands(&paths, &raw_args).await?;
+    let rc = dispatch_commands(&paths, &raw_args, control_token.as_deref()).await?;
     if hold_on_exit && term_ui::is_stdout_tty() {
         let _ = prompt_input("\nPress Enter to close this window...");
     }
     Ok(rc)
 }
 
-async fn dispatch_commands(paths: &AppPaths, raw_args: &[String]) -> io::Result<i32> {
+async fn dispatch_commands(
+    paths: &AppPaths,
+    raw_args: &[String],
+    control_token: Option<&str>,
+) -> io::Result<i32> {
     let help_text = build_help_text();
     if raw_args.is_empty() {
         return interactive_menu(paths, &help_text).await;
@@ -371,6 +393,56 @@ async fn dispatch_commands(paths: &AppPaths, raw_args: &[String]) -> io::Result<
     if flag_interactive || matches!(subcmd.as_str(), "menu" | "interactive") {
         return interactive_menu(paths, &help_text).await;
     }
+
+    let operation =
+        if flag_disconnect || matches!(subcmd.as_str(), "disconnect" | "down" | "stop" | "d") {
+            Some("Disconnect")
+        } else if flag_doctor || matches!(subcmd.as_str(), "doctor" | "check" | "diag") {
+            Some("Diagnostics")
+        } else if flag_status || matches!(subcmd.as_str(), "status" | "st") {
+            Some("Connection status")
+        } else if flag_mirrors || matches!(subcmd.as_str(), "mirrors" | "mirror" | "sites") {
+            Some("Discover mirrors")
+        } else if matches!(subcmd.as_str(), "watchdog" | "wd") {
+            Some("Manage watchdog")
+        } else if matches!(subcmd.as_str(), "probe") {
+            Some("Probe relay")
+        } else if matches!(
+            subcmd.as_str(),
+            "update" | "upgrade" | "self-update" | "selfupdate"
+        ) {
+            Some("Update desktop")
+        } else if matches!(subcmd.as_str(), "refresh") {
+            Some("Refresh relay pool")
+        } else if flag_countries || matches!(subcmd.as_str(), "countries" | "regions" | "c") {
+            Some("List countries")
+        } else if flag_list || matches!(subcmd.as_str(), "list" | "ls" | "servers") {
+            Some("List relays")
+        } else if matches!(subcmd.as_str(), "connect" | "up" | "engage") || country.is_some() {
+            Some("Connect")
+        } else if force_refresh {
+            Some("Refresh relay pool")
+        } else {
+            None
+        };
+    let Some(operation) = operation else {
+        return interactive_menu(paths, &help_text).await;
+    };
+    let _ui_control_access = match acquire_command_control(paths, operation, control_token) {
+        Ok(access) => access,
+        Err(UiControlError::Busy(control)) => {
+            err(&format!(
+                "Observe-only: {} is controlling {} ({}). Wait until that operation finishes, then retry.",
+                control.owner, control.operation, control.phase
+            ));
+            return Ok(75);
+        }
+        Err(error) => {
+            err(&format!("Cannot enter shared UI control: {error}"));
+            return Ok(2);
+        }
+    };
+
     if flag_disconnect || matches!(subcmd.as_str(), "disconnect" | "down" | "stop" | "d") {
         return cmd_disconnect(paths).await;
     }

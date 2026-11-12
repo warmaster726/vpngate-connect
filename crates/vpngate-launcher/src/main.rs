@@ -32,6 +32,7 @@ mod linux {
         Orientation, STYLE_PROVIDER_PRIORITY_APPLICATION,
     };
     use pango::FontDescription;
+    use vpngate_core::{AppPaths, ui_control_status};
     use vte4::prelude::*;
     use vte4::{PtyFlags, Terminal};
 
@@ -63,6 +64,11 @@ mod linux {
             background-color: rgba(210, 153, 34, 0.20); color: #e3b341;
             border: 1px solid rgba(210, 153, 34, 0.50); border-radius: 999px;
             padding: 2px 10px; font-size: 9pt; font-weight: 700;
+        }
+        label.pill-control {
+            background-color: rgba(210, 153, 34, 0.16); color: #e3b341;
+            border: 1px solid rgba(210, 153, 34, 0.44); border-radius: 999px;
+            padding: 2px 8px; font-size: 8pt; font-weight: 700;
         }
         button.ip-chip {
             background-image: none; background-color: #1f2937; color: #79c0ff;
@@ -156,10 +162,14 @@ mod linux {
         let header = HeaderBar::new();
         let status = Label::new(Some("○ DISCONNECTED"));
         status.add_css_class("pill-off");
+        let controller_status = Label::new(None);
+        controller_status.add_css_class("pill-control");
+        controller_status.set_visible(false);
         let ip_chip = Button::with_label("");
         ip_chip.add_css_class("ip-chip");
         ip_chip.set_visible(false);
         header.pack_start(&status);
+        header.pack_start(&controller_status);
         header.pack_end(&ip_chip);
         win.set_titlebar(Some(&header));
 
@@ -184,8 +194,7 @@ mod linux {
         let run_base = env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
         let sock_dir = tempfile_dir(&run_base)?;
         let sock_path = sock_dir.join("resize.sock");
-        let sock = UnixDatagram::bind(&sock_path)
-            .map_err(|e| format!("resize socket: {e}"))?;
+        let sock = UnixDatagram::bind(&sock_path).map_err(|e| format!("resize socket: {e}"))?;
         let _ = fs::set_permissions(&sock_path, fs::Permissions::from_mode(0o600));
         sock.set_nonblocking(true)
             .map_err(|e| format!("resize socket: {e}"))?;
@@ -205,6 +214,7 @@ mod linux {
             format!("TERM=xterm-256color"),
             format!("COLORTERM=truecolor"),
             format!("VPNGATE_RESIZE_SOCK={}", sock_path.display()),
+            "VPNGATE_UI_NAME=GTK terminal".to_string(),
         ];
         let envv_refs: Vec<&str> = envv.iter().map(String::as_str).collect();
         let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
@@ -219,19 +229,20 @@ mod linux {
             -1,
             gio::Cancellable::NONE,
             |result| {
-                    if let Err(e) = result {
-                        eprintln!("vpngate-launcher: spawn failed: {e}");
-                    }
-                },
+                if let Err(e) = result {
+                    eprintln!("vpngate-launcher: spawn failed: {e}");
+                }
+            },
         );
 
         let status_l = status.clone();
+        let controller_l = controller_status.clone();
         let ip_l = ip_chip.clone();
-        glib::timeout_add_local(Duration::from_millis(1500), move || {
-            refresh_header(&status_l, &ip_l);
+        glib::timeout_add_local(Duration::from_millis(1000), move || {
+            refresh_header(&status_l, &controller_l, &ip_l);
             ControlFlow::Continue
         });
-        refresh_header(&status, &ip_chip);
+        refresh_header(&status, &controller_status, &ip_chip);
 
         let ip_copy = ip_chip.clone();
         ip_chip.connect_clicked(move |_| {
@@ -292,7 +303,7 @@ mod linux {
         win.set_default_size(px_w, px_h);
     }
 
-    fn refresh_header(status: &Label, ip_chip: &Button) {
+    fn refresh_header(status: &Label, controller: &Label, ip_chip: &Button) {
         let snap = read_fast_tunnel_snapshot();
         status.set_text(&snap.badge);
         status.remove_css_class("pill-off");
@@ -303,6 +314,12 @@ mod linux {
             "reconnecting" => "pill-warn",
             _ => "pill-off",
         });
+        if let Some(badge) = snap.control {
+            controller.set_text(&badge);
+            controller.set_visible(true);
+        } else {
+            controller.set_visible(false);
+        }
         if snap.ip.is_empty() {
             ip_chip.set_visible(false);
         } else {
@@ -315,9 +332,18 @@ mod linux {
         mode: String,
         badge: String,
         ip: String,
+        control: Option<String>,
     }
 
     fn read_fast_tunnel_snapshot() -> Snap {
+        let control = ui_control_status(&AppPaths::resolve()).map(|state| {
+            let mode = if state.owner == "GTK terminal" {
+                "BUSY"
+            } else {
+                "OBSERVE ONLY"
+            };
+            format!("{mode} · {}: {}", state.owner, state.operation)
+        });
         let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
         let state = Path::new(&home).join(".cache/vpngate/active_state.json");
         let vpn_devs = list_vpn_devs();
@@ -333,6 +359,7 @@ mod linux {
                     mode: "reconnecting".into(),
                     badge: format!("↻ RECONNECTING · {region}"),
                     ip: String::new(),
+                    control,
                 };
             }
             let dev = st.get("device").and_then(|v| v.as_str()).unwrap_or("");
@@ -352,6 +379,7 @@ mod linux {
                     mode: "connected".into(),
                     badge: format!("● CONNECTED · {cc} ({host}) · {proto}"),
                     ip: egress,
+                    control,
                 };
             }
         }
@@ -360,12 +388,14 @@ mod linux {
                 mode: "connected".into(),
                 badge: format!("● TUNNEL UP ({dev})"),
                 ip: String::new(),
+                control,
             };
         }
         Snap {
             mode: "disconnected".into(),
             badge: "○ DISCONNECTED".into(),
             ip: String::new(),
+            control,
         }
     }
 

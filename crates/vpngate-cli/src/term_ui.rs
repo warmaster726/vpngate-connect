@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 use std::env;
 use std::io::{self, IsTerminal, Write};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use vpngate_core::ProgressEvent;
+use vpngate_core::{AppPaths, ProgressEvent, report_ui_control_phase};
 
 pub const RESET: &str = "\x1b[0m";
 pub const BOLD: &str = "\x1b[1m";
@@ -20,6 +21,11 @@ static DYNAMIC_RESIZE_ENABLED: AtomicBool = AtomicBool::new(true);
 static SCREEN_CLEAR_ENABLED: AtomicBool = AtomicBool::new(true);
 static LAST_TRANSIENT_VIS_LEN: AtomicUsize = AtomicUsize::new(0);
 static WIN_VT_ENABLED: AtomicBool = AtomicBool::new(!cfg!(windows));
+static UI_CONTROL_PATHS: OnceLock<AppPaths> = OnceLock::new();
+
+pub fn set_ui_control_paths(paths: AppPaths) {
+    let _ = UI_CONTROL_PATHS.set(paths);
+}
 
 #[cfg(windows)]
 mod win_console {
@@ -234,15 +240,15 @@ mod win_console {
                     .saturating_mul(u32::from(csbi.dw_size.y.max(0) as u16));
                 let origin = Coord { x: 0, y: 0 };
                 let mut written: u32 = 0;
-                let _ = FillConsoleOutputCharacterW(
+                let _ =
+                    FillConsoleOutputCharacterW(h_con, b' ' as u16, cells, origin, &mut written);
+                let _ = FillConsoleOutputAttribute(
                     h_con,
-                    b' ' as u16,
+                    csbi.w_attributes,
                     cells,
                     origin,
                     &mut written,
                 );
-                let _ =
-                    FillConsoleOutputAttribute(h_con, csbi.w_attributes, cells, origin, &mut written);
                 let _ = SetConsoleCursorPosition(h_con, origin);
             }
             let _ = CloseHandle(h_con);
@@ -426,8 +432,36 @@ pub fn format_thousands_u64(n: u64) -> String {
     out.chars().rev().collect()
 }
 
+fn report_ui_control_progress(ev: &ProgressEvent) {
+    let Some(paths) = UI_CONTROL_PATHS.get() else {
+        return;
+    };
+    let phase = match ev {
+        ProgressEvent::Info(message) => Some(message.clone()),
+        ProgressEvent::Ok(message) => Some(message.clone()),
+        ProgressEvent::Warn(message) => Some(message.clone()),
+        ProgressEvent::AttemptBanner {
+            index,
+            total,
+            hostname,
+            ..
+        } => Some(format!("Testing relay {index}/{total}: {hostname}")),
+        ProgressEvent::Transient {
+            stage,
+            elapsed_secs,
+            tick,
+            ..
+        } if tick.is_multiple_of(5) => Some(format!("{stage} · {elapsed_secs}s")),
+        ProgressEvent::Transient { .. } | ProgressEvent::ClearTransient => None,
+    };
+    if let Some(phase) = phase {
+        report_ui_control_phase(paths, phase.chars().take(180).collect::<String>());
+    }
+}
+
 /// Renders live `ProgressEvent` items (`PY` branch style in-place counters + step logs).
 pub fn render_progress_event(ev: ProgressEvent) {
+    report_ui_control_progress(&ev);
     match ev {
         ProgressEvent::ClearTransient => clear_transient_line(),
         ProgressEvent::Info(m) => info(&m),
@@ -477,7 +511,9 @@ pub fn render_progress_event(ev: ProgressEvent) {
             let (cols, _) = get_live_terminal_size(100, 30);
             // Leave at least a 2-column EOL margin on Windows so `ENABLE_WRAP_AT_EOL_OUTPUT`
             // never wraps the in-place `\r` spinner onto a second row.
-            let max_vis = cols.saturating_sub(if cfg!(windows) { 2 } else { 1 }).max(20);
+            let max_vis = cols
+                .saturating_sub(if cfg!(windows) { 2 } else { 1 })
+                .max(20);
 
             let plain_full =
                 format!("[*] [{spin}] {stage_clean} [{cnt_str}] - Press Ctrl+C to interrupt");
@@ -514,7 +550,9 @@ pub fn render_progress_event(ev: ProgressEvent) {
                 strip_ansi(&raw_colored)
             };
             let prev = LAST_TRANSIENT_VIS_LEN.swap(vis_len, Ordering::Relaxed);
-            let pad_len = prev.saturating_sub(vis_len).min(max_vis.saturating_sub(vis_len));
+            let pad_len = prev
+                .saturating_sub(vis_len)
+                .min(max_vis.saturating_sub(vis_len));
             let pad = " ".repeat(pad_len);
             let mut out = io::stdout().lock();
             let _ = write!(out, "\r{rendered}{pad}");
@@ -799,7 +837,10 @@ pub fn render_dynamic_box(
     for l in cleaned_lines.iter().flatten() {
         natural_inner = natural_inner.max(visible_len(l));
     }
-    request_window_resize(natural_inner + 6, cleaned_lines.len() + 2 + extra_rows_below);
+    request_window_resize(
+        natural_inner + 6,
+        cleaned_lines.len() + 2 + extra_rows_below,
+    );
 
     let (term_cols, _) = get_live_terminal_size(natural_inner + 6, 30);
     let mut inner_w = natural_inner;
@@ -827,7 +868,10 @@ pub fn render_dynamic_box(
     for item in &cleaned_lines {
         let row_line = match item {
             None => format!("{BOLD}{ml}{horiz}{mr}{RESET}"),
-            Some(txt) => format!("{BOLD}{vt}{RESET} {} {BOLD}{vt}{RESET}", fit_ansi_line(txt, inner_w)),
+            Some(txt) => format!(
+                "{BOLD}{vt}{RESET} {} {BOLD}{vt}{RESET}",
+                fit_ansi_line(txt, inner_w)
+            ),
         };
         buf.push_str(&if use_ansi {
             row_line
@@ -965,11 +1009,7 @@ pub fn render_dynamic_table(
     buf.push_str(&sep_rendered);
     buf.push('\n');
     for fl in &clean_footers {
-        buf.push_str(&if use_ansi {
-            fl.clone()
-        } else {
-            strip_ansi(fl)
-        });
+        buf.push_str(&if use_ansi { fl.clone() } else { strip_ansi(fl) });
         buf.push('\n');
     }
     buf.push('\n');

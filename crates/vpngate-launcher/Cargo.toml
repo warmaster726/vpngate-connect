@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 serde_json.workspace = true
+vpngate-core = { path = "../vpngate-core" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk4 = { version = "0.9", default-features = true }

@@ -26,6 +26,7 @@ use crate::protocol::{
     OpenVpnCompat, ProtocolFilter, SortBy, TargetPlatform, VpnProtocol, WindowsOvpnDriver,
 };
 use crate::server::{VpnServer, filter_by_country, filter_by_protocol, sort_servers};
+use crate::ui_control::wait_for_ui_control_cancel;
 
 pub const NM_PROFILE_PREFIX: &str = "vpngate-";
 pub const WIN_VPN_PROFILE_NAME: &str = "VPNGate-L2TP";
@@ -977,9 +978,7 @@ pub fn probe_linux_l2tp_kernel_support() -> std::result::Result<(), String> {
 fn collect_linux_connection_dns(dev: &str) -> Vec<String> {
     let mut out = Vec::new();
     if which_bin("resolvectl").is_some()
-        && let Ok(o) = Command::new("resolvectl")
-            .args(["dns", dev])
-            .output()
+        && let Ok(o) = Command::new("resolvectl").args(["dns", dev]).output()
     {
         out.extend(parse_resolvectl_dns_output(&String::from_utf8_lossy(
             &o.stdout,
@@ -1102,7 +1101,11 @@ fn stop_ikev1_daemon_and_xfrm(paths: &AppPaths) {
 }
 
 /// Deletes leftover VPN Gate L2TP / OpenVPN profile files from the app cache.
-fn purge_cached_ovpn_files(paths: &AppPaths, quiet: bool, on_progress: &mut impl FnMut(ProgressEvent)) {
+fn purge_cached_ovpn_files(
+    paths: &AppPaths,
+    quiet: bool,
+    on_progress: &mut impl FnMut(ProgressEvent),
+) {
     let Ok(rd) = fs::read_dir(&paths.cache_dir) else {
         return;
     };
@@ -2204,6 +2207,7 @@ pub async fn engage_candidates_with_progress(
     let outcome = tokio::select! {
         biased;
         _ = tokio::signal::ctrl_c() => None,
+        _ = wait_for_ui_control_cancel(paths) => None,
         rc = engage_candidates_body(paths, candidates, cfg, &mut on_progress) => Some(rc),
     };
     match outcome {
@@ -2215,7 +2219,8 @@ pub async fn engage_candidates_with_progress(
             ));
             cleanup_existing_vpn_with_progress(paths, true, true, false, &mut on_progress);
             on_progress(ProgressEvent::Ok(
-                "Rolled back routes, DNS, firewall, and VPN Gate L2TP/OpenVPN profiles.".to_string(),
+                "Rolled back routes, DNS, firewall, and VPN Gate L2TP/OpenVPN profiles."
+                    .to_string(),
             ));
             INTERRUPTED_EXIT
         }

@@ -2,9 +2,9 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 #[cfg(windows)]
 use std::path::Path;
 use std::path::PathBuf;
@@ -14,21 +14,22 @@ use std::time::{Duration, Instant};
 
 use vpngate_core::{
     ActiveSessionState, AppPaths, ConnectSessionConfig, CountrySummary, DiscoveryClient,
-    DiscoveryOptions, INTERRUPTED_EXIT, Ikev1StateInfo, MONITOR_INTERVAL_SECONDS, NM_PROFILE_PREFIX,
-    OfficialMirrorSite, ProgressEvent, ProtocolFilter, ServerCacheFile, SortBy, VpnServer,
-    parse_dns_list, tunnel_aid_dns_cli,
-    cleanup_existing_vpn_with_progress, detect_host_os_label, engage_candidates_with_progress,
+    DiscoveryOptions, INTERRUPTED_EXIT, Ikev1StateInfo, MONITOR_INTERVAL_SECONDS,
+    NM_PROFILE_PREFIX, OfficialMirrorSite, PRODUCT_VERSION, ProgressEvent, ProtocolFilter,
+    ServerCacheFile, SortBy, UiControlAccess, UiControlError, VpnServer, acquire_ui_control,
+    cached_newer_than_installed, cleanup_existing_vpn_with_progress, default_repo_slug,
+    detect_host_os_label, engage_candidates_with_progress, fetch_public_url_text,
     filter_by_country, filter_by_protocol, find_openvpn_bin, get_default_gateway,
     get_ppp_interfaces, get_public_ip_trace, get_running_monitor_pid, get_running_openvpn_pid,
-    get_servers_cached_with_progress, get_tun_interfaces, is_root_or_admin, load_cached_mirrors,
-    load_cooldowns, load_watchdog_pref, normalize_mirror_base_url, now_unix_secs, probe_tcp,
-    prune_stale_state_if_dead, query_windows_natt_rule, read_json_opt, run_ikev1_crypto_self_test,
-    save_cached_mirrors, save_cooldowns, save_watchdog_pref, sort_servers,
-    cached_newer_than_installed, default_repo_slug, fetch_public_url_text, installer_script_urls,
-    installed_desktop_version, load_update_cache, record_update_declined, refresh_update_cache,
-    PRODUCT_VERSION,
-    resolve_user_home, should_auto_prompt, spawn_auto_reconnect_monitor,
-    stop_monitor_daemon, summarize_countries, verify_l2tp_psk_vpn, which_bin,
+    get_servers_cached_with_progress, get_tun_interfaces, installed_desktop_version,
+    installer_script_urls, is_root_or_admin, join_ui_control, load_cached_mirrors, load_cooldowns,
+    load_update_cache, load_watchdog_pref, normalize_mirror_base_url, now_unix_secs,
+    parse_dns_list, probe_tcp, prune_stale_state_if_dead, query_windows_natt_rule, read_json_opt,
+    record_update_declined, refresh_update_cache, resolve_user_home, run_ikev1_crypto_self_test,
+    save_cached_mirrors, save_cooldowns, save_watchdog_pref, should_auto_prompt, sort_servers,
+    spawn_auto_reconnect_monitor, stop_monitor_daemon, summarize_countries, tunnel_aid_dns_cli,
+    ui_control_status, ui_control_token_for_process, verify_l2tp_psk_vpn,
+    wait_for_ui_control_cancel, which_bin,
 };
 
 use crate::term_ui::{
@@ -210,6 +211,24 @@ pub mod win_uac {
     }
 }
 
+pub fn ui_owner_label() -> String {
+    env::var("VPNGATE_UI_NAME")
+        .ok()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "Terminal CLI".to_string())
+}
+
+pub fn acquire_command_control(
+    paths: &AppPaths,
+    operation: &str,
+    delegated_token: Option<&str>,
+) -> Result<UiControlAccess, UiControlError> {
+    if let Some(token) = delegated_token.filter(|token| !token.is_empty()) {
+        return join_ui_control(paths, token).map(UiControlAccess::Executor);
+    }
+    acquire_ui_control(paths, &ui_owner_label(), operation).map(UiControlAccess::Owner)
+}
+
 fn parse_custom_mirrors(urls: &[String]) -> Vec<OfficialMirrorSite> {
     let mut out = Vec::new();
     for raw in urls {
@@ -267,11 +286,19 @@ pub fn elevate_self(paths: &AppPaths, sub_args: &[String]) -> i32 {
     };
     #[cfg(unix)]
     {
-        let _ = paths;
+        let mut elevated_args = vec![
+            "--cache-dir".to_string(),
+            paths.cache_dir.display().to_string(),
+        ];
+        if let Some(token) = ui_control_token_for_process(paths) {
+            elevated_args.push("--ui-control-token".to_string());
+            elevated_args.push(token);
+        }
+        elevated_args.extend_from_slice(sub_args);
         let status = Command::new("sudo")
             .arg("-E")
             .arg(self_exe)
-            .args(sub_args)
+            .args(&elevated_args)
             .status();
         match status {
             Ok(s) => s.code().unwrap_or(1),
@@ -284,10 +311,8 @@ pub fn elevate_self(paths: &AppPaths, sub_args: &[String]) -> i32 {
     #[cfg(windows)]
     {
         if uac_already_attempted() {
-            err(
-                "Administrator token was not granted after UAC elevation. \
-                 Right-click PowerShell or Windows Terminal -> 'Run as Administrator' and retry.",
-            );
+            err("Administrator token was not granted after UAC elevation. \
+                 Right-click PowerShell or Windows Terminal -> 'Run as Administrator' and retry.");
             return 1;
         }
         let mut full_args = vec![
@@ -295,6 +320,10 @@ pub fn elevate_self(paths: &AppPaths, sub_args: &[String]) -> i32 {
             "--cache-dir".to_string(),
             paths.cache_dir.display().to_string(),
         ];
+        if let Some(token) = ui_control_token_for_process(paths) {
+            full_args.push("--ui-control-token".to_string());
+            full_args.push(token);
+        }
         full_args.extend_from_slice(sub_args);
         match win_uac::run_elevated(&self_exe, &full_args, true) {
             Ok(code) => code,
@@ -715,6 +744,10 @@ pub async fn cmd_connect(paths: &AppPaths, args: &ConnectArgs) -> io::Result<i32
             warn("Interrupted — returning without connecting.");
             return Ok(INTERRUPTED_EXIT);
         }
+        _ = wait_for_ui_control_cancel(paths) => {
+            warn("Connect cancelled — returning without changing the VPN tunnel.");
+            return Ok(INTERRUPTED_EXIT);
+        }
         res = get_servers_cached_with_progress(
             paths,
             args.force_refresh,
@@ -797,7 +830,9 @@ pub async fn cmd_disconnect(paths: &AppPaths) -> io::Result<i32> {
         }
         let rc = elevate_self(paths, &sub);
         if cfg!(windows) && rc == 0 {
-            ok("Disconnected from VPN Gate, removed L2TP/OpenVPN profiles, and restored routes, DNS, and firewall.");
+            ok(
+                "Disconnected from VPN Gate, removed L2TP/OpenVPN profiles, and restored routes, DNS, and firewall.",
+            );
             if let Some(trace) = trace_public_ip_with_spinner(
                 "Verifying restored host public egress IP",
                 Duration::from_secs(5),
@@ -813,7 +848,9 @@ pub async fn cmd_disconnect(paths: &AppPaths) -> io::Result<i32> {
     clear_screen_if_tty();
     info("Tearing down active VPN tunnel and removing VPN Gate L2TP/OpenVPN profile residue ...");
     cleanup_existing_vpn_with_progress(paths, true, true, false, render_progress_event);
-    ok("Disconnected from VPN Gate, removed L2TP/OpenVPN profiles, and restored routes, DNS, and firewall.");
+    ok(
+        "Disconnected from VPN Gate, removed L2TP/OpenVPN profiles, and restored routes, DNS, and firewall.",
+    );
     if let Some(trace) = trace_public_ip_with_spinner(
         "Verifying restored host public egress IP",
         Duration::from_secs(5),
@@ -1604,7 +1641,10 @@ fn interpret_country_selection(
     let iso_or_idx = |t: &str| {
         t.parse::<usize>().is_ok()
             || (t.len() == 2 && t.chars().all(|c| c.is_ascii_alphabetic()))
-            || matches!(t.to_ascii_lowercase().as_str(), "a" | "all" | "*" | "worldwide")
+            || matches!(
+                t.to_ascii_lowercase().as_str(),
+                "a" | "all" | "*" | "worldwide"
+            )
     };
     let chunks: Vec<&str> = if has_list_sep {
         trimmed
@@ -1746,7 +1786,10 @@ fn cargo_install_shadow_binary() -> PathBuf {
             .join("bin")
             .join("vpngate.exe")
     } else {
-        resolve_user_home().join(".cargo").join("bin").join("vpngate")
+        resolve_user_home()
+            .join(".cargo")
+            .join("bin")
+            .join("vpngate")
     }
 }
 
@@ -1835,7 +1878,9 @@ async fn run_desktop_installer(paths: &AppPaths) -> io::Result<i32> {
     #[cfg(windows)]
     {
         remove_shadow_desktop_binaries();
-        info("Launching the Windows installer in a new window, then closing this process so vpngate.exe is not locked ...");
+        info(
+            "Launching the Windows installer in a new window, then closing this process so vpngate.exe is not locked ...",
+        );
         spawn_windows_upgrade_installer(&script)?;
         ok("The installer will replace this copy and remove the previous vpngate.exe.");
         ok("After it finishes, start VPN Gate again from the Start Menu or `vpngate`.");
@@ -1844,7 +1889,9 @@ async fn run_desktop_installer(paths: &AppPaths) -> io::Result<i32> {
 
     #[cfg(not(windows))]
     {
-        info("Running the installer (it deletes /usr/local/bin/vpngate, then installs the new build) ...");
+        info(
+            "Running the installer (it deletes /usr/local/bin/vpngate, then installs the new build) ...",
+        );
         let status = Command::new("sh")
             .arg(&script)
             .stdin(Stdio::inherit())
@@ -1853,7 +1900,9 @@ async fn run_desktop_installer(paths: &AppPaths) -> io::Result<i32> {
             .status()?;
         let rc = status.code().unwrap_or(1);
         if rc != 0 {
-            err("Installer did not finish successfully. The previous desktop binary was left in place.");
+            err(
+                "Installer did not finish successfully. The previous desktop binary was left in place.",
+            );
             return Ok(rc);
         }
         remove_shadow_desktop_binaries();
@@ -1885,7 +1934,9 @@ fn desktop_update_status_line(paths: &AppPaths) -> String {
     let local = installed_desktop_version();
     match load_update_cache(paths) {
         Some(cache) if !cache.last_error.is_empty() && cache.remote_version.is_empty() => {
-            format!("Update   : {YELLOW}CHECK FAILED{RESET} — run `{BOLD}vpngate update{RESET}` (anonymous HTTPS, no GitHub login)")
+            format!(
+                "Update   : {YELLOW}CHECK FAILED{RESET} — run `{BOLD}vpngate update{RESET}` (anonymous HTTPS, no GitHub login)"
+            )
         }
         Some(cache) => {
             if let Some(remote) = vpngate_core::DesktopVersion::parse(&cache.remote_version) {
@@ -1895,7 +1946,10 @@ fn desktop_update_status_line(paths: &AppPaths) -> String {
                         cache.remote_version
                     )
                 } else if remote < local {
-                    format!("Update   : {CYAN}{local}{RESET} — newer than public main ({})", cache.remote_version)
+                    format!(
+                        "Update   : {CYAN}{local}{RESET} — newer than public main ({})",
+                        cache.remote_version
+                    )
                 } else {
                     format!("Update   : {GREEN}up to date{RESET} — public main is {local}")
                 }
@@ -2054,11 +2108,24 @@ pub async fn interactive_menu(paths: &AppPaths, help_text: &str) -> io::Result<i
         tokio::time::sleep(Duration::from_millis(900)).await;
     }
 
-    if is_stdout_tty() && !skip_update_check() {
-        live_check_desktop_update(paths).await;
-    }
+    let mut startup_update_checked = false;
 
     loop {
+        if is_stdout_tty() && !skip_update_check() && !startup_update_checked {
+            match acquire_ui_control(paths, &ui_owner_label(), "Check desktop update") {
+                Ok(_lease) => {
+                    live_check_desktop_update(paths).await;
+                    startup_update_checked = true;
+                }
+                Err(UiControlError::Busy(_)) => {}
+                Err(error) => {
+                    warn(&format!(
+                        "Could not check desktop updates under the shared control lock: {error}"
+                    ));
+                    startup_update_checked = true;
+                }
+            }
+        }
         clear_screen_if_tty();
         prune_stale_state_if_dead(paths);
 
@@ -2103,12 +2170,22 @@ pub async fn interactive_menu(paths: &AppPaths, help_text: &str) -> io::Result<i
             }
         };
 
+        let control_line = ui_control_status(paths)
+            .filter(|control| control.owner_pid != std::process::id())
+            .map(|control| {
+                format!(
+                    "Controller: {YELLOW}OBSERVE ONLY{RESET} — {} is running {} ({})",
+                    control.owner, control.operation, control.phase
+                )
+            });
+
         let menu_lines = vec![
             Some(format!(
                 "{CYAN}{BOLD}VPN Gate Console v{}{RESET}  ·  {os_label} (Auto: L2TP/IPsec -> OVPN UDP -> OVPN TCP)",
                 PRODUCT_VERSION
             )),
             Some(status_line),
+            control_line,
             Some(local_pool_summary_line(paths)),
             Some(desktop_update_status_line(paths)),
             None,
@@ -2153,12 +2230,22 @@ pub async fn interactive_menu(paths: &AppPaths, help_text: &str) -> io::Result<i
 
         if is_stdout_tty()
             && !skip_update_check()
-            && !UPDATE_PROMPT_DONE.swap(true, Ordering::Relaxed)
+            && startup_update_checked
+            && !UPDATE_PROMPT_DONE.load(Ordering::Relaxed)
         {
-            match maybe_prompt_if_newer(paths, true).await? {
-                Some(UpgradeOffer::ExitAfterInstall) => return Ok(0),
-                Some(UpgradeOffer::Continue | UpgradeOffer::Failed(_)) => continue,
-                None => {}
+            match acquire_ui_control(paths, &ui_owner_label(), "Review desktop update") {
+                Ok(_lease) => {
+                    UPDATE_PROMPT_DONE.store(true, Ordering::Relaxed);
+                    match maybe_prompt_if_newer(paths, true).await? {
+                        Some(UpgradeOffer::ExitAfterInstall) => return Ok(0),
+                        Some(UpgradeOffer::Continue | UpgradeOffer::Failed(_)) => continue,
+                        None => {}
+                    }
+                }
+                Err(UiControlError::Busy(_)) => {}
+                Err(error) => warn(&format!(
+                    "Could not review desktop updates under the shared control lock: {error}"
+                )),
             }
         }
 
@@ -2169,6 +2256,39 @@ pub async fn interactive_menu(paths: &AppPaths, help_text: &str) -> io::Result<i
                 continue;
             }
             return Ok(0);
+        };
+
+        let operation = match choice.to_ascii_lowercase().as_str() {
+            "1" => Some("Connect by region"),
+            "2" => Some("Browse and connect to a relay"),
+            "3" => Some("List countries"),
+            "4" => Some("Connection status"),
+            "5" => Some("Change watchdog"),
+            "6" => Some("Disconnect"),
+            "7" => Some("Refresh relay cache"),
+            "8" => Some("Discover mirrors"),
+            "9" => Some("Run diagnostics"),
+            _ => None,
+        };
+        let _ui_control_lease = if let Some(operation) = operation {
+            match acquire_ui_control(paths, &ui_owner_label(), operation) {
+                Ok(lease) => Some(lease),
+                Err(UiControlError::Busy(control)) => {
+                    warn(&format!(
+                        "Observe-only: {} is running {} ({}). Wait for it to finish before using this console.",
+                        control.owner, control.operation, control.phase
+                    ));
+                    let _ = prompt_input("\nPress Enter to return to the Dashboard...");
+                    continue;
+                }
+                Err(error) => {
+                    err(&format!("Could not acquire shared UI control: {error}"));
+                    let _ = prompt_input("\nPress Enter to return to the Dashboard...");
+                    continue;
+                }
+            }
+        } else {
+            None
         };
 
         match choice.to_ascii_lowercase().as_str() {

@@ -1,23 +1,39 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![forbid(unsafe_code)]
 
+use std::collections::VecDeque;
+use std::io::{BufRead, BufReader, Read};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
 use std::time::{Duration, Instant};
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
 use eframe::egui::{self, Color32, RichText};
 use vpngate_core::cache::ServerCacheFile;
 use vpngate_core::{
-    ActiveSessionState, AppPaths, PRODUCT_VERSION, VpnServer, assert_supported_native_host,
-    cpu_isa_label, detect_host_os_label, is_root_or_admin, now_unix_secs, read_json_opt,
+    ActiveSessionState, AppPaths, PRODUCT_VERSION, ProtocolFilter, RemoteDesktopVersion, SortBy,
+    UiControlError, UiControlLease, UiControlSnapshot, VpnServer, acquire_ui_control,
+    cpu_isa_label, detect_host_os_label, filter_by_country, filter_by_protocol,
+    installed_desktop_version, is_root_or_admin, load_cached_mirrors, load_update_cache,
+    now_unix_secs, read_json_opt, record_update_declined, refresh_update_cache, should_auto_prompt,
+    sort_servers, summarize_countries, tunnel_aid_dns_cli, ui_control_status,
 };
 
 const APP_ID: &str = "net.vpngate.connect";
 const ACTIVE_STATE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const IDLE_STATE_POLL_INTERVAL: Duration = Duration::from_secs(15);
 const CACHE_POLL_INTERVAL: Duration = Duration::from_secs(60);
+const BUSY_CACHE_POLL_INTERVAL: Duration = Duration::from_secs(3);
+const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(700);
 const MAX_RELAY_ROWS: usize = 100;
+const MAX_LOG_LINES: usize = 600;
 
 fn main() -> eframe::Result {
-    if let Err(error) = assert_supported_native_host() {
+    if let Err(error) = vpngate_core::assert_supported_native_host() {
         eprintln!("vpngate-gui: {error}");
         std::process::exit(2);
     }
@@ -25,8 +41,8 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("VPN Gate Connect")
-            .with_inner_size([1040.0, 700.0])
-            .with_min_inner_size([800.0, 580.0]),
+            .with_inner_size([1080.0, 760.0])
+            .with_min_inner_size([820.0, 620.0]),
         ..Default::default()
     };
 
@@ -41,25 +57,32 @@ fn main() -> eframe::Result {
 enum Page {
     Connect,
     Relays,
+    Tools,
     Activity,
 }
 
 impl Page {
-    const ALL: [Self; 3] = [Self::Connect, Self::Relays, Self::Activity];
+    const ALL: [Self; 4] = [Self::Connect, Self::Relays, Self::Tools, Self::Activity];
 
     fn title(self) -> &'static str {
         match self {
             Self::Connect => "Connect",
             Self::Relays => "Relays",
-            Self::Activity => "System & diagnostics",
+            Self::Tools => "CLI functions",
+            Self::Activity => "System & activity",
         }
     }
 
     fn subtitle(self) -> &'static str {
         match self {
-            Self::Connect => "Connection status and selected relay",
-            Self::Relays => "Browse the locally cached relay list",
-            Self::Activity => "Host information and integration status",
+            Self::Connect => {
+                "Choose one or more regions and connect with the desktop tunnel engine"
+            }
+            Self::Relays => "Browse, filter, list, and start a connection from a ranked relay",
+            Self::Tools => "Run the existing vpngate commands from this window",
+            Self::Activity => {
+                "Live tunnel state, shared controller, diagnostics, and command output"
+            }
         }
     }
 
@@ -67,25 +90,110 @@ impl Page {
         match self {
             Self::Connect => "Connect",
             Self::Relays => "Relays",
+            Self::Tools => "CLI functions",
             Self::Activity => "System",
         }
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum UpdateKind {
+    Update,
+    Upgrade,
+}
+
+impl UpdateKind {
+    fn command(self) -> &'static str {
+        match self {
+            Self::Update => "update",
+            Self::Upgrade => "upgrade",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateCheckMode {
+    Startup,
+    Diagnostics,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ToolAction {
+    Countries,
+    List,
+    Mirrors,
+    Refresh,
+    Status,
+    Doctor,
+    Probe,
+    Disconnect,
+    Watchdog(&'static str),
+    CliHelp,
+}
+
+enum CommandEvent {
+    Output(String),
+    UpdateCheck(UpdateCheckMode, Result<RemoteDesktopVersion, String>),
+    Finished(i32),
+    Failed(String),
+}
+
+struct CommandWorker {
+    receiver: Receiver<CommandEvent>,
+    operation: String,
+    started_at: Instant,
+    cancellable: bool,
+    cancel_requested: bool,
+}
+
 struct GuiApp {
     paths: AppPaths,
+    cli_binary: Option<PathBuf>,
     page: Page,
     theme: egui::ThemePreference,
     session: Option<ActiveSessionState>,
     cached_servers: Vec<VpnServer>,
-    matched_relay_indices: Vec<usize>,
     cache_timestamp: Option<u64>,
+    cached_mirror_count: usize,
     relay_search: String,
+    relay_country_filter: String,
+    relay_protocol: String,
+    relay_sort: String,
+    selected_relay_ip: Option<String>,
     last_state_poll: Instant,
     last_cache_poll: Instant,
+    last_control_poll: Instant,
+    control_status: Option<UiControlSnapshot>,
+    control_lease: Option<UiControlLease>,
+    worker: Option<CommandWorker>,
+    command_log: VecDeque<String>,
+    status_message: String,
     host_label: String,
     native_arch: &'static str,
     elevated: bool,
+
+    connect_country: String,
+    connect_protocol: String,
+    connect_sort: String,
+    connect_limit: usize,
+    connect_timeout_secs: u64,
+    connect_engine: String,
+    connect_dns: String,
+    connect_start_index: usize,
+    connect_autoreconnect: String,
+    connect_force_refresh: bool,
+    connect_mirrors: String,
+
+    tools_country: String,
+    tools_protocol: String,
+    tools_sort: String,
+    tools_limit: usize,
+    tools_force_refresh: bool,
+    tools_mirrors: String,
+    probe_ip: String,
+    pending_update: Option<UpdateKind>,
+    update_offer: Option<RemoteDesktopVersion>,
+    pending_update_check: Option<UpdateCheckMode>,
 }
 
 impl GuiApp {
@@ -96,21 +204,56 @@ impl GuiApp {
         let paths = AppPaths::resolve();
         let mut app = Self {
             paths,
+            cli_binary: resolve_cli_binary(),
             page: Page::Connect,
             theme: egui::ThemePreference::System,
             session: None,
             cached_servers: Vec::new(),
-            matched_relay_indices: Vec::new(),
             cache_timestamp: None,
+            cached_mirror_count: 0,
             relay_search: String::new(),
+            relay_country_filter: String::new(),
+            relay_protocol: "auto".to_string(),
+            relay_sort: "score".to_string(),
+            selected_relay_ip: None,
             last_state_poll: Instant::now(),
             last_cache_poll: Instant::now(),
+            last_control_poll: Instant::now(),
+            control_status: None,
+            control_lease: None,
+            worker: None,
+            command_log: VecDeque::new(),
+            status_message: String::new(),
             host_label: detect_host_os_label(),
             native_arch: cpu_isa_label(),
             elevated: is_root_or_admin(),
+
+            connect_country: "JP".to_string(),
+            connect_protocol: "auto".to_string(),
+            connect_sort: "score".to_string(),
+            connect_limit: 0,
+            connect_timeout_secs: 22,
+            connect_engine: "auto".to_string(),
+            connect_dns: tunnel_aid_dns_cli(),
+            connect_start_index: 1,
+            connect_autoreconnect: "default".to_string(),
+            connect_force_refresh: false,
+            connect_mirrors: String::new(),
+
+            tools_country: String::new(),
+            tools_protocol: "auto".to_string(),
+            tools_sort: "score".to_string(),
+            tools_limit: 25,
+            tools_force_refresh: false,
+            tools_mirrors: String::new(),
+            probe_ip: String::new(),
+            pending_update: None,
+            update_offer: None,
+            pending_update_check: Some(UpdateCheckMode::Startup),
         };
         app.reload_session();
         app.reload_cache();
+        app.control_status = ui_control_status(&app.paths);
         app
     }
 
@@ -125,20 +268,606 @@ impl GuiApp {
             self.cached_servers = snapshot.servers;
         } else {
             self.cache_timestamp = None;
-            self.cached_servers = Vec::new();
+            self.cached_servers.clear();
         }
+        self.cached_mirror_count = load_cached_mirrors(&self.paths).len();
         self.last_cache_poll = Instant::now();
-        self.rebuild_relay_matches();
     }
 
-    fn rebuild_relay_matches(&mut self) {
-        let query = self.relay_search.trim();
-        self.matched_relay_indices = self
-            .cached_servers
-            .iter()
+    fn reload_control(&mut self) {
+        self.control_status = ui_control_status(&self.paths);
+        self.last_control_poll = Instant::now();
+    }
+
+    fn actions_blocked(&self) -> bool {
+        self.worker.is_some()
+            || self.control_lease.is_some()
+            || self
+                .control_status
+                .as_ref()
+                .is_some_and(|state| state.owner_pid != std::process::id())
+    }
+
+    fn control_badge(&self) -> Option<(String, Color32)> {
+        if let Some(worker) = &self.worker {
+            return Some((
+                format!("RUNNING · {}", worker.operation),
+                Color32::from_rgb(53, 132, 228),
+            ));
+        }
+        self.control_status.as_ref().and_then(|state| {
+            (state.owner_pid != std::process::id()).then(|| {
+                (
+                    format!("OBSERVE ONLY · {}: {}", state.owner, state.operation),
+                    Color32::from_rgb(190, 125, 30),
+                )
+            })
+        })
+    }
+
+    fn control_banner(&self, ui: &mut egui::Ui) {
+        if let Some(state) = self.control_status.as_ref()
+            && state.owner_pid != std::process::id()
+        {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.colored_label(
+                        Color32::from_rgb(190, 125, 30),
+                        RichText::new("OBSERVE ONLY").strong(),
+                    );
+                    ui.label(format!(
+                        "{} is running {} — {}. Controls unlock when that window finishes.",
+                        state.owner, state.operation, state.phase
+                    ));
+                });
+            });
+            ui.add_space(8.0);
+        } else if let Some(worker) = &self.worker {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.colored_label(
+                        Color32::from_rgb(53, 132, 228),
+                        RichText::new("GUI HAS CONTROL").strong(),
+                    );
+                    ui.label(format!(
+                        "{} · elapsed {}s",
+                        worker.operation,
+                        worker.started_at.elapsed().as_secs()
+                    ));
+                });
+            });
+            ui.add_space(8.0);
+        }
+    }
+
+    fn available_countries(&self) -> Vec<(String, String)> {
+        summarize_countries(&self.cached_servers)
+            .into_iter()
+            .map(|country| (country.country_short, country.country_long))
+            .collect()
+    }
+
+    fn parsed_protocol(value: &str) -> ProtocolFilter {
+        ProtocolFilter::from_cli_str(value).unwrap_or(ProtocolFilter::Auto)
+    }
+
+    fn parsed_sort(value: &str) -> SortBy {
+        SortBy::from_cli_str(value).unwrap_or(SortBy::Score)
+    }
+
+    fn matched_relays(&self) -> Vec<(usize, VpnServer)> {
+        let protocol = Self::parsed_protocol(&self.relay_protocol);
+        let available = filter_by_protocol(&self.cached_servers, protocol);
+        let query = self.relay_country_filter.trim();
+        let mut relays = filter_by_country(&available, (!query.is_empty()).then_some(query));
+        sort_servers(&mut relays, Self::parsed_sort(&self.relay_sort), protocol);
+        relays
+            .into_iter()
             .enumerate()
-            .filter_map(|(index, server)| relay_matches(server, query).then_some(index))
-            .collect();
+            .filter_map(|(rank, server)| {
+                relay_matches(&server, self.relay_search.trim()).then_some((rank, server))
+            })
+            .collect()
+    }
+
+    fn selected_relay(&self) -> Option<(usize, VpnServer)> {
+        let selected = self.selected_relay_ip.as_deref()?;
+        self.matched_relays()
+            .into_iter()
+            .find(|(_, server)| server.ip == selected)
+    }
+
+    fn connect_args(&self) -> Vec<String> {
+        let mut args = vec![
+            "connect".to_string(),
+            "--country".to_string(),
+            self.connect_country.trim().to_string(),
+            "--proto".to_string(),
+            self.connect_protocol.clone(),
+            "--sort".to_string(),
+            self.connect_sort.clone(),
+            "--limit".to_string(),
+            self.connect_limit.to_string(),
+            "--timeout".to_string(),
+            self.connect_timeout_secs.to_string(),
+            "--engine".to_string(),
+            self.connect_engine.clone(),
+            "--dns".to_string(),
+            self.connect_dns.trim().to_string(),
+            "--start".to_string(),
+            self.connect_start_index.to_string(),
+        ];
+        if self.connect_force_refresh {
+            args.push("--refresh".to_string());
+        }
+        match self.connect_autoreconnect.as_str() {
+            "on" => args.push("--autoreconnect".to_string()),
+            "off" => args.push("--no-autoreconnect".to_string()),
+            _ => {}
+        }
+        append_mirror_args(&mut args, &self.connect_mirrors);
+        args
+    }
+
+    fn tool_list_args(&self) -> Vec<String> {
+        let mut args = vec![
+            "list".to_string(),
+            "--proto".to_string(),
+            self.tools_protocol.clone(),
+            "--sort".to_string(),
+            self.tools_sort.clone(),
+            "--limit".to_string(),
+            self.tools_limit.to_string(),
+        ];
+        if !self.tools_country.trim().is_empty() {
+            args.push("--country".to_string());
+            args.push(self.tools_country.trim().to_string());
+        }
+        if self.tools_force_refresh {
+            args.push("--refresh".to_string());
+        }
+        append_mirror_args(&mut args, &self.tools_mirrors);
+        args
+    }
+
+    fn start_connect(&mut self) {
+        if self.connect_country.trim().is_empty() {
+            self.status_message = "Enter a country code/name or use `all`. Multiple regions can be comma-separated (for example JP,KR).".to_string();
+            return;
+        }
+        let args = self.connect_args();
+        self.start_cli_command("Connect", args, true, true);
+    }
+
+    fn start_cli_command(
+        &mut self,
+        operation: &str,
+        args: Vec<String>,
+        cancellable: bool,
+        requires_privilege: bool,
+    ) {
+        if self.actions_blocked() {
+            self.status_message =
+                "Another UI currently owns the shared control lock; this window is observe-only."
+                    .to_string();
+            return;
+        }
+        let Some(cli_binary) = self.cli_binary.clone() else {
+            self.status_message = "Could not locate `vpngate`. Build/install the CLI beside this GUI or add it to PATH.".to_string();
+            return;
+        };
+
+        let lease = match acquire_ui_control(&self.paths, "GUI", operation) {
+            Ok(lease) => lease,
+            Err(UiControlError::Busy(state)) => {
+                self.control_status = Some(state.clone());
+                self.status_message = format!(
+                    "Observe-only: {} is running {} ({}).",
+                    state.owner, state.operation, state.phase
+                );
+                return;
+            }
+            Err(error) => {
+                self.status_message =
+                    format!("Could not acquire the shared UI control lock: {error}");
+                return;
+            }
+        };
+        let token = lease.token().to_string();
+        lease.set_phase("Starting CLI operation");
+        self.command_log.clear();
+        self.push_log(format!("Starting {operation}…"));
+        self.status_message.clear();
+        self.control_lease = Some(lease);
+        self.reload_control();
+
+        let paths = self.paths.clone();
+        let (sender, receiver) = mpsc::channel();
+        let worker_operation = operation.to_string();
+        thread::spawn(move || {
+            run_cli_command(cli_binary, args, paths, token, requires_privilege, sender);
+        });
+        self.worker = Some(CommandWorker {
+            receiver,
+            operation: worker_operation,
+            started_at: Instant::now(),
+            cancellable,
+            cancel_requested: false,
+        });
+    }
+
+    fn start_update_check(&mut self, mode: UpdateCheckMode) {
+        if self.worker.is_some() || self.control_lease.is_some() {
+            return;
+        }
+        if self.cli_binary.is_none() {
+            self.pending_update_check = None;
+            return;
+        }
+        let lease = match acquire_ui_control(&self.paths, "GUI", "Check desktop updates") {
+            Ok(lease) => lease,
+            Err(UiControlError::Busy(state)) => {
+                self.control_status = Some(state);
+                return;
+            }
+            Err(error) => {
+                self.pending_update_check = None;
+                self.status_message = format!("Could not start the update check: {error}");
+                return;
+            }
+        };
+        lease.set_phase("Checking the public desktop version");
+        self.control_lease = Some(lease);
+        self.command_log.clear();
+        self.push_log("Checking for desktop updates…".to_string());
+        self.status_message.clear();
+        self.reload_control();
+
+        let paths = self.paths.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime.block_on(refresh_update_cache(
+                    &paths,
+                    mode == UpdateCheckMode::Diagnostics,
+                )),
+                Err(error) => Err(format!("Could not start the update-check runtime: {error}")),
+            };
+            let _ = sender.send(CommandEvent::UpdateCheck(mode, result));
+        });
+        self.worker = Some(CommandWorker {
+            receiver,
+            operation: "Check desktop updates".to_string(),
+            started_at: Instant::now(),
+            cancellable: false,
+            cancel_requested: false,
+        });
+        self.pending_update_check = None;
+    }
+
+    fn cancel_connect(&mut self) {
+        let can_cancel = self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| worker.cancellable && !worker.cancel_requested);
+        if !can_cancel {
+            return;
+        }
+        let requested = self
+            .control_lease
+            .as_ref()
+            .is_some_and(UiControlLease::request_cancel);
+        if requested {
+            if let Some(worker) = &mut self.worker {
+                worker.cancel_requested = true;
+            }
+            self.push_log(
+                "Cancellation requested — the CLI will roll back tunnel changes before returning."
+                    .to_string(),
+            );
+            self.status_message = "Cancelling and rolling back…".to_string();
+            self.reload_control();
+        } else {
+            self.status_message = "The shared cancellation request could not be sent.".to_string();
+        }
+    }
+
+    fn execute_tool_action(&mut self, action: ToolAction) {
+        match action {
+            ToolAction::Countries => {
+                let mut args = vec![
+                    "countries".to_string(),
+                    "--proto".to_string(),
+                    self.tools_protocol.clone(),
+                ];
+                if self.tools_force_refresh {
+                    args.push("--refresh".to_string());
+                }
+                append_mirror_args(&mut args, &self.tools_mirrors);
+                self.start_cli_command("List countries", args, false, false);
+            }
+            ToolAction::List => {
+                let args = self.tool_list_args();
+                self.start_cli_command("List relays", args, false, false);
+            }
+            ToolAction::Mirrors => {
+                let mut args = vec!["mirrors".to_string()];
+                append_mirror_args(&mut args, &self.tools_mirrors);
+                self.start_cli_command("Discover mirrors", args, false, false);
+            }
+            ToolAction::Refresh => {
+                let mut args = vec!["refresh".to_string()];
+                append_mirror_args(&mut args, &self.tools_mirrors);
+                self.start_cli_command("Refresh relay pool", args, false, false);
+            }
+            ToolAction::Status => {
+                self.start_cli_command(
+                    "Connection status",
+                    vec!["status".to_string()],
+                    false,
+                    false,
+                );
+            }
+            ToolAction::Doctor => {
+                self.start_cli_command(
+                    "System diagnostics",
+                    vec!["doctor".to_string()],
+                    false,
+                    false,
+                );
+            }
+            ToolAction::Probe => {
+                if self.probe_ip.trim().is_empty() {
+                    self.status_message = "Enter an IPv4 address to probe.".to_string();
+                    return;
+                }
+                self.start_cli_command(
+                    "Probe relay",
+                    vec!["probe".to_string(), self.probe_ip.trim().to_string()],
+                    false,
+                    false,
+                );
+            }
+            ToolAction::Disconnect => {
+                self.start_cli_command("Disconnect", vec!["disconnect".to_string()], false, true);
+            }
+            ToolAction::Watchdog(mode) => {
+                let needs_privilege =
+                    self.session.is_some() && matches!(mode, "on" | "off" | "toggle");
+                self.start_cli_command(
+                    &format!("Watchdog {mode}"),
+                    vec!["watchdog".to_string(), mode.to_string()],
+                    false,
+                    needs_privilege,
+                );
+            }
+            ToolAction::CliHelp => {
+                self.start_cli_command("CLI help", vec!["--help".to_string()], false, false);
+            }
+        }
+    }
+
+    fn request_update(&mut self, kind: UpdateKind) {
+        self.pending_update = Some(kind);
+    }
+
+    fn update_confirmation_ui(&mut self, ctx: &egui::Context) {
+        let Some(kind) = self.pending_update else {
+            return;
+        };
+        let mut confirmed = false;
+        let mut dismissed = false;
+        egui::Window::new("Confirm desktop update")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                if let Some(remote) = &self.update_offer {
+                    ui.label(format!(
+                        "Installed v{PRODUCT_VERSION} · latest v{}. Installing the update is strongly recommended.",
+                        remote.raw
+                    ));
+                    ui.label(
+                        RichText::new(format!("Version source: {}", remote.source_url))
+                            .weak()
+                            .small(),
+                    );
+                } else {
+                    ui.label(format!(
+                        "Run `vpngate {}`? The installer may replace the current desktop binary.",
+                        kind.command()
+                    ));
+                    ui.label(
+                        RichText::new(
+                            "The update is downloaded anonymously from the public repository.",
+                        )
+                        .weak(),
+                    );
+                }
+                ui.label(
+                    RichText::new(
+                        "Installing replaces this desktop version and removes the old binary.",
+                    )
+                    .weak(),
+                );
+                ui.add_space(8.0);
+                if self.cli_binary.is_none() {
+                    ui.colored_label(
+                        Color32::from_rgb(190, 125, 30),
+                        "The `vpngate` CLI binary is required to install updates.",
+                    );
+                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(self.cli_binary.is_some(), egui::Button::new("Install update"))
+                        .clicked()
+                    {
+                        confirmed = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        dismissed = true;
+                    }
+                });
+            });
+        if confirmed {
+            self.pending_update = None;
+            let update_offer = self.update_offer.take();
+            self.start_cli_command(
+                kind.command(),
+                vec![kind.command().to_string(), "--yes".to_string()],
+                false,
+                true,
+            );
+            if self.worker.is_none() {
+                self.update_offer = update_offer;
+                self.pending_update = Some(kind);
+            }
+        } else if dismissed {
+            if let Some(remote) = self.update_offer.take() {
+                record_update_declined(&self.paths, &remote);
+            }
+            self.pending_update = None;
+        }
+    }
+
+    fn pump_command_events(&mut self) {
+        let events: Vec<CommandEvent> = self
+            .worker
+            .as_ref()
+            .map(|worker| worker.receiver.try_iter().collect())
+            .unwrap_or_default();
+        let mut finished = false;
+        let mut latest_phase = None;
+        for event in events {
+            match event {
+                CommandEvent::Output(line) => {
+                    let clean = strip_ansi(&line);
+                    if !clean.trim().is_empty() {
+                        latest_phase = Some(clean.clone());
+                        self.push_log(clean);
+                    }
+                }
+                CommandEvent::UpdateCheck(mode, Ok(remote)) => {
+                    if remote.version > installed_desktop_version() {
+                        let should_prompt = mode == UpdateCheckMode::Diagnostics
+                            || load_update_cache(&self.paths)
+                                .is_none_or(|cache| should_auto_prompt(&cache, &remote.version));
+                        if should_prompt {
+                            let message = format!(
+                                "Desktop update v{} is available; installing it is strongly recommended.",
+                                remote.raw
+                            );
+                            self.push_log(message.clone());
+                            self.status_message = message;
+                            self.update_offer = Some(remote);
+                            self.pending_update = Some(UpdateKind::Update);
+                        } else {
+                            let message = format!(
+                                "Desktop update v{} is available; its reminder is snoozed after your earlier choice.",
+                                remote.raw
+                            );
+                            self.push_log(message.clone());
+                            self.status_message = message;
+                        }
+                    } else {
+                        let message =
+                            format!("VPN Gate Connect is up to date (v{PRODUCT_VERSION}).");
+                        self.push_log(message.clone());
+                        self.status_message = message;
+                    }
+                    finished = true;
+                }
+                CommandEvent::UpdateCheck(_, Err(error)) => {
+                    let message = format!("Desktop update check did not complete: {error}");
+                    self.push_log(message.clone());
+                    self.status_message = message;
+                    finished = true;
+                }
+                CommandEvent::Finished(code) => {
+                    let message = if code == vpngate_core::INTERRUPTED_EXIT {
+                        "Connect cancelled; rollback completed or tunnel state was left unchanged."
+                            .to_string()
+                    } else {
+                        format!("Command finished with exit code {code}.")
+                    };
+                    self.push_log(message.clone());
+                    self.status_message = message;
+                    finished = true;
+                }
+                CommandEvent::Failed(error) => {
+                    self.push_log(format!("Could not start command: {error}"));
+                    self.status_message = format!("Could not start command: {error}");
+                    finished = true;
+                }
+            }
+        }
+        if let (Some(phase), Some(lease)) = (latest_phase, self.control_lease.as_ref()) {
+            lease.set_phase(phase.chars().take(180).collect::<String>());
+        }
+        if finished {
+            let update_after_doctor = self
+                .worker
+                .as_ref()
+                .is_some_and(|worker| worker.operation == "System diagnostics");
+            self.worker = None;
+            self.control_lease = None;
+            self.reload_session();
+            self.reload_cache();
+            self.reload_control();
+            if update_after_doctor {
+                self.pending_update_check = Some(UpdateCheckMode::Diagnostics);
+            }
+        }
+    }
+
+    fn push_log(&mut self, line: String) {
+        for part in line.lines() {
+            self.command_log.push_back(part.to_string());
+            while self.command_log.len() > MAX_LOG_LINES {
+                self.command_log.pop_front();
+            }
+        }
+    }
+
+    fn command_output_panel(&mut self, ui: &mut egui::Ui, max_height: f32) {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Command output").strong());
+                if let Some(worker) = &self.worker {
+                    ui.label(
+                        RichText::new(format!(
+                            "{} · {}s",
+                            worker.operation,
+                            worker.started_at.elapsed().as_secs()
+                        ))
+                        .weak(),
+                    );
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Clear").clicked() {
+                        self.command_log.clear();
+                    }
+                });
+            });
+            if !self.status_message.is_empty() {
+                ui.label(RichText::new(&self.status_message).weak());
+            }
+            egui::ScrollArea::vertical()
+                .max_height(max_height)
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    if self.command_log.is_empty() {
+                        ui.label(RichText::new("No command has run in this window yet.").weak());
+                    } else {
+                        for line in &self.command_log {
+                            ui.monospace(line);
+                        }
+                    }
+                });
+        });
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -165,6 +894,30 @@ impl GuiApp {
         });
     }
 
+    #[cfg(not(target_os = "windows"))]
+    fn desktop_header(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(RichText::new("VPN Gate Connect").heading().strong());
+                ui.label(
+                    RichText::new(format!("Functional GUI · v{PRODUCT_VERSION}"))
+                        .weak()
+                        .small(),
+                );
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.appearance_picker(ui, ctx);
+                ui.add_space(12.0);
+                if let Some((label, color)) = self.control_badge() {
+                    ui.colored_label(color, RichText::new(label).strong());
+                    ui.add_space(12.0);
+                }
+                let (label, color) = self.status_badge();
+                ui.colored_label(color, RichText::new(label).strong());
+            });
+        });
+    }
+
     #[cfg(target_os = "windows")]
     fn appearance_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         for (theme, label) in [
@@ -177,23 +930,6 @@ impl GuiApp {
                 ui.close();
             }
         }
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    fn desktop_header(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.label(RichText::new("VPN Gate Connect").heading().strong());
-                ui.label(RichText::new("Read-only preview").weak().small());
-            });
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let (label, color) = self.status_badge();
-                ui.colored_label(color, RichText::new(label).strong());
-                ui.add_space(18.0);
-                self.appearance_picker(ui, ctx);
-            });
-        });
     }
 
     #[cfg(target_os = "windows")]
@@ -210,14 +946,16 @@ impl GuiApp {
                     ui.close();
                 }
             });
-
             ui.menu_button("View", |ui| {
                 ui.menu_button("Appearance", |ui| self.appearance_menu(ui, ctx));
             });
-
             ui.menu_button("Help", |ui| {
-                if ui.button("System & diagnostics").clicked() {
+                if ui.button("System & activity").clicked() {
                     self.page = Page::Activity;
+                    ui.close();
+                }
+                if ui.button("CLI reference").clicked() {
+                    self.execute_tool_action(ToolAction::CliHelp);
                     ui.close();
                 }
                 ui.separator();
@@ -236,10 +974,13 @@ impl GuiApp {
             for page in Page::ALL {
                 ui.selectable_value(&mut self.page, page, page.navigation_label());
             }
-
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let (label, color) = self.status_badge();
                 ui.colored_label(color, RichText::new(label).strong());
+                if let Some((label, color)) = self.control_badge() {
+                    ui.add_space(12.0);
+                    ui.colored_label(color, RichText::new(label).strong());
+                }
             });
         });
     }
@@ -257,7 +998,6 @@ impl GuiApp {
                     self.page = page;
                 }
             }
-
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                 ui.separator();
                 ui.label(
@@ -272,16 +1012,18 @@ impl GuiApp {
     fn page_contents(&mut self, ui: &mut egui::Ui) {
         ui.heading(self.page.title());
         ui.label(RichText::new(self.page.subtitle()).weak());
-        ui.add_space(12.0);
+        ui.add_space(10.0);
+        self.control_banner(ui);
 
         match self.page {
             Page::Connect => self.connect_page(ui),
             Page::Relays => self.relays_page(ui),
+            Page::Tools => self.tools_page(ui),
             Page::Activity => self.activity_page(ui),
         }
     }
 
-    fn connect_page(&self, ui: &mut egui::Ui) {
+    fn connect_page(&mut self, ui: &mut egui::Ui) {
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.horizontal(|ui| {
                 let (label, color) = self.status_badge();
@@ -290,16 +1032,16 @@ impl GuiApp {
                 ui.painter().circle_filled(dot_rect.center(), 5.0, color);
                 ui.vertical(|ui| {
                     ui.label(RichText::new(label).strong().size(18.0));
-                    ui.label(RichText::new("Current VPN session").weak());
+                    ui.label(
+                        RichText::new("Live session state from the shared desktop cache").weak(),
+                    );
                 });
             });
-
-            ui.add_space(10.0);
-            ui.separator();
+            ui.add_space(6.0);
             if let Some(session) = &self.session {
                 egui::Grid::new("session_details")
                     .num_columns(2)
-                    .spacing([20.0, 8.0])
+                    .spacing([20.0, 6.0])
                     .show(ui, |ui| {
                         detail_row(ui, "Profile", &session.profile_name);
                         detail_row(ui, "Protocol", &session.protocol);
@@ -321,117 +1063,526 @@ impl GuiApp {
                                 &format!("{} {}", session.egress_ip, session.egress_loc),
                             );
                         }
-                        ui.end_row();
                     });
             } else {
                 ui.label("No active VPN session was found.");
             }
         });
 
-        ui.add_space(12.0);
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.label(RichText::new("Connection controls").strong());
-            ui.label("Connection actions are not available in this window yet.");
-            ui.horizontal(|ui| {
-                ui.add_enabled(false, egui::Button::new("Connect"));
-                ui.add_enabled(false, egui::Button::new("Disconnect"));
-                ui.label(
-                    RichText::new("Use the existing CLI or GTK/VTE window to manage the tunnel.")
-                        .weak(),
-                );
+        ui.add_space(10.0);
+        let blocked = self.actions_blocked();
+        let countries = self.available_countries();
+        let mut connect_clicked = false;
+        let mut disconnect_clicked = false;
+        ui.add_enabled_ui(!blocked, |ui| {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.label(RichText::new("Connection options").strong());
+                egui::Grid::new("connect_options")
+                    .num_columns(2)
+                    .spacing([12.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label("Country / region");
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.connect_country)
+                                    .desired_width(170.0),
+                            );
+                            egui::ComboBox::from_id_salt("connect_country_picker")
+                                .selected_text("From cache")
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut self.connect_country,
+                                        "all".to_string(),
+                                        "All countries",
+                                    );
+                                    for (code, name) in &countries {
+                                        ui.selectable_value(
+                                            &mut self.connect_country,
+                                            code.clone(),
+                                            format!("{name} ({code})"),
+                                        );
+                                    }
+                                });
+                        });
+                        ui.end_row();
+
+                        ui.label("Protocol");
+                        egui::ComboBox::from_id_salt("connect_protocol")
+                            .selected_text(&self.connect_protocol)
+                            .show_ui(ui, |ui| {
+                                for item in
+                                    ["auto", "l2tp", "openvpn-udp", "openvpn-tcp", "openvpn"]
+                                {
+                                    ui.selectable_value(
+                                        &mut self.connect_protocol,
+                                        item.to_string(),
+                                        item,
+                                    );
+                                }
+                            });
+                        ui.end_row();
+
+                        ui.label("Sort order");
+                        egui::ComboBox::from_id_salt("connect_sort")
+                            .selected_text(&self.connect_sort)
+                            .show_ui(ui, |ui| {
+                                for item in ["score", "speed", "ping", "recommended"] {
+                                    ui.selectable_value(
+                                        &mut self.connect_sort,
+                                        item.to_string(),
+                                        item,
+                                    );
+                                }
+                            });
+                        ui.end_row();
+
+                        ui.label("Auto-reconnect");
+                        egui::ComboBox::from_id_salt("connect_watchdog")
+                            .selected_text(match self.connect_autoreconnect.as_str() {
+                                "on" => "Enable",
+                                "off" => "Disable",
+                                _ => "Use saved preference",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.connect_autoreconnect,
+                                    "default".to_string(),
+                                    "Use saved preference",
+                                );
+                                ui.selectable_value(
+                                    &mut self.connect_autoreconnect,
+                                    "on".to_string(),
+                                    "Enable for this session",
+                                );
+                                ui.selectable_value(
+                                    &mut self.connect_autoreconnect,
+                                    "off".to_string(),
+                                    "Disable for this session",
+                                );
+                            });
+                        ui.end_row();
+                    });
+
+                egui::CollapsingHeader::new("Advanced CLI-compatible options")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        egui::Grid::new("connect_advanced")
+                            .num_columns(2)
+                            .spacing([12.0, 8.0])
+                            .show(ui, |ui| {
+                                ui.label("Try at most");
+                                ui.add(
+                                    egui::DragValue::new(&mut self.connect_limit)
+                                        .range(0..=1000)
+                                        .suffix(" relays (0 = all)"),
+                                );
+                                ui.end_row();
+
+                                ui.label("Attempt timeout");
+                                ui.add(
+                                    egui::DragValue::new(&mut self.connect_timeout_secs)
+                                        .range(5..=300)
+                                        .suffix(" s"),
+                                );
+                                ui.end_row();
+
+                                ui.label("Start at ranked relay");
+                                ui.add(
+                                    egui::DragValue::new(&mut self.connect_start_index)
+                                        .range(1..=10000),
+                                );
+                                ui.end_row();
+
+                                ui.label("OpenVPN engine");
+                                egui::ComboBox::from_id_salt("connect_engine")
+                                    .selected_text(&self.connect_engine)
+                                    .show_ui(ui, |ui| {
+                                        for item in ["auto", "nm", "daemon"] {
+                                            ui.selectable_value(
+                                                &mut self.connect_engine,
+                                                item.to_string(),
+                                                item,
+                                            );
+                                        }
+                                    });
+                                ui.end_row();
+
+                                ui.label("Extra DNS servers");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.connect_dns)
+                                        .desired_width(320.0),
+                                );
+                                ui.end_row();
+
+                                ui.label("Custom mirrors");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.connect_mirrors)
+                                        .desired_width(320.0)
+                                        .hint_text("URLs separated by semicolon"),
+                                );
+                                ui.end_row();
+                            });
+                        ui.checkbox(
+                            &mut self.connect_force_refresh,
+                            "Force refresh relay pool before connecting (-r)",
+                        );
+                    });
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    connect_clicked = ui.button(RichText::new("Connect").strong()).clicked();
+                    disconnect_clicked = ui.button("Disconnect").clicked();
+                    if ui.button("Browse relays").clicked() {
+                        self.page = Page::Relays;
+                    }
+                    if ui.button("More CLI functions").clicked() {
+                        self.page = Page::Tools;
+                    }
+                });
             });
         });
+
+        if self.cli_binary.is_none() {
+            ui.colored_label(Color32::from_rgb(190, 125, 30), "The `vpngate` CLI binary was not found. Build/install it beside this GUI or make it available in PATH.");
+        }
+        if !self.status_message.is_empty() {
+            ui.label(RichText::new(&self.status_message).weak());
+        }
+        if let Some(worker) = &self.worker
+            && worker.cancellable
+        {
+            let mut cancel_clicked = false;
+            let enabled = !worker.cancel_requested;
+            ui.horizontal(|ui| {
+                ui.colored_label(
+                    Color32::from_rgb(190, 125, 30),
+                    "Connect is running. Cancelling performs the normal tunnel rollback.",
+                );
+                cancel_clicked = ui
+                    .add_enabled(enabled, egui::Button::new("Cancel connect"))
+                    .clicked();
+            });
+            if cancel_clicked {
+                self.cancel_connect();
+            }
+        }
+
+        if connect_clicked {
+            self.start_connect();
+        } else if disconnect_clicked {
+            self.execute_tool_action(ToolAction::Disconnect);
+        }
+        ui.add_space(8.0);
+        self.command_output_panel(ui, 180.0);
     }
 
     fn relays_page(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label("Filter");
-            let response = ui.add(
-                egui::TextEdit::singleline(&mut self.relay_search)
-                    .hint_text("Country, relay, or IP")
-                    .desired_width(260.0),
-            );
-            if response.changed() {
-                self.rebuild_relay_matches();
-            }
-            if ui.button("Reload cache").clicked() {
-                self.reload_cache();
-            }
-            ui.label(RichText::new(format!("{} relays", self.cached_servers.len())).weak());
-        });
-        ui.add_space(8.0);
-
-        if self.cached_servers.is_empty() {
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.label(RichText::new("No cached relays").strong());
-                ui.label(
-                    "Run `vpngate refresh` in the existing terminal window to populate this list.",
+        let blocked = self.actions_blocked();
+        let mut run_list = false;
+        let mut connect_selected = false;
+        let mut reload = false;
+        ui.add_enabled_ui(!blocked, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Country");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.relay_country_filter)
+                        .desired_width(90.0)
+                        .hint_text("all"),
                 );
+                ui.label("Protocol");
+                egui::ComboBox::from_id_salt("relay_protocol")
+                    .selected_text(&self.relay_protocol)
+                    .show_ui(ui, |ui| {
+                        for item in ["auto", "l2tp", "openvpn-udp", "openvpn-tcp", "openvpn"] {
+                            ui.selectable_value(&mut self.relay_protocol, item.to_string(), item);
+                        }
+                    });
+                ui.label("Sort");
+                egui::ComboBox::from_id_salt("relay_sort")
+                    .selected_text(&self.relay_sort)
+                    .show_ui(ui, |ui| {
+                        for item in ["score", "speed", "ping", "recommended"] {
+                            ui.selectable_value(&mut self.relay_sort, item.to_string(), item);
+                        }
+                    });
+                ui.label("Find");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.relay_search)
+                        .desired_width(150.0)
+                        .hint_text("host, country, IP"),
+                );
+                run_list = ui.button("Run CLI list").clicked();
+                reload = ui.button("Reload cache").clicked();
             });
-            return;
+        });
+        if reload {
+            self.reload_cache();
+        }
+        if run_list {
+            let mut args = vec![
+                "list".to_string(),
+                "--proto".to_string(),
+                self.relay_protocol.clone(),
+                "--sort".to_string(),
+                self.relay_sort.clone(),
+                "--limit".to_string(),
+                "0".to_string(),
+            ];
+            if !self.relay_country_filter.trim().is_empty() {
+                args.push("--country".to_string());
+                args.push(self.relay_country_filter.trim().to_string());
+            }
+            self.start_cli_command("List relays", args, false, false);
         }
 
+        let relays = self.matched_relays();
         let cache_age = self
             .cache_timestamp
             .map(|timestamp| format_age(now_unix_secs().saturating_sub(timestamp)))
             .unwrap_or_else(|| "unknown age".to_string());
         ui.label(
             RichText::new(format!(
-                "Local cache · {cache_age} · {} matching relays",
-                self.matched_relay_indices.len()
+                "Local pool: {} relays · {} matching · cache {cache_age}",
+                self.cached_servers.len(),
+                relays.len()
             ))
             .weak()
             .small(),
         );
+        ui.add_space(6.0);
 
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                egui::Grid::new("relay_table")
-                    .striped(true)
-                    .num_columns(6)
-                    .spacing([14.0, 7.0])
-                    .show(ui, |ui| {
-                        for header in ["Relay", "Country", "Address", "Speed", "Ping", "Protocols"]
-                        {
-                            ui.label(RichText::new(header).strong());
-                        }
-                        ui.end_row();
-
-                        for &index in self.matched_relay_indices.iter().take(MAX_RELAY_ROWS) {
-                            let server = &self.cached_servers[index];
-                            ui.label(&server.hostname);
-                            ui.label(format!(
-                                "{} ({})",
-                                server.country_long, server.country_short
-                            ));
-                            ui.monospace(&server.ip);
-                            ui.label(format!("{:.1} Mbps", server.speed_mbps()));
-                            ui.label(format!("{} ms", server.ping_ms));
-                            ui.label(protocol_labels(server));
-                            ui.end_row();
-                        }
-                    });
+        if self.cached_servers.is_empty() {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.label(RichText::new("No cached relays").strong());
+                ui.label(
+                    "Run `countries`, `list`, `refresh`, or connect to populate the shared cache.",
+                );
             });
-
-        if self.matched_relay_indices.len() > MAX_RELAY_ROWS {
-            ui.label(
-                RichText::new(format!(
-                    "Showing the first {MAX_RELAY_ROWS} of {} matching relays.",
-                    self.matched_relay_indices.len()
-                ))
-                .weak()
-                .small(),
-            );
+        } else if relays.is_empty() {
+            ui.label("No cached relays match these filters.");
+        } else {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .max_height(420.0)
+                .show(ui, |ui| {
+                    egui::Grid::new("relay_table")
+                        .striped(true)
+                        .num_columns(6)
+                        .spacing([12.0, 6.0])
+                        .show(ui, |ui| {
+                            for header in [
+                                "# / relay",
+                                "Country",
+                                "Address",
+                                "Speed",
+                                "Ping",
+                                "Protocols",
+                            ] {
+                                ui.label(RichText::new(header).strong());
+                            }
+                            ui.end_row();
+                            for (rank, server) in relays.iter().take(MAX_RELAY_ROWS) {
+                                let selected =
+                                    self.selected_relay_ip.as_deref() == Some(server.ip.as_str());
+                                if ui
+                                    .selectable_label(
+                                        selected,
+                                        format!("{} · {}", rank + 1, server.hostname),
+                                    )
+                                    .clicked()
+                                {
+                                    self.selected_relay_ip = Some(server.ip.clone());
+                                }
+                                ui.label(format!(
+                                    "{} ({})",
+                                    server.country_long, server.country_short
+                                ));
+                                ui.monospace(&server.ip);
+                                ui.label(format!("{:.1} Mbps", server.speed_mbps()));
+                                ui.label(if server.ping_ms < 9999 {
+                                    format!("{} ms", server.ping_ms)
+                                } else {
+                                    "N/A".to_string()
+                                });
+                                ui.label(protocol_labels(server));
+                                ui.end_row();
+                            }
+                        });
+                });
+            if relays.len() > MAX_RELAY_ROWS {
+                ui.label(
+                    RichText::new(format!(
+                        "Showing the first {MAX_RELAY_ROWS} of {} matches.",
+                        relays.len()
+                    ))
+                    .weak()
+                    .small(),
+                );
+            }
         }
+
+        if let Some((rank, server)) = self.selected_relay() {
+            let label = format!(
+                "Connect from selected relay #{} — {} ({})",
+                rank + 1,
+                server.hostname,
+                server.country_short
+            );
+            connect_selected = ui.add_enabled(!blocked, egui::Button::new(label)).clicked();
+        } else if self.selected_relay_ip.is_some() {
+            ui.label(RichText::new("Selected relay is outside the current filters.").weak());
+        }
+        if connect_selected && let Some((rank, server)) = self.selected_relay() {
+            self.connect_country = server.country_short.clone();
+            self.connect_protocol = self.relay_protocol.clone();
+            self.connect_sort = self.relay_sort.clone();
+            self.connect_start_index = rank + 1;
+            self.start_connect();
+        }
+        ui.add_space(8.0);
+        self.command_output_panel(ui, 150.0);
     }
 
-    fn activity_page(&self, ui: &mut egui::Ui) {
+    fn tools_page(&mut self, ui: &mut egui::Ui) {
+        let blocked = self.actions_blocked();
+        let mut action = None;
+        ui.add_enabled_ui(!blocked, |ui| {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.label(RichText::new("Shared command options").strong());
+                egui::Grid::new("tool_options")
+                    .num_columns(4)
+                    .spacing([10.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label("Country filter");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.tools_country)
+                                .desired_width(120.0)
+                                .hint_text("JP,KR or all"),
+                        );
+                        ui.label("Protocol");
+                        egui::ComboBox::from_id_salt("tools_protocol")
+                            .selected_text(&self.tools_protocol)
+                            .show_ui(ui, |ui| {
+                                for item in
+                                    ["auto", "l2tp", "openvpn-udp", "openvpn-tcp", "openvpn"]
+                                {
+                                    ui.selectable_value(
+                                        &mut self.tools_protocol,
+                                        item.to_string(),
+                                        item,
+                                    );
+                                }
+                            });
+                        ui.end_row();
+                        ui.label("Sort");
+                        egui::ComboBox::from_id_salt("tools_sort")
+                            .selected_text(&self.tools_sort)
+                            .show_ui(ui, |ui| {
+                                for item in ["score", "speed", "ping", "recommended"] {
+                                    ui.selectable_value(
+                                        &mut self.tools_sort,
+                                        item.to_string(),
+                                        item,
+                                    );
+                                }
+                            });
+                        ui.label("List limit");
+                        ui.add(
+                            egui::DragValue::new(&mut self.tools_limit)
+                                .range(0..=1000)
+                                .suffix(" (0 = all)"),
+                        );
+                        ui.end_row();
+                        ui.label("Custom mirror URLs");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.tools_mirrors)
+                                .desired_width(240.0)
+                                .hint_text("separate URLs with semicolons"),
+                        );
+                        ui.label("Probe IPv4");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.probe_ip)
+                                .desired_width(150.0)
+                                .hint_text("192.0.2.1"),
+                        );
+                        ui.end_row();
+                    });
+                ui.checkbox(
+                    &mut self.tools_force_refresh,
+                    "Force live server-pool refresh for countries/list (-r)",
+                );
+            });
+
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Countries (-L)").clicked() {
+                    action = Some(ToolAction::Countries);
+                }
+                if ui.button("List relays (-l)").clicked() {
+                    action = Some(ToolAction::List);
+                }
+                if ui.button("Discover mirrors (-M)").clicked() {
+                    action = Some(ToolAction::Mirrors);
+                }
+                if ui.button("Refresh pool (-r)").clicked() {
+                    action = Some(ToolAction::Refresh);
+                }
+                if ui.button("Status (-S)").clicked() {
+                    action = Some(ToolAction::Status);
+                }
+                if ui.button("Doctor (-D)").clicked() {
+                    action = Some(ToolAction::Doctor);
+                }
+                if ui.button("Probe IPv4").clicked() {
+                    action = Some(ToolAction::Probe);
+                }
+                if ui.button("Disconnect (-d)").clicked() {
+                    action = Some(ToolAction::Disconnect);
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Watchdog status").clicked() {
+                    action = Some(ToolAction::Watchdog("status"));
+                }
+                if ui.button("Watchdog on").clicked() {
+                    action = Some(ToolAction::Watchdog("on"));
+                }
+                if ui.button("Watchdog off").clicked() {
+                    action = Some(ToolAction::Watchdog("off"));
+                }
+                if ui.button("Watchdog toggle").clicked() {
+                    action = Some(ToolAction::Watchdog("toggle"));
+                }
+                if ui.button("CLI help").clicked() {
+                    action = Some(ToolAction::CliHelp);
+                }
+                if ui.button("Update…").clicked() {
+                    self.request_update(UpdateKind::Update);
+                }
+                if ui.button("Upgrade alias…").clicked() {
+                    self.request_update(UpdateKind::Upgrade);
+                }
+            });
+        });
+        if let Some(action) = action {
+            self.execute_tool_action(action);
+        }
+        if self.cli_binary.is_none() {
+            ui.colored_label(
+                Color32::from_rgb(190, 125, 30),
+                "CLI functions require the existing `vpngate` binary.",
+            );
+        }
+        ui.add_space(10.0);
+        self.command_output_panel(ui, 260.0);
+    }
+
+    fn activity_page(&mut self, ui: &mut egui::Ui) {
         egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.label(RichText::new("Host information").strong());
+            ui.label(RichText::new("Host and shared state").strong());
             egui::Grid::new("host_details")
                 .num_columns(2)
-                .spacing([20.0, 8.0])
+                .spacing([18.0, 7.0])
                 .show(ui, |ui| {
                     detail_row(ui, "Operating system", &self.host_label);
                     detail_row(ui, "Native architecture", self.native_arch);
@@ -446,31 +1597,70 @@ impl GuiApp {
                     );
                     detail_row(
                         ui,
+                        "CLI binary",
+                        &self
+                            .cli_binary
+                            .as_ref()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_else(|| "Not found".to_string()),
+                    );
+                    detail_row(
+                        ui,
                         "Cache directory",
                         &self.paths.cache_dir.display().to_string(),
                     );
                     detail_row(ui, "Cached relays", &self.cached_servers.len().to_string());
+                    detail_row(ui, "Cached mirrors", &self.cached_mirror_count.to_string());
                     detail_row(
                         ui,
-                        "Core state",
+                        "Watchdog preference",
+                        if vpngate_core::load_watchdog_pref(&self.paths) {
+                            "Enabled"
+                        } else {
+                            "Disabled"
+                        },
+                    );
+                    detail_row(
+                        ui,
+                        "Active session",
                         if self.session.is_some() {
                             "Session file present"
                         } else {
                             "No session file"
                         },
                     );
+                    ui.end_row();
                 });
         });
-
-        ui.add_space(12.0);
+        ui.add_space(10.0);
         egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.label(RichText::new("Integration status").strong());
-            ui.label("Session and relay data are read-only snapshots from vpngate-core.");
-            ui.label(
-                "Connection, progress, cancellation, and privilege handoff still need integration.",
-            );
-            ui.label("The existing CLI and GTK/VTE window remain available for live operations.");
+            ui.label(RichText::new("Shared controller").strong());
+            if let Some(control) = &self.control_status {
+                ui.label(format!(
+                    "{} · {} · {}",
+                    control.owner, control.operation, control.phase
+                ));
+                ui.label(
+                    RichText::new(format!(
+                        "Since {} · owner process {}",
+                        control.started_at, control.owner_pid
+                    ))
+                    .weak()
+                    .small(),
+                );
+            } else {
+                ui.label("No UI currently owns the shared exclusive-control lock.");
+            }
+            if let Some(worker) = &self.worker {
+                ui.label(format!(
+                    "This GUI operation: {} ({}s)",
+                    worker.operation,
+                    worker.started_at.elapsed().as_secs()
+                ));
+            }
         });
+        ui.add_space(10.0);
+        self.command_output_panel(ui, 340.0);
     }
 
     fn status_badge(&self) -> (&str, Color32) {
@@ -492,20 +1682,42 @@ impl GuiApp {
 
 impl eframe::App for GuiApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let state_interval = self.session_poll_interval();
-        if self.last_state_poll.elapsed() >= state_interval {
+        self.pump_command_events();
+        if self.last_state_poll.elapsed() >= self.session_poll_interval() {
             self.reload_session();
         }
-        let mut next_repaint = state_interval.saturating_sub(self.last_state_poll.elapsed());
-
-        if self.page == Page::Relays {
-            if self.last_cache_poll.elapsed() >= CACHE_POLL_INTERVAL {
-                self.reload_cache();
-            }
-            next_repaint = next_repaint
-                .min(CACHE_POLL_INTERVAL.saturating_sub(self.last_cache_poll.elapsed()));
+        if self.last_control_poll.elapsed() >= CONTROL_POLL_INTERVAL {
+            self.reload_control();
+        }
+        let cache_interval = if self.control_status.is_some() {
+            BUSY_CACHE_POLL_INTERVAL
+        } else {
+            CACHE_POLL_INTERVAL
+        };
+        if matches!(self.page, Page::Relays | Page::Tools | Page::Activity)
+            && self.last_cache_poll.elapsed() >= cache_interval
+        {
+            self.reload_cache();
+        }
+        if let Some(mode) = self.pending_update_check
+            && self.worker.is_none()
+            && self.control_lease.is_none()
+            && self.control_status.is_none()
+        {
+            self.start_update_check(mode);
         }
 
+        let state_interval = self.session_poll_interval();
+        let mut next_repaint = state_interval.saturating_sub(self.last_state_poll.elapsed());
+        next_repaint = next_repaint
+            .min(CONTROL_POLL_INTERVAL.saturating_sub(self.last_control_poll.elapsed()));
+        if matches!(self.page, Page::Relays | Page::Tools | Page::Activity) {
+            next_repaint =
+                next_repaint.min(cache_interval.saturating_sub(self.last_cache_poll.elapsed()));
+        }
+        if self.worker.is_some() {
+            next_repaint = next_repaint.min(Duration::from_millis(180));
+        }
         ctx.request_repaint_after(next_repaint);
     }
 
@@ -538,7 +1750,12 @@ impl eframe::App for GuiApp {
                 .show(ui, |ui| self.sidebar(ui));
         }
 
-        egui::CentralPanel::default().show(ui, |ui| self.page_contents(ui));
+        egui::CentralPanel::default().show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| self.page_contents(ui));
+        });
+        self.update_confirmation_ui(&ctx);
     }
 }
 
@@ -569,7 +1786,7 @@ fn configure_native_theme(ctx: &egui::Context) {
 
 #[cfg(target_os = "windows")]
 fn install_platform_font(ctx: &egui::Context) {
-    use std::{env, fs, path::PathBuf, sync::Arc};
+    use std::{env, fs, path::PathBuf};
 
     let windows_dir = env::var_os("WINDIR")
         .map(PathBuf::from)
@@ -581,7 +1798,7 @@ fn install_platform_font(ctx: &egui::Context) {
         const WINDOWS_UI_FONT: &str = "vpn_gate_segoe_ui";
         fonts.font_data.insert(
             WINDOWS_UI_FONT.to_owned(),
-            Arc::new(egui::FontData::from_owned(bytes)),
+            std::sync::Arc::new(egui::FontData::from_owned(bytes)),
         );
         fonts
             .families
@@ -594,7 +1811,7 @@ fn install_platform_font(ctx: &egui::Context) {
         const WINDOWS_MONO_FONT: &str = "vpn_gate_consolas";
         fonts.font_data.insert(
             WINDOWS_MONO_FONT.to_owned(),
-            Arc::new(egui::FontData::from_owned(bytes)),
+            std::sync::Arc::new(egui::FontData::from_owned(bytes)),
         );
         fonts
             .families
@@ -659,9 +1876,265 @@ fn format_age(seconds: u64) -> String {
     }
 }
 
+fn append_mirror_args(args: &mut Vec<String>, value: &str) {
+    for mirror in value
+        .split([';', '\n'])
+        .map(str::trim)
+        .filter(|mirror| !mirror.is_empty())
+    {
+        args.push("--mirror".to_string());
+        args.push(mirror.to_string());
+    }
+}
+
+fn resolve_cli_binary() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    let executable = std::env::current_exe().ok();
+    if let Some(executable) = executable.as_ref() {
+        let binary_name = if cfg!(windows) {
+            "vpngate.exe"
+        } else {
+            "vpngate"
+        };
+        let mut ancestor = executable.parent();
+        while let Some(directory) = ancestor {
+            candidates.push(directory.join(binary_name));
+            for profile in ["debug", "release"] {
+                candidates.push(directory.join("target").join(profile).join(binary_name));
+            }
+            ancestor = directory.parent();
+        }
+    }
+    if let Some(path) = vpngate_core::which_bin(if cfg!(windows) {
+        "vpngate.exe"
+    } else {
+        "vpngate"
+    }) {
+        candidates.push(path);
+    }
+    #[cfg(target_os = "linux")]
+    candidates.push(PathBuf::from("/usr/local/bin/vpngate"));
+    #[cfg(target_os = "macos")]
+    {
+        candidates.push(PathBuf::from("/usr/local/bin/vpngate"));
+        candidates.push(PathBuf::from("/opt/homebrew/bin/vpngate"));
+    }
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+fn build_cli_command(
+    cli_binary: &Path,
+    args: &[String],
+    paths: &AppPaths,
+    token: &str,
+    requires_privilege: bool,
+) -> Command {
+    let mut cli_args = vec![
+        "--cache-dir".to_string(),
+        paths.cache_dir.display().to_string(),
+        "--ui-control-token".to_string(),
+        token.to_string(),
+    ];
+    cli_args.extend_from_slice(args);
+    #[cfg(target_os = "windows")]
+    let _ = requires_privilege;
+
+    #[cfg(target_os = "linux")]
+    if requires_privilege
+        && !is_root_or_admin()
+        && let Some(pkexec) = vpngate_core::which_bin("pkexec")
+    {
+        let (uid, gid, user) = unix_identity();
+        let mut command = Command::new(pkexec);
+        command
+            .arg("/usr/bin/env")
+            .arg(format!("SUDO_UID={uid}"))
+            .arg(format!("SUDO_GID={gid}"))
+            .arg(format!("SUDO_USER={user}"))
+            .arg(cli_binary)
+            .args(&cli_args);
+        return command;
+    }
+
+    #[cfg(target_os = "macos")]
+    if requires_privilege && !is_root_or_admin() {
+        let (uid, gid, user) = unix_identity();
+        let mut shell_words = vec![
+            "/usr/bin/env".to_string(),
+            format!("SUDO_UID={uid}"),
+            format!("SUDO_GID={gid}"),
+            format!("SUDO_USER={user}"),
+            cli_binary.display().to_string(),
+        ];
+        shell_words.extend(cli_args);
+        let shell_line = shell_words
+            .iter()
+            .map(|word| shell_quote(word))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let apple_script = format!(
+            "do shell script \"{}\" with administrator privileges",
+            applescript_escape(&shell_line)
+        );
+        let mut command = Command::new("/usr/bin/osascript");
+        command.args(["-e", &apple_script]);
+        return command;
+    }
+
+    let mut command = Command::new(cli_binary);
+    command.args(&cli_args);
+    command
+}
+
+fn run_cli_command(
+    cli_binary: PathBuf,
+    args: Vec<String>,
+    paths: AppPaths,
+    token: String,
+    requires_privilege: bool,
+    sender: Sender<CommandEvent>,
+) {
+    let mut command = build_cli_command(&cli_binary, &args, &paths, &token, requires_privilege);
+    command
+        .env("VPNGATE_UI_NAME", "GUI")
+        .env("VPNGATE_UI_CONTROL_TOKEN", &token)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000);
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = sender.send(CommandEvent::Failed(error.to_string()));
+            return;
+        }
+    };
+
+    let stdout_thread = child
+        .stdout
+        .take()
+        .map(|stdout| spawn_pipe_reader(stdout, sender.clone(), false));
+    let stderr_thread = child
+        .stderr
+        .take()
+        .map(|stderr| spawn_pipe_reader(stderr, sender.clone(), true));
+
+    let code = child
+        .wait()
+        .ok()
+        .and_then(|status| status.code())
+        .unwrap_or(1);
+    if let Some(handle) = stdout_thread {
+        let _ = handle.join();
+    }
+    if let Some(handle) = stderr_thread {
+        let _ = handle.join();
+    }
+    let _ = sender.send(CommandEvent::Finished(code));
+}
+
+fn spawn_pipe_reader<R>(
+    reader: R,
+    sender: Sender<CommandEvent>,
+    is_stderr: bool,
+) -> thread::JoinHandle<()>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut reader = BufReader::new(reader);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let line = line.trim_end_matches(['\r', '\n']);
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let message = if is_stderr {
+                        format!("[stderr] {line}")
+                    } else {
+                        line.to_string()
+                    };
+                    if sender.send(CommandEvent::Output(message)).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ =
+                        sender.send(CommandEvent::Output(format!("[output read error] {error}")));
+                    break;
+                }
+            }
+        }
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn unix_identity() -> (String, String, String) {
+    fn query(flag: &str) -> String {
+        Command::new("id")
+            .arg(flag)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .unwrap_or_default()
+    }
+    (query("-u"), query("-g"), query("-un"))
+}
+
+#[cfg(target_os = "macos")]
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(target_os = "macos")]
+fn applescript_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn strip_ansi(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            if !ch.is_control() || ch == '\t' {
+                output.push(ch);
+            }
+            continue;
+        }
+        match chars.next() {
+            Some('[') => {
+                for code in chars.by_ref() {
+                    if ('@'..='~').contains(&code) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                while let Some(code) = chars.next() {
+                    if code == '\u{7}' {
+                        break;
+                    }
+                    if code == '\u{1b}' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            Some(_) | None => {}
+        }
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{format_age, protocol_labels, relay_matches};
+    use super::{append_mirror_args, format_age, protocol_labels, relay_matches, strip_ansi};
     use vpngate_core::VpnServer;
 
     fn server() -> VpnServer {
@@ -703,7 +2176,6 @@ mod tests {
             protocol_labels(&server()),
             "L2TP/IPsec · OVPN UDP · OVPN TCP"
         );
-
         let mut no_protocols = server();
         no_protocols.l2tp = false;
         no_protocols.openvpn = false;
@@ -715,5 +2187,34 @@ mod tests {
         assert_eq!(format_age(42), "42s old");
         assert_eq!(format_age(120), "2m old");
         assert_eq!(format_age(7200), "2h old");
+    }
+
+    #[test]
+    fn mirror_input_splits_repeated_values_without_empty_arguments() {
+        let mut args = vec!["connect".to_string()];
+        append_mirror_args(&mut args, "http://one/en/;\nhttp://two/en/;");
+        assert_eq!(
+            args,
+            [
+                "connect",
+                "--mirror",
+                "http://one/en/",
+                "--mirror",
+                "http://two/en/"
+            ]
+        );
+    }
+
+    #[test]
+    fn console_output_is_sanitized_before_rendering() {
+        assert_eq!(strip_ansi("\u{1b}[31mred\u{1b}[0m"), "red");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn privileged_shell_arguments_are_quoted_for_osascript() {
+        use super::shell_quote;
+        assert_eq!(shell_quote("plain"), "'plain'");
+        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
     }
 }

@@ -101,6 +101,24 @@ cargo build --release --locked -p vpngate-cli --target x86_64-unknown-linux-gnu
 
 ---
 
+## Optional Native GUI (trial)
+
+The functional eframe/egui GUI is an **opt-in desktop trial**; the existing `vpngate` CLI/`[0-9]` console and Linux GTK/VTE window remain available and are not replaced. The GUI reuses the installed `vpngate` binary for the complete command set (connect, countries, list, mirrors, refresh, status, doctor, watchdog, probe, disconnect, and update/upgrade), including relay/protocol/sort/timeout/DNS/autoreconnect options.
+
+Both frontends share an exclusive control lease in the VPN Gate cache. They stay open and follow the same tunnel/cache state; while one frontend runs an operation, the other remains observe-only until the lease is released. The GUI streams command output, supports connect cancellation with the normal rollback, and refreshes session/control state while idle. It anonymously checks the public desktop version at startup and after diagnostics; if a newer version is available, it prompts and strongly recommends installing it. Privileged operations use Windows UAC, macOS authorization, or Linux `pkexec` when available; a Linux GUI without a polkit agent may need to be launched from a terminal or use the legacy CLI/GTK window for sudo prompts.
+
+Build the CLI and optional GUI from a local clone, then launch the GUI (it finds `vpngate` beside the build or on `PATH`):
+
+```bash
+cargo build --release --locked -p vpngate-cli
+cargo build --release --manifest-path crates/vpngate-gui/Cargo.toml
+./crates/vpngate-gui/target/release/vpngate-gui
+```
+
+The standard installers continue to install the CLI and existing launcher only; they do not build or install the optional GUI.
+
+---
+
 ## Usage (`vpngate`)
 
 ```bash
@@ -132,7 +150,8 @@ vpngate-connect/
 ├── crates/
 │   ├── vpngate-core/      # Pure-Rust discovery, Official Mirrors, DoH, IKEv1/XFRM & desktop tunnel engine
 │   ├── vpngate-cli/       # Single-binary `vpngate` CLI & [0-9] Interactive Console
-│   └── vpngate-launcher/  # Linux GNOME GTK4/VTE dark window host (`vpngate -w`)
+│   ├── vpngate-launcher/  # Linux GNOME GTK4/VTE dark window host (`vpngate -w`)
+│   └── vpngate-gui/      # Optional eframe/egui native GUI trial (separate Cargo workspace)
 ├── assets/                # Desktop app icon (gate mark, no VG glyph) — SVG / PNG / Windows ICO
 ├── vpngate.desktop        # XDG Desktop Entry + GNOME Dash Quick Actions
 ├── install-vpngate.sh     # POSIX /bin/sh Linux & macOS installer, residue cleaner & uninstaller
