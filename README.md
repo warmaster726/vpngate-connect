@@ -16,9 +16,11 @@ Censorship-resilient **SoftEther VPN Gate** desktop client engineered around a *
   - **Official VPN Gate Daily Mirror Sites (`sites.aspx`)**: Automatically harvests, caches (`mirrors_cache.json`), probes, and fails over to Official VPN Gate Mirror Portals (`http://<mirror>:<port>/en/` & `/api/iphone/`), including ASP.NET `C_L2TP=on` / `C_OpenVPN=on` protocol tables.
   - **HTTPS Mirror & Archive Recovery**: Enriches the relay pool from 5+ HTTPS GitHub/CDN CSV mirrors plus Internet Archive CDX & `funcra` history pools (admitting archive L2TP candidates *only* if live cryptographic `PSK == "vpn"` verification succeeds right now) and backfills 100% inline `.ovpn` certificates.
   - **IP-Pinned Cloudflare DoH (`1.1.1.1:443`) & Leak Protection**: Bypasses ISP DNS poisoning, uses tunnel DNS from the connection plus Cloudflare (`1.1.1.1`, `1.0.0.1`) and Google (`8.8.8.8`, `8.8.4.4`) including their IPv6 counterparts, and restores host routes, `/etc/resolv.conf` / `systemd-resolved`, and IPv6 state cleanly on teardown.
-- **Interactive `[0-9]` Console + Native Dark GNOME GTK/VTE Window**
-  - Screen-cleared step-by-step live execution progress with in-place spinners, dynamically resizing Unicode boxes/tables, 30-minute per-protocol dead-server cooldowns, and an optional 15-second background Auto-Reconnect Watchdog (`vpngate _monitor`).
-  - On Linux/GNOME, includes `vpngate-launcher` (`GTK4` + `VTE-2.91-gtk4`) with a dark CSD HeaderBar live tunnel status badge and one-click Egress IP copy chip.
+- **Two Separate Desktop Launch Paths: Traditional Console and Native GUI**
+  - The traditional `vpngate` dashboard remains available, including `-w` and the Linux GNOME GTK4/VTE host (`vpngate-launcher`). It retains the Python v5.3-compatible menu, command/flag interface, live progress and tables.
+  - `vpngate-gui` is a separate eframe/egui application for Linux, Windows 11, and macOS, with practical Connect, Relays, More actions, and System pages plus light/dark themes.
+  - Both frontends use one per-user OS file lock: the traditional UI and GUI are mutually exclusive, and a second launch receives a clear notice. GUI cancellation keeps the tunnel rollback behavior; the old shared-control/observer integration is removed.
+  - The GTK/VTE host retains its dark header, live tunnel badge, and one-click egress-IP copy chip.
 
 ---
 
@@ -26,8 +28,8 @@ Censorship-resilient **SoftEther VPN Gate** desktop client engineered around a *
 
 | Branch | Status | Description |
 | :--- | :--- | :--- |
-| **`main`** | **Active (Default)** | Public **0.4.x** Pure-Rust 64-bit Desktop Edition (`vpngate-core`, `vpngate-cli`, Linux/macOS & Windows 11 installers, GNOME GTK/VTE launcher). Version on `main` ticks when `develop` is merged. |
-| **`develop`** | **Active (integration)** | Ongoing desktop work. Merge into `main` when you want a public version bump, so `main` does not increment on every change. |
+| **`main`** | **Active (Default)** | Public **0.4.x** Pure-Rust 64-bit Desktop Edition; it remains unchanged until an authorized merge from `develop`. |
+| **`develop`** | **Active (integration)** | Desktop **0.5.0** preparation: separate console/GUI launch paths and a shared one-frontend-at-a-time guard. Push integration work here first. |
 
 ---
 
@@ -41,7 +43,7 @@ Censorship-resilient **SoftEther VPN Gate** desktop client engineered around a *
 curl -fsSL https://raw.githubusercontent.com/warmaster726/vpngate-connect/main/install-vpngate.sh | sh
 ```
 
-If a Rust toolchain or C linker must be downloaded to compile from source, the installer **asks whether to keep those compile tools** or **remove them after `vpngate` is built**. Pre-existing toolchains are left untouched. Non-interactive runs remove tools this installer added; pass `--keep-toolchain` or `--remove-toolchain` to skip the prompt.
+If a Rust toolchain or C linker must be downloaded to compile from source, the installer **asks whether to keep those compile tools** or **remove them after the console, GUI, and (on Linux) GTK/VTE launcher are built**. Pre-existing toolchains are left untouched. Non-interactive runs remove tools this installer added; pass `--keep-toolchain` or `--remove-toolchain` to skip the prompt.
 
 **Or from a local `git clone`:**
 
@@ -67,7 +69,7 @@ sh ./install-vpngate.sh --uninstall
 irm https://raw.githubusercontent.com/warmaster726/vpngate-connect/main/install-vpngate.ps1 | iex
 ```
 
-Same compile-tool prompt as Linux: keep or remove Rust / MinGW after `vpngate.exe` is built (`-KeepToolchain` / `-RemoveToolchain`).
+Same compile-tool prompt as Linux: keep or remove Rust / MinGW after the console and native GUI binaries are built (`-KeepToolchain` / `-RemoveToolchain`). The Start Menu contains separate **VPN Gate Connect** (traditional console) and **VPN Gate Connect GUI** shortcuts.
 
 **Or from a local `git clone`:**
 - Double-click **`install-vpngate.cmd`** (auto-elevates via Windows UAC), or run `.\install-vpngate.ps1` in an elevated PowerShell window.
@@ -77,7 +79,7 @@ Same compile-tool prompt as Linux: keep or remove Rust / MinGW after `vpngate.ex
 
 ### Building Manually From Source (Rust / Cargo)
 
-Because TLS (`rustls`) and IKEv1 cryptography are implemented in pure Rust and exact crate versions are pinned in [`Cargo.lock`](Cargo.lock), **no OpenSSL headers, `pkg-config`, or `cmake` are required**—only a standard Rust toolchain (`rustup`) and a basic C linker (`gcc`/`clang` on Unix, or MSVC / MinGW-w64 `gcc.exe` on Windows):
+The core CLI uses pure-Rust TLS (`rustls`) and IKEv1 cryptography; it needs no OpenSSL headers. The native GUI is a separate eframe/egui Cargo workspace with its own lockfile. On Linux, building the GUI requires native X11/Wayland and fontconfig development libraries; the Linux installer installs the needed headers. A standard Rust toolchain and C linker are required for source builds.
 
 ```bash
 # Option A — Install directly from Git with Cargo (64-bit host with Rust installed):
@@ -101,29 +103,39 @@ cargo build --release --locked -p vpngate-cli --target x86_64-unknown-linux-gnu
 
 ---
 
-## Optional Native GUI (trial)
+## Separate Traditional and GUI Launch Paths
 
-The functional eframe/egui GUI is an **opt-in desktop trial**; the existing `vpngate` CLI/`[0-9]` console and Linux GTK/VTE window remain available and are not replaced. The GUI presents native Connect, Relays, More actions, and System pages while using the companion desktop service for the full operation set (connect, countries, relays, mirrors, refresh, cooldown reset, status, diagnostics, watchdog, probe, disconnect, and update/upgrade).
+Desktop 0.5.0 keeps the traditional dashboard and the native GUI as distinct applications:
 
-All frontends share an exclusive control lease in the VPN Gate cache. They stay open and follow the same tunnel/cache state; while one frontend runs an operation, the other remains observe-only until the lease is released. Before enabling actions, the GUI checks that its companion service supports the shared-control protocol. If it is outdated or incompatible, the GUI shows a compatibility notice rather than surfacing a generic exit code 2 or running unsynchronized operations. Build/install the GUI and companion service from a compatible desktop revision. The GUI supports connect cancellation with the normal rollback, keeps session/control state live while idle, and puts raw diagnostic output under **Technical details**. It anonymously checks the public desktop version at startup and after diagnostics; if a newer version is available, it prompts and strongly recommends installing it. Privileged operations use Windows UAC, macOS authorization, or Linux `pkexec` when available; a Linux GUI without a polkit agent may need to be launched from a terminal or use the legacy CLI/GTK window for sudo prompts.
+- **VPN Gate Connect** — run `vpngate` for the terminal dashboard. On Linux, `vpngate -w` opens the same traditional UI in the retained GTK4/VTE window; Windows Terminal remains available through `-w`.
+- **VPN Gate Connect GUI** — run `vpngate-gui` for the eframe/egui interface on Linux, Windows 11, or macOS. The GUI supports light and dark themes and exposes connect, relay browsing, tools, status, diagnostics, watchdog, disconnect, and desktop update actions.
 
-Build the CLI and optional GUI from a local clone, then launch the GUI (it finds a compatible `vpngate` service beside the build or on `PATH`):
+The two interactive frontends contend for one stable per-user OS-backed singleton lock—even when a custom cache directory is used—so only one can be active at a time. If the other frontend is already running, the new launch shows a notice instead of starting another dashboard. The previous shared-control lease, synced read-only observer, and live mirrored output have been removed. The GUI runs full command actions through the installed companion `vpngate` binary, but it does not launch a second interactive console.
+
+Connect cancellation is operation-specific and retains rollback: cancelling a connection returns after VPN Gate tunnel/profile changes are rolled back or left unchanged. The GUI also checks for desktop updates anonymously at startup and after diagnostics; a newer version prompts with a strong recommendation to install. Privileged operations use Windows UAC, macOS authorization, or Linux `pkexec` where available. On Linux without a polkit agent, launch the traditional GTK/VTE path from a terminal if a sudo prompt is required.
+
+The standard Linux/macOS and Windows installers build and install both applications from source. Linux installs separate **VPN Gate Connect** and **VPN Gate Connect GUI** desktop entries; Windows creates separate Start Menu shortcuts. The GTK/VTE launcher and CLI remain installed.
+
+Build the applications manually from a local clone:
 
 ```bash
 cargo build --release --locked -p vpngate-cli
-cargo build --release --manifest-path crates/vpngate-gui/Cargo.toml
-./crates/vpngate-gui/target/release/vpngate-gui
+# Linux traditional GTK/VTE host:
+cargo build --release --locked -p vpngate-launcher
+# Native GUI (separate Cargo workspace and Cargo.lock):
+cargo build --release --locked --manifest-path crates/vpngate-gui/Cargo.toml --bin vpngate-gui
 ```
 
-The standard installers continue to install the CLI and existing launcher only; they do not build or install the optional GUI.
+Run `vpngate` for the traditional dashboard or `vpngate-gui` for the separate GUI. For a direct GUI build, the executable is under `crates/vpngate-gui/target/release/` unless `CARGO_TARGET_DIR` is set.
 
 ---
 
 ## Usage (`vpngate`)
 
 ```bash
-vpngate                        # Launch Interactive Console Dashboard [0-9]
-vpngate -w                     # Launch inside dedicated dark GNOME GTK/VTE or Windows Terminal window
+vpngate                        # VPN Gate Connect: launch the traditional [0-9] console dashboard
+vpngate -w                     # Traditional UI in GTK/VTE (Linux) or Windows Terminal
+vpngate-gui                    # VPN Gate Connect GUI: separate native eframe/egui application
 vpngate countries              # View unified countries & protocol summary table
 vpngate list -c JP -n 15       # List top 15 servers in Japan
 vpngate connect -c JP          # Auto-connect to Japan (L2TP/IPsec -> OVPN UDP -> OVPN TCP)
@@ -140,7 +152,7 @@ vpngate update                 # Scan public main for a newer desktop (no GitHub
 vpngate upgrade                # Same as `vpngate update`
 ```
 
-The interactive `[0-9]` dashboard live-checks for a newer desktop at **startup** and again when you select **`[9]`** (`doctor`), over anonymous HTTPS (no GitHub account or 2FA). **GitHub raw `main` is authoritative**; jsDelivr is only a fallback if GitHub is unreachable, so a stale CDN cannot hide a newer public version. If a newer version is found you are prompted to install it; confirming runs the public installer from `main`, which disconnects any tunnel, deletes the previous `vpngate` binary, and installs the new one. Use `--no-update-check` to skip those scans, or `vpngate update -y` to install without a second prompt. Pool refresh stays `vpngate refresh`.
+The traditional interactive `[0-9]` dashboard live-checks for a newer desktop at **startup** and again when you select **`[9]`** (`doctor`); the GUI also checks at startup and after diagnostics. Checks use anonymous HTTPS (no GitHub account or 2FA). **GitHub raw `main` is authoritative**; jsDelivr is only a fallback if GitHub is unreachable. If a newer public version is found, you are prompted to install it; the public installer replaces the installed desktop binaries. Use `--no-update-check` in the console to skip its startup scan, or `vpngate update -y` to install without a second prompt. Pool refresh stays `vpngate refresh`.
 
 ---
 
@@ -151,17 +163,18 @@ vpngate-connect/
 ├── crates/
 │   ├── vpngate-core/      # Pure-Rust discovery, Official Mirrors, DoH, IKEv1/XFRM & desktop tunnel engine
 │   ├── vpngate-cli/       # Single-binary `vpngate` CLI & [0-9] Interactive Console
-│   ├── vpngate-launcher/  # Linux GNOME GTK4/VTE dark window host (`vpngate -w`)
-│   └── vpngate-gui/      # Optional eframe/egui native GUI trial (separate Cargo workspace)
+│   ├── vpngate-launcher/  # Linux GNOME GTK4/VTE traditional UI host (`vpngate -w`)
+│   └── vpngate-gui/       # Native eframe/egui GUI (`vpngate-gui`, separate Cargo workspace)
 ├── assets/                # Desktop app icon (gate mark, no VG glyph) — SVG / PNG / Windows ICO
-├── vpngate.desktop        # XDG Desktop Entry + GNOME Dash Quick Actions
+├── vpngate.desktop        # Traditional VPN Gate Connect entry + GNOME Dash Quick Actions
+├── vpngate-gui.desktop    # Separate VPN Gate Connect GUI entry
 ├── install-vpngate.sh     # POSIX /bin/sh Linux & macOS installer, residue cleaner & uninstaller
 ├── install-vpngate.ps1    # Windows 11 PowerShell installer, NAT-T & Zero-Prompt OpenVPN configurator
 ├── install-vpngate.cmd    # Windows 11 UAC auto-elevating Batch wrapper
 └── web/                   # Isolated Cloudflare Workers Web Profile Portal (.mobileconfig & .ovpn export)
 ```
 
-> **Isolation Note:** `web/` is a standalone Cloudflare Worker (`workers-rs` + the 4-tab HTML/JS console in `web/assets/`). Desktop installers (`install-vpngate.sh`, `install-vpngate.ps1`, `install-vpngate.cmd`) compile `-p vpngate-cli` (and on Linux `-p vpngate-launcher`) inside a temporary build root and never build, run, or copy `web/`. The root Cargo workspace **excludes** `web/`.
+> **Isolation Note:** `web/` is a standalone Cloudflare Worker (`workers-rs` + the 4-tab HTML/JS console in `web/assets/`). Desktop installers (`install-vpngate.sh`, `install-vpngate.ps1`, `install-vpngate.cmd`) build `vpngate-cli`, the separate `vpngate-gui` workspace, and the Linux `vpngate-launcher` inside an isolated temporary target directory. They never build, run, or copy `web/`; the root Cargo workspace **excludes** it.
 
 ---
 

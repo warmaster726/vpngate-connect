@@ -1,13 +1,11 @@
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
-#[cfg(windows)]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -15,21 +13,21 @@ use std::time::{Duration, Instant};
 use vpngate_core::{
     ActiveSessionState, AppPaths, ConnectSessionConfig, CooldownStore, CountrySummary,
     DEFAULT_COOLDOWN_SECS, DiscoveryClient, DiscoveryOptions, INTERRUPTED_EXIT, Ikev1StateInfo,
-    MONITOR_INTERVAL_SECONDS, NM_PROFILE_PREFIX, OfficialMirrorSite, PRODUCT_VERSION,
-    ProgressEvent, ProtocolFilter, ServerCacheFile, SortBy, UiControlAccess, UiControlError,
-    VpnServer, acquire_ui_control, cached_newer_than_installed, cleanup_existing_vpn_with_progress,
+    InteractiveInstanceError, MONITOR_INTERVAL_SECONDS, NM_PROFILE_PREFIX, OfficialMirrorSite,
+    PRODUCT_VERSION, ProgressEvent, ProtocolFilter, ServerCacheFile, SortBy, VpnServer,
+    acquire_interactive_instances, cached_newer_than_installed, cleanup_existing_vpn_with_progress,
     default_repo_slug, detect_host_os_label, engage_candidates_with_progress,
     fetch_public_url_text, filter_by_country, filter_by_protocol, find_openvpn_bin, fix_owner,
     get_default_gateway, get_ppp_interfaces, get_public_ip_trace, get_running_monitor_pid,
     get_running_openvpn_pid, get_servers_cached_with_progress, get_tun_interfaces,
-    installed_desktop_version, installer_script_urls, is_root_or_admin, join_ui_control,
-    load_cached_mirrors, load_cooldowns, load_update_cache, load_watchdog_pref,
-    normalize_mirror_base_url, now_unix_secs, parse_dns_list, probe_tcp, prune_stale_state_if_dead,
-    query_windows_natt_rule, read_json_opt, record_update_declined, refresh_update_cache,
-    resolve_user_home, run_ikev1_crypto_self_test, save_cached_mirrors, save_cooldowns,
-    save_watchdog_pref, should_auto_prompt, sort_servers, spawn_auto_reconnect_monitor,
-    stop_monitor_daemon, summarize_countries, tunnel_aid_dns_cli, ui_control_status,
-    ui_control_token_for_process, verify_l2tp_psk_vpn, wait_for_ui_control_cancel, which_bin,
+    installed_desktop_version, installer_script_urls, is_root_or_admin, load_cached_mirrors,
+    load_cooldowns, load_update_cache, load_watchdog_pref, normalize_mirror_base_url,
+    now_unix_secs, parse_dns_list, probe_tcp, prune_stale_state_if_dead, query_windows_natt_rule,
+    read_json_opt, record_update_declined, refresh_update_cache, resolve_user_home,
+    run_ikev1_crypto_self_test, save_cached_mirrors, save_cooldowns, save_watchdog_pref,
+    should_auto_prompt, sort_servers, spawn_auto_reconnect_monitor, stop_monitor_daemon,
+    summarize_countries, tunnel_aid_dns_cli, validate_interactive_instance_handoff,
+    verify_l2tp_psk_vpn, wait_for_cancel_file, which_bin,
 };
 
 use crate::term_ui::{
@@ -211,24 +209,6 @@ pub mod win_uac {
     }
 }
 
-pub fn ui_owner_label() -> String {
-    env::var("VPNGATE_UI_NAME")
-        .ok()
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or_else(|| "Terminal CLI".to_string())
-}
-
-pub fn acquire_command_control(
-    paths: &AppPaths,
-    operation: &str,
-    delegated_token: Option<&str>,
-) -> Result<UiControlAccess, UiControlError> {
-    if let Some(token) = delegated_token.filter(|token| !token.is_empty()) {
-        return join_ui_control(paths, token).map(UiControlAccess::Executor);
-    }
-    acquire_ui_control(paths, &ui_owner_label(), operation).map(UiControlAccess::Owner)
-}
-
 fn parse_custom_mirrors(urls: &[String]) -> Vec<OfficialMirrorSite> {
     let mut out = Vec::new();
     for raw in urls {
@@ -290,10 +270,6 @@ pub fn elevate_self(paths: &AppPaths, sub_args: &[String]) -> i32 {
             "--cache-dir".to_string(),
             paths.cache_dir.display().to_string(),
         ];
-        if let Some(token) = ui_control_token_for_process(paths) {
-            elevated_args.push("--ui-control-token".to_string());
-            elevated_args.push(token);
-        }
         elevated_args.extend_from_slice(sub_args);
         let status = Command::new("sudo")
             .arg("-E")
@@ -320,10 +296,6 @@ pub fn elevate_self(paths: &AppPaths, sub_args: &[String]) -> i32 {
             "--cache-dir".to_string(),
             paths.cache_dir.display().to_string(),
         ];
-        if let Some(token) = ui_control_token_for_process(paths) {
-            full_args.push("--ui-control-token".to_string());
-            full_args.push(token);
-        }
         full_args.extend_from_slice(sub_args);
         match win_uac::run_elevated(&self_exe, &full_args, true) {
             Ok(code) => code,
@@ -343,7 +315,7 @@ pub fn elevate_self(paths: &AppPaths, sub_args: &[String]) -> i32 {
 }
 
 #[cfg(windows)]
-fn launch_elevated_interactive_console(paths: &AppPaths) -> bool {
+fn launch_elevated_interactive_console(paths: &AppPaths, default_cache_dir: &Path) -> bool {
     let Ok(self_exe) = env::current_exe() else {
         return false;
     };
@@ -351,6 +323,8 @@ fn launch_elevated_interactive_console(paths: &AppPaths) -> bool {
         "--uac-elevated".to_string(),
         "--cache-dir".to_string(),
         paths.cache_dir.display().to_string(),
+        "--interactive-default-cache-dir".to_string(),
+        default_cache_dir.display().to_string(),
     ];
     if !dynamic_resize_enabled() {
         args.push("--no-resize".to_string());
@@ -666,6 +640,7 @@ pub struct ConnectArgs {
     pub force_refresh: bool,
     pub auto_reconnect_override: Option<bool>,
     pub custom_mirrors: Vec<String>,
+    pub cancel_file: Option<PathBuf>,
 }
 
 pub async fn cmd_connect(paths: &AppPaths, args: &ConnectArgs) -> io::Result<i32> {
@@ -712,6 +687,10 @@ pub async fn cmd_connect(paths: &AppPaths, args: &ConnectArgs) -> io::Result<i32
         if args.force_refresh {
             sub.push("-r".to_string());
         }
+        if let Some(path) = &args.cancel_file {
+            sub.push("--cancel-file".to_string());
+            sub.push(path.display().to_string());
+        }
         if !dynamic_resize_enabled() {
             sub.push("--no-resize".to_string());
         }
@@ -744,7 +723,7 @@ pub async fn cmd_connect(paths: &AppPaths, args: &ConnectArgs) -> io::Result<i32
             warn("Interrupted — returning without connecting.");
             return Ok(INTERRUPTED_EXIT);
         }
-        _ = wait_for_ui_control_cancel(paths) => {
+        _ = wait_for_cancel_file(args.cancel_file.as_deref()) => {
             warn("Connect cancelled — returning without changing the VPN tunnel.");
             return Ok(INTERRUPTED_EXIT);
         }
@@ -790,6 +769,7 @@ pub async fn cmd_connect(paths: &AppPaths, args: &ConnectArgs) -> io::Result<i32
         start_index: args.start_index.max(1),
         auto_reconnect,
         in_monitor: false,
+        cancel_file: args.cancel_file.clone(),
     };
 
     info(&format!(
@@ -2115,156 +2095,55 @@ async fn prompt_and_maybe_install(
     }
 }
 
-const OBSERVER_OUTPUT_LINES: usize = 14;
-const OBSERVER_REFRESH: Duration = Duration::from_millis(500);
-
-/// Read-only original-console companion used by the native GUI to mirror its live output.
-pub fn interactive_observer(paths: &AppPaths) -> io::Result<i32> {
-    let mut offset = 0u64;
-    let mut pending = Vec::new();
-    let mut output = VecDeque::new();
-
-    loop {
-        poll_observer_log(
-            &paths.ui_observer_log,
-            &mut offset,
-            &mut pending,
-            &mut output,
-        )?;
-
-        let session = read_json_opt::<ActiveSessionState>(&paths.active_state);
-        let tunnel_line = if let Some(state) = session {
-            format!(
-                "Tunnel: {} → {} ({} · {})",
-                state.status.to_ascii_uppercase(),
-                state.hostname,
-                state.country_short,
-                state.protocol
-            )
-        } else {
-            "Tunnel: DISCONNECTED".to_string()
-        };
-        let watchdog_pid = get_running_monitor_pid(paths);
-        let watchdog_line = if watchdog_pid > 0 {
-            format!("Watchdog: ARMED (PID {watchdog_pid})")
-        } else if load_watchdog_pref(paths) {
-            "Watchdog: ON (standby)".to_string()
-        } else {
-            "Watchdog: OFF".to_string()
-        };
-        let controller_line = ui_control_status(paths)
-            .map(|control| {
-                format!(
-                    "Controller: OBSERVE ONLY — {} is running {} ({})",
-                    control.owner, control.operation, control.phase
-                )
-            })
-            .unwrap_or_else(|| "Controller: idle — no operation currently running".to_string());
-
-        let mut lines = vec![
-            Some(format!(
-                "{CYAN}{BOLD}VPN Gate Console v{PRODUCT_VERSION}{RESET}  ·  LIVE OBSERVER"
-            )),
-            Some(tunnel_line),
-            Some(controller_line),
-            Some(format!("{}  ·  {watchdog_line}", local_pool_summary_line(paths))),
-            None,
-            Some(format!("{BOLD}Original dashboard actions (read-only in this window){RESET}")),
-            Some(" [1] Connect by region   [2] Pick relay   [3] Countries   [4] Live status   [5] Watchdog".to_string()),
-            Some(" [6] Disconnect   [7] Refresh pool   [8] Mirrors   [9] Diagnostics / CLI reference".to_string()),
-            None,
-            Some(format!("{BOLD}Live output from GUI operations{RESET}")),
-        ];
-        if output.is_empty() {
-            lines.push(Some(format!(
-                "{DIM}Waiting for the GUI to start an operation…{RESET}"
-            )));
-        } else {
-            lines.extend(output.iter().map(|line| Some(truncate_plain(line, 112))));
-        }
-        lines.push(None);
-        lines.push(Some(format!(
-            "{DIM}This companion is observe-only. Use the VPN Gate Connect GUI to control operations; close this window or press Ctrl+C to exit.{RESET}"
-        )));
-
-        clear_screen_if_tty();
-        render_dynamic_box(&lines, 0, 76)?;
-        if !is_stdout_tty() {
-            return Ok(0);
-        }
-        std::thread::sleep(OBSERVER_REFRESH);
-    }
-}
-
-fn poll_observer_log(
-    path: &std::path::Path,
-    offset: &mut u64,
-    pending: &mut Vec<u8>,
-    output: &mut VecDeque<String>,
-) -> io::Result<()> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
-    };
-    if (bytes.len() as u64) < *offset {
-        *offset = 0;
-        pending.clear();
-        output.clear();
-    }
-    let start = usize::try_from(*offset).unwrap_or(0).min(bytes.len());
-    pending.extend_from_slice(&bytes[start..]);
-    *offset = bytes.len() as u64;
-
-    while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
-        let line = pending.drain(..=newline).collect::<Vec<_>>();
-        let line = String::from_utf8_lossy(&line[..line.len().saturating_sub(1)])
-            .trim_end_matches('\r')
-            .to_string();
-        if !line.is_empty() {
-            output.push_back(line);
-            while output.len() > OBSERVER_OUTPUT_LINES {
-                output.pop_front();
-            }
-        }
-    }
-    Ok(())
-}
-
-pub async fn interactive_menu(paths: &AppPaths, help_text: &str) -> io::Result<i32> {
+pub async fn interactive_menu(
+    paths: &AppPaths,
+    help_text: &str,
+    default_cache_dir: &Path,
+    handoff_token: Option<&str>,
+) -> io::Result<i32> {
     let os_label = detect_host_os_label();
 
     #[cfg(windows)]
     if !is_root_or_admin() && is_stdout_tty() && !uac_already_attempted() && !no_elevate_requested()
     {
         info("Requesting Administrator privileges via Windows UAC ...");
-        if launch_elevated_interactive_console(paths) {
+        if launch_elevated_interactive_console(paths, default_cache_dir) {
             ok("Opened elevated Administrator VPN Gate console window.");
             return Ok(0);
         }
         warn(
-            "UAC elevation was declined - continuing in Read-Only mode (Countries, List, Mirrors, Status, Doctor).",
+            "UAC elevation was declined - continuing without pre-elevation; privileged actions may request credentials when needed.",
         );
         tokio::time::sleep(Duration::from_millis(900)).await;
     }
+
+    let default_lock_paths = AppPaths::with_base_dir(default_cache_dir.to_path_buf());
+    let _interactive_instances = if handoff_token
+        .is_some_and(|token| validate_interactive_instance_handoff(&default_lock_paths, token))
+    {
+        Vec::new()
+    } else {
+        match acquire_interactive_instances(paths, default_cache_dir) {
+            Ok(guards) => guards,
+            Err(InteractiveInstanceError::AlreadyRunning) => {
+                err(
+                    "Another VPN Gate Connect frontend is already open. Close it before starting this one.",
+                );
+                return Ok(75);
+            }
+            Err(error) => {
+                err(&format!("Cannot start the interactive frontend: {error}"));
+                return Ok(2);
+            }
+        }
+    };
 
     let mut startup_update_checked = false;
 
     loop {
         if is_stdout_tty() && !skip_update_check() && !startup_update_checked {
-            match acquire_ui_control(paths, &ui_owner_label(), "Check desktop update") {
-                Ok(_lease) => {
-                    live_check_desktop_update(paths).await;
-                    startup_update_checked = true;
-                }
-                Err(UiControlError::Busy(_)) => {}
-                Err(error) => {
-                    warn(&format!(
-                        "Could not check desktop updates under the shared control lock: {error}"
-                    ));
-                    startup_update_checked = true;
-                }
-            }
+            live_check_desktop_update(paths).await;
+            startup_update_checked = true;
         }
         clear_screen_if_tty();
         prune_stale_state_if_dead(paths);
@@ -2310,22 +2189,12 @@ pub async fn interactive_menu(paths: &AppPaths, help_text: &str) -> io::Result<i
             }
         };
 
-        let control_line = ui_control_status(paths)
-            .filter(|control| control.owner_pid != std::process::id())
-            .map(|control| {
-                format!(
-                    "Controller: {YELLOW}OBSERVE ONLY{RESET} — {} is running {} ({})",
-                    control.owner, control.operation, control.phase
-                )
-            });
-
         let menu_lines = vec![
             Some(format!(
                 "{CYAN}{BOLD}VPN Gate Console v{}{RESET}  ·  {os_label} (Auto: L2TP/IPsec -> OVPN UDP -> OVPN TCP)",
                 PRODUCT_VERSION
             )),
             Some(status_line),
-            control_line,
             Some(local_pool_summary_line(paths)),
             Some(desktop_update_status_line(paths)),
             None,
@@ -2373,19 +2242,11 @@ pub async fn interactive_menu(paths: &AppPaths, help_text: &str) -> io::Result<i
             && startup_update_checked
             && !UPDATE_PROMPT_DONE.load(Ordering::Relaxed)
         {
-            match acquire_ui_control(paths, &ui_owner_label(), "Review desktop update") {
-                Ok(_lease) => {
-                    UPDATE_PROMPT_DONE.store(true, Ordering::Relaxed);
-                    match maybe_prompt_if_newer(paths, true).await? {
-                        Some(UpgradeOffer::ExitAfterInstall) => return Ok(0),
-                        Some(UpgradeOffer::Continue | UpgradeOffer::Failed(_)) => continue,
-                        None => {}
-                    }
-                }
-                Err(UiControlError::Busy(_)) => {}
-                Err(error) => warn(&format!(
-                    "Could not review desktop updates under the shared control lock: {error}"
-                )),
+            UPDATE_PROMPT_DONE.store(true, Ordering::Relaxed);
+            match maybe_prompt_if_newer(paths, true).await? {
+                Some(UpgradeOffer::ExitAfterInstall) => return Ok(0),
+                Some(UpgradeOffer::Continue | UpgradeOffer::Failed(_)) => continue,
+                None => {}
             }
         }
 
@@ -2396,39 +2257,6 @@ pub async fn interactive_menu(paths: &AppPaths, help_text: &str) -> io::Result<i
                 continue;
             }
             return Ok(0);
-        };
-
-        let operation = match choice.to_ascii_lowercase().as_str() {
-            "1" => Some("Connect by region"),
-            "2" => Some("Browse and connect to a relay"),
-            "3" => Some("List countries"),
-            "4" => Some("Connection status"),
-            "5" => Some("Change watchdog"),
-            "6" => Some("Disconnect"),
-            "7" => Some("Refresh relay cache"),
-            "8" => Some("Discover mirrors"),
-            "9" => Some("Run diagnostics"),
-            _ => None,
-        };
-        let _ui_control_lease = if let Some(operation) = operation {
-            match acquire_ui_control(paths, &ui_owner_label(), operation) {
-                Ok(lease) => Some(lease),
-                Err(UiControlError::Busy(control)) => {
-                    warn(&format!(
-                        "Observe-only: {} is running {} ({}). Wait for it to finish before using this console.",
-                        control.owner, control.operation, control.phase
-                    ));
-                    let _ = prompt_input("\nPress Enter to return to the Dashboard...");
-                    continue;
-                }
-                Err(error) => {
-                    err(&format!("Could not acquire shared UI control: {error}"));
-                    let _ = prompt_input("\nPress Enter to return to the Dashboard...");
-                    continue;
-                }
-            }
-        } else {
-            None
         };
 
         match choice.to_ascii_lowercase().as_str() {
@@ -2464,6 +2292,7 @@ pub async fn interactive_menu(paths: &AppPaths, help_text: &str) -> io::Result<i
                     force_refresh: false,
                     auto_reconnect_override: None,
                     custom_mirrors: Vec::new(),
+                    cancel_file: None,
                 };
                 let rc = cmd_connect(paths, &cargs).await?;
                 pause_for_dashboard(rc);
@@ -2530,6 +2359,7 @@ pub async fn interactive_menu(paths: &AppPaths, help_text: &str) -> io::Result<i
                     force_refresh: false,
                     auto_reconnect_override: None,
                     custom_mirrors: Vec::new(),
+                    cancel_file: None,
                 };
                 let rc = cmd_connect(paths, &cargs).await?;
                 pause_for_dashboard(rc);
@@ -2599,47 +2429,10 @@ pub async fn interactive_menu(paths: &AppPaths, help_text: &str) -> io::Result<i
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
     use std::fs;
 
-    use super::{cmd_reset_cooldowns, poll_observer_log, quote_windows_arg};
+    use super::{cmd_reset_cooldowns, quote_windows_arg};
     use vpngate_core::{AppPaths, CooldownStore, VpnProtocol, load_cooldowns, now_unix_secs};
-
-    #[test]
-    fn observer_log_tails_incrementally_and_recovers_after_truncation() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "vpngate-cli-observer-{}-{nonce}.log",
-            std::process::id()
-        ));
-        fs::write(&path, "Connect started\nrelay".as_bytes()).unwrap();
-        let mut offset = 0;
-        let mut pending = Vec::new();
-        let mut output = VecDeque::new();
-        poll_observer_log(&path, &mut offset, &mut pending, &mut output).unwrap();
-        assert_eq!(
-            output.iter().map(String::as_str).collect::<Vec<_>>(),
-            ["Connect started"]
-        );
-
-        fs::write(&path, "Connect started\nrelay ready\n".as_bytes()).unwrap();
-        poll_observer_log(&path, &mut offset, &mut pending, &mut output).unwrap();
-        assert_eq!(
-            output.iter().map(String::as_str).collect::<Vec<_>>(),
-            ["Connect started", "relay ready"]
-        );
-
-        fs::write(&path, "New GUI session\n".as_bytes()).unwrap();
-        poll_observer_log(&path, &mut offset, &mut pending, &mut output).unwrap();
-        assert_eq!(
-            output.iter().map(String::as_str).collect::<Vec<_>>(),
-            ["New GUI session"]
-        );
-        fs::remove_file(path).unwrap();
-    }
 
     #[test]
     fn cooldown_reset_command_clears_saved_penalties() {

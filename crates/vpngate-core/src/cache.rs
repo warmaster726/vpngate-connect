@@ -96,14 +96,17 @@ pub struct AppPaths {
     pub l2tp_resolv_bak: PathBuf,
     pub l2tp_run_dir: PathBuf,
     pub update_check: PathBuf,
-    /// Shared cross-process exclusive UI controller lease and progress state.
-    pub ui_control: PathBuf,
-    /// Append-only output stream mirrored by the GUI's read-only terminal companion.
-    pub ui_observer_log: PathBuf,
 }
 
 impl AppPaths {
     pub fn with_base_dir(cache_dir: PathBuf) -> Self {
+        let cache_dir = if cache_dir.is_absolute() {
+            cache_dir
+        } else {
+            env::current_dir()
+                .map(|current_dir| current_dir.join(&cache_dir))
+                .unwrap_or(cache_dir)
+        };
         let l2tp_run_dir = if cfg!(target_os = "linux") {
             PathBuf::from("/run/vpngate-l2tp")
         } else {
@@ -125,19 +128,15 @@ impl AppPaths {
             l2tp_route: cache_dir.join("l2tp_route.json"),
             l2tp_resolv_bak: cache_dir.join("resolv.conf.bak"),
             update_check: cache_dir.join("update_check.json"),
-            ui_control: cache_dir.join("ui-control.json"),
-            ui_observer_log: cache_dir.join("ui-observer.log"),
             l2tp_run_dir,
             cache_dir,
         }
     }
 
-    pub fn resolve() -> Self {
-        let cache_dir = if let Ok(override_dir) = env::var("VPNGATE_CACHE_DIR")
-            && !override_dir.trim().is_empty()
-        {
-            PathBuf::from(override_dir)
-        } else if cfg!(target_os = "windows") {
+    /// Stable per-user cache location, independent of the `VPNGATE_CACHE_DIR` override.
+    /// Interactive frontends always contend on this path as well as any selected cache.
+    pub fn default_cache_dir() -> PathBuf {
+        if cfg!(target_os = "windows") {
             env::var("LOCALAPPDATA")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| resolve_user_home().join("AppData").join("Local"))
@@ -149,6 +148,16 @@ impl AppPaths {
                 .join("vpngate")
         } else {
             resolve_user_home().join(".cache").join("vpngate")
+        }
+    }
+
+    pub fn resolve() -> Self {
+        let cache_dir = if let Ok(override_dir) = env::var("VPNGATE_CACHE_DIR")
+            && !override_dir.trim().is_empty()
+        {
+            PathBuf::from(override_dir)
+        } else {
+            Self::default_cache_dir()
         };
 
         Self::with_base_dir(cache_dir)

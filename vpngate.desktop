@@ -1,14 +1,14 @@
 [Desktop Entry]
 Version=1.0
 Type=Application
-Name=VPN Gate
+Name=VPN Gate Connect
 GenericName=VPN Gate Client & Region Connector
-Comment=Dynamic-resizing SoftEther VPN Gate Client (Auto: L2TP/IPsec -> OVPN UDP -> OVPN TCP)
+Comment=Traditional VPN Gate console dashboard in a native GTK/VTE window
 Exec=/usr/local/bin/vpngate-launcher
 Icon=vpngate
 Terminal=false
-Categories=System;Security;
-Keywords=vpn;vpngate;l2tp;ipsec;xfrm;openvpn;kali;rust;
+Categories=Network;Security;
+Keywords=vpn;vpngate;l2tp;ipsec;openvpn;console;
 StartupNotify=true
 Actions=ConnectJPAuto;ConnectJPL2TP;ConnectJPOVPNUDP;Countries;Mirrors;Status;Doctor;Disconnect;
 

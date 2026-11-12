@@ -26,7 +26,6 @@ use crate::protocol::{
     OpenVpnCompat, ProtocolFilter, SortBy, TargetPlatform, VpnProtocol, WindowsOvpnDriver,
 };
 use crate::server::{VpnServer, filter_by_country, filter_by_protocol, sort_servers};
-use crate::ui_control::wait_for_ui_control_cancel;
 
 pub const NM_PROFILE_PREFIX: &str = "vpngate-";
 pub const WIN_VPN_PROFILE_NAME: &str = "VPNGate-L2TP";
@@ -2160,6 +2159,23 @@ pub struct ConnectSessionConfig {
     pub start_index: usize,
     pub auto_reconnect: bool,
     pub in_monitor: bool,
+    /// Optional one-operation cancellation marker supplied by a controlling GUI.
+    pub cancel_file: Option<PathBuf>,
+}
+
+/// Wait for a GUI-owned, operation-specific cancellation marker. With no marker
+/// configured this future remains pending, so terminal Ctrl+C stays independent.
+pub async fn wait_for_cancel_file(path: Option<&Path>) {
+    let Some(path) = path else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    loop {
+        if path.is_file() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 /// Attempts connection across ranked `candidates` with plain text log callback.
@@ -2207,7 +2223,7 @@ pub async fn engage_candidates_with_progress(
     let outcome = tokio::select! {
         biased;
         _ = tokio::signal::ctrl_c() => None,
-        _ = wait_for_ui_control_cancel(paths) => None,
+        _ = wait_for_cancel_file(cfg.cancel_file.as_deref()) => None,
         rc = engage_candidates_body(paths, candidates, cfg, &mut on_progress) => Some(rc),
     };
     match outcome {
@@ -2649,6 +2665,7 @@ pub async fn run_monitor_daemon(paths: &AppPaths) -> i32 {
             start_index: 1,
             auto_reconnect: true,
             in_monitor: true,
+            cancel_file: None,
         };
         let _ = engage_candidates(paths, &cands, &cfg, |msg| append_monitor_log(paths, msg)).await;
     }

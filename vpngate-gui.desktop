@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=VPN Gate Connect GUI
+GenericName=VPN Gate Client
+Comment=Native graphical VPN Gate client with light and dark themes
+Exec=/usr/local/bin/vpngate-gui
+Icon=vpngate
+Terminal=false
+Categories=Network;Security;
+Keywords=vpn;vpngate;l2tp;ipsec;openvpn;gui;
+StartupNotify=true

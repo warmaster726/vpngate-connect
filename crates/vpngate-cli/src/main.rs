@@ -17,15 +17,15 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 
 use commands::{
-    ConnectArgs, UpgradeOffer, acquire_command_control, cmd_connect, cmd_countries, cmd_disconnect,
-    cmd_doctor_with_update, cmd_list, cmd_mirrors, cmd_probe, cmd_refresh, cmd_reset_cooldowns,
-    cmd_status, cmd_upgrade, cmd_watchdog, interactive_menu, set_no_elevate_requested,
-    set_skip_update_check, set_uac_already_attempted,
+    ConnectArgs, UpgradeOffer, cmd_connect, cmd_countries, cmd_disconnect, cmd_doctor_with_update,
+    cmd_list, cmd_mirrors, cmd_probe, cmd_refresh, cmd_reset_cooldowns, cmd_status, cmd_upgrade,
+    cmd_watchdog, interactive_menu, set_no_elevate_requested, set_skip_update_check,
+    set_uac_already_attempted,
 };
 use term_ui::{err, init_console, print_line, prompt_input, set_dynamic_resize, set_screen_clear};
 use vpngate_core::{
-    AppPaths, PRODUCT_VERSION, ProtocolFilter, SortBy, UiControlError,
-    assert_supported_native_host, run_ikev1_daemon, run_monitor_daemon, tunnel_aid_dns_cli,
+    AppPaths, PRODUCT_VERSION, ProtocolFilter, SortBy, assert_supported_native_host,
+    run_ikev1_daemon, run_monitor_daemon, tunnel_aid_dns_cli,
 };
 
 fn build_help_text() -> String {
@@ -71,14 +71,17 @@ fn build_help_text() -> String {
                --no-resize       Disable dynamic terminal window resize sequences\n\
                --no-clear        Do not clear previous screen items before command execution\n\
                --no-update-check Skip the dashboard scan for a newer desktop\n\
-               --observe         Open a read-only live terminal companion for GUI operations\n\
            -y, --yes             With `update`/`upgrade`, install without an extra confirmation prompt\n\
            -h, --help            Print this help message\n",
         PRODUCT_VERSION
     )
 }
 
-fn delegate_to_window_launcher(paths: &AppPaths, raw_args: &[String]) -> i32 {
+fn delegate_to_window_launcher(
+    paths: &AppPaths,
+    default_cache_dir: &Path,
+    raw_args: &[String],
+) -> i32 {
     let filtered: Vec<String> = raw_args
         .iter()
         .filter(|a| a.as_str() != "-w" && a.as_str() != "--window")
@@ -91,22 +94,22 @@ fn delegate_to_window_launcher(paths: &AppPaths, raw_args: &[String]) -> i32 {
             err("Could not determine vpngate executable path.");
             return 1;
         };
-        let is_observer = filtered.iter().any(|a| a == "--observe");
         let is_interactive = filtered.is_empty()
-            || is_observer
             || filtered
                 .iter()
                 .any(|a| matches!(a.as_str(), "-i" | "--interactive" | "menu" | "interactive"));
         let mut launch_args = vec![
             "--cache-dir".to_string(),
             paths.cache_dir.display().to_string(),
+            "--interactive-default-cache-dir".to_string(),
+            default_cache_dir.display().to_string(),
         ];
         launch_args.extend(filtered);
         if !is_interactive {
             launch_args.push("--hold".to_string());
         }
 
-        if !is_observer && !vpngate_core::is_root_or_admin() && !commands::no_elevate_requested() {
+        if !vpngate_core::is_root_or_admin() && !commands::no_elevate_requested() {
             let mut uac_args = vec!["--uac-elevated".to_string()];
             uac_args.extend_from_slice(&launch_args);
             if commands::win_uac::run_elevated(&self_exe, &uac_args, false).is_ok() {
@@ -149,7 +152,6 @@ fn delegate_to_window_launcher(paths: &AppPaths, raw_args: &[String]) -> i32 {
 
     #[cfg(not(windows))]
     {
-        let _ = paths;
         let self_dir = env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
@@ -168,7 +170,11 @@ fn delegate_to_window_launcher(paths: &AppPaths, raw_args: &[String]) -> i32 {
         };
 
         let mut cmd = std::process::Command::new(launcher);
-        if !filtered.is_empty() && !filtered.iter().any(|arg| arg == "--observe") {
+        cmd.arg("--cache-dir")
+            .arg(&paths.cache_dir)
+            .arg("--interactive-default-cache-dir")
+            .arg(default_cache_dir);
+        if !filtered.is_empty() {
             cmd.arg("--hold");
         }
         cmd.args(&filtered);
@@ -188,11 +194,10 @@ async fn dispatch() -> io::Result<i32> {
         return Ok(1);
     }
 
-    // Pre-scan global cache/window/UAC flags and the private shared-control token.
+    // Pre-scan global cache/window/UAC flags.
     let mut cache_dir_override: Option<PathBuf> = None;
+    let mut interactive_default_cache_dir: Option<PathBuf> = None;
     let mut hold_on_exit = false;
-    let mut control_token = env::var("VPNGATE_UI_CONTROL_TOKEN").ok();
-    let mut report_ui_control_protocol = false;
     let mut raw_args: Vec<String> = Vec::with_capacity(raw_all.len());
     let mut idx = 0usize;
     while idx < raw_all.len() {
@@ -205,22 +210,22 @@ async fn dispatch() -> io::Result<i32> {
                     cache_dir_override = Some(PathBuf::from(dir));
                 }
             }
+            "--interactive-default-cache-dir" => {
+                idx += 1;
+                if let Some(dir) = raw_all.get(idx)
+                    && !dir.trim().is_empty()
+                {
+                    interactive_default_cache_dir = Some(PathBuf::from(dir));
+                } else {
+                    err("--interactive-default-cache-dir requires a path.");
+                    return Ok(2);
+                }
+            }
             "--hold" => {
                 hold_on_exit = true;
             }
             "--uac-elevated" => {
                 set_uac_already_attempted(true);
-            }
-            "--ui-control-token" => {
-                idx += 1;
-                if let Some(token) = raw_all.get(idx)
-                    && !token.trim().is_empty()
-                {
-                    control_token = Some(token.clone());
-                }
-            }
-            "--ui-control-protocol-version" => {
-                report_ui_control_protocol = true;
             }
             "--no-elevate" | "--read-only" => {
                 set_no_elevate_requested(true);
@@ -237,13 +242,9 @@ async fn dispatch() -> io::Result<i32> {
         Some(dir) => AppPaths::with_base_dir(dir),
         None => AppPaths::resolve(),
     };
-    term_ui::set_ui_control_paths(paths.clone());
-
-    if report_ui_control_protocol {
-        print_line(&vpngate_core::UI_CONTROL_PROTOCOL_VERSION.to_string());
-        return Ok(0);
-    }
-
+    let default_cache_dir =
+        interactive_default_cache_dir.unwrap_or_else(AppPaths::default_cache_dir);
+    let interactive_instance_token = env::var("VPNGATE_INTERACTIVE_INSTANCE_TOKEN").ok();
     // Internal background daemons (exact match with Python v5.3 architecture)
     if raw_args.first().map(String::as_str) == Some("_monitor") {
         return Ok(run_monitor_daemon(&paths).await);
@@ -252,10 +253,20 @@ async fn dispatch() -> io::Result<i32> {
         return Ok(run_ikev1_daemon(&raw_args[1], Path::new(&raw_args[2])).await);
     }
     if raw_args.iter().any(|a| a == "-w" || a == "--window") {
-        return Ok(delegate_to_window_launcher(&paths, &raw_args));
+        return Ok(delegate_to_window_launcher(
+            &paths,
+            &default_cache_dir,
+            &raw_args,
+        ));
     }
 
-    let rc = dispatch_commands(&paths, &raw_args, control_token.as_deref()).await?;
+    let rc = dispatch_commands(
+        &paths,
+        &raw_args,
+        &default_cache_dir,
+        interactive_instance_token.as_deref(),
+    )
+    .await?;
     if hold_on_exit && term_ui::is_stdout_tty() {
         let _ = prompt_input("\nPress Enter to close this window...");
     }
@@ -265,29 +276,18 @@ async fn dispatch() -> io::Result<i32> {
 async fn dispatch_commands(
     paths: &AppPaths,
     raw_args: &[String],
-    control_token: Option<&str>,
+    default_cache_dir: &Path,
+    interactive_instance_token: Option<&str>,
 ) -> io::Result<i32> {
     let help_text = build_help_text();
-    if raw_args.iter().any(|arg| arg == "--observe") {
-        if raw_args
-            .iter()
-            .any(|arg| !matches!(arg.as_str(), "--observe" | "--no-resize" | "--no-clear"))
-        {
-            err(
-                "The read-only --observe mode cannot be combined with a command or connection options.",
-            );
-            return Ok(2);
-        }
-        if raw_args.iter().any(|arg| arg == "--no-resize") {
-            set_dynamic_resize(false);
-        }
-        if raw_args.iter().any(|arg| arg == "--no-clear") {
-            set_screen_clear(false);
-        }
-        return commands::interactive_observer(paths);
-    }
     if raw_args.is_empty() {
-        return interactive_menu(paths, &help_text).await;
+        return interactive_menu(
+            paths,
+            &help_text,
+            default_cache_dir,
+            interactive_instance_token,
+        )
+        .await;
     }
 
     let mut subcmd = String::new();
@@ -302,6 +302,7 @@ async fn dispatch_commands(
     let mut force_refresh = false;
     let mut auto_reconnect_override: Option<bool> = None;
     let mut custom_mirrors: Vec<String> = Vec::new();
+    let mut cancel_file: Option<PathBuf> = None;
     let mut flag_interactive = false;
     let mut flag_countries = false;
     let mut flag_list = false;
@@ -397,6 +398,15 @@ async fn dispatch_commands(
                     custom_mirrors.push(v.clone());
                 }
             }
+            "--cancel-file" => {
+                i += 1;
+                if let Some(v) = raw_args.get(i) {
+                    cancel_file = Some(PathBuf::from(v));
+                } else {
+                    err("Missing value for --cancel-file.");
+                    return Ok(2);
+                }
+            }
             other if !other.starts_with('-') && subcmd.is_empty() => {
                 subcmd = other.to_ascii_lowercase();
             }
@@ -422,7 +432,13 @@ async fn dispatch_commands(
     let sort_by = SortBy::from_cli_str(&sort_str).unwrap_or(SortBy::Recommended);
 
     if flag_interactive || matches!(subcmd.as_str(), "menu" | "interactive") {
-        return interactive_menu(paths, &help_text).await;
+        return interactive_menu(
+            paths,
+            &help_text,
+            default_cache_dir,
+            interactive_instance_token,
+        )
+        .await;
     }
 
     let operation =
@@ -458,24 +474,15 @@ async fn dispatch_commands(
         } else {
             None
         };
-    let Some(operation) = operation else {
-        return interactive_menu(paths, &help_text).await;
-    };
-    let _ui_control_access = match acquire_command_control(paths, operation, control_token) {
-        Ok(access) => access,
-        Err(UiControlError::Busy(control)) => {
-            err(&format!(
-                "Observe-only: {} is controlling {} ({}). Wait until that operation finishes, then retry.",
-                control.owner, control.operation, control.phase
-            ));
-            return Ok(75);
-        }
-        Err(error) => {
-            err(&format!("Cannot enter shared UI control: {error}"));
-            return Ok(2);
-        }
-    };
-
+    if operation.is_none() {
+        return interactive_menu(
+            paths,
+            &help_text,
+            default_cache_dir,
+            interactive_instance_token,
+        )
+        .await;
+    }
     if flag_disconnect || matches!(subcmd.as_str(), "disconnect" | "down" | "stop" | "d") {
         return cmd_disconnect(paths).await;
     }
@@ -554,6 +561,7 @@ async fn dispatch_commands(
             force_refresh,
             auto_reconnect_override,
             custom_mirrors,
+            cancel_file,
         };
         return cmd_connect(paths, &cargs).await;
     }
@@ -561,7 +569,13 @@ async fn dispatch_commands(
         return cmd_refresh(paths, &custom_mirrors).await;
     }
 
-    interactive_menu(paths, &help_text).await
+    interactive_menu(
+        paths,
+        &help_text,
+        default_cache_dir,
+        interactive_instance_token,
+    )
+    .await
 }
 
 #[tokio::main]

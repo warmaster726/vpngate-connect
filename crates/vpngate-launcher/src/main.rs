@@ -32,7 +32,7 @@ mod linux {
         Orientation, STYLE_PROVIDER_PRIORITY_APPLICATION,
     };
     use pango::FontDescription;
-    use vpngate_core::{AppPaths, ui_control_status};
+    use vpngate_core::{AppPaths, InteractiveInstanceError, acquire_interactive_instances};
     use vte4::prelude::*;
     use vte4::{PtyFlags, Terminal};
 
@@ -65,11 +65,6 @@ mod linux {
             border: 1px solid rgba(210, 153, 34, 0.50); border-radius: 999px;
             padding: 2px 10px; font-size: 9pt; font-weight: 700;
         }
-        label.pill-control {
-            background-color: rgba(210, 153, 34, 0.16); color: #e3b341;
-            border: 1px solid rgba(210, 153, 34, 0.44); border-radius: 999px;
-            padding: 2px 8px; font-size: 8pt; font-weight: 700;
-        }
         button.ip-chip {
             background-image: none; background-color: #1f2937; color: #79c0ff;
             border: 1px solid #30363d; border-radius: 6px; padding: 1px 8px;
@@ -80,14 +75,68 @@ mod linux {
 
     pub fn run() {
         let mut hold = false;
+        let mut cache_dir_override = None;
+        let mut default_cache_dir_override = None;
         let mut passthrough = Vec::new();
-        for a in env::args().skip(1) {
-            if a == "--hold" {
-                hold = true;
-            } else {
-                passthrough.push(a);
+        let mut args = env::args().skip(1);
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--hold" => hold = true,
+                "--cache-dir" => {
+                    let Some(value) = args.next() else {
+                        eprintln!("vpngate-launcher: --cache-dir requires a path");
+                        std::process::exit(2);
+                    };
+                    let cache_dir = AppPaths::with_base_dir(PathBuf::from(&value)).cache_dir;
+                    cache_dir_override = Some(cache_dir.clone());
+                    passthrough.push(arg);
+                    passthrough.push(cache_dir.display().to_string());
+                }
+                "--interactive-default-cache-dir" => {
+                    let Some(value) = args.next() else {
+                        eprintln!(
+                            "vpngate-launcher: --interactive-default-cache-dir requires a path"
+                        );
+                        std::process::exit(2);
+                    };
+                    let default_cache_dir =
+                        AppPaths::with_base_dir(PathBuf::from(&value)).cache_dir;
+                    default_cache_dir_override = Some(default_cache_dir.clone());
+                    passthrough.push(arg);
+                    passthrough.push(default_cache_dir.display().to_string());
+                }
+                _ => passthrough.push(arg),
             }
         }
+        let selected_paths = cache_dir_override
+            .map(AppPaths::with_base_dir)
+            .unwrap_or_else(AppPaths::resolve);
+        if !passthrough.iter().any(|arg| arg == "--cache-dir") {
+            passthrough.push("--cache-dir".to_string());
+            passthrough.push(selected_paths.cache_dir.display().to_string());
+        }
+        let default_cache_dir =
+            default_cache_dir_override.unwrap_or_else(AppPaths::default_cache_dir);
+        let mut startup_notice = None;
+        let instance_guards = match acquire_interactive_instances(
+            &selected_paths,
+            &default_cache_dir,
+        ) {
+            Ok(guards) => guards,
+            Err(InteractiveInstanceError::AlreadyRunning) => {
+                startup_notice = Some(
+                    "Another VPN Gate Connect frontend is already open. Close it before starting this one.".to_string(),
+                );
+                Vec::new()
+            }
+            Err(error) => {
+                startup_notice = Some(format!("Could not start the traditional frontend: {error}"));
+                Vec::new()
+            }
+        };
+        let handoff_token = instance_guards
+            .first()
+            .map(|guard| guard.handoff_token().to_string());
 
         let vpngate_bin = match resolve_vpngate_bin() {
             Ok(p) => p,
@@ -97,14 +146,59 @@ mod linux {
             }
         };
 
-        let app = Application::builder().application_id(APP_ID).build();
+        // A duplicate launch must show its own notice, not activate the existing
+        // GApplication and accidentally open another terminal window.
+        let application_id = if startup_notice.is_some() {
+            format!("{APP_ID}.notice.{}", std::process::id())
+        } else {
+            APP_ID.to_string()
+        };
+        let app = Application::builder()
+            .application_id(&application_id)
+            .build();
         app.connect_activate(move |app| {
-            if let Err(e) = build_window(app, &vpngate_bin, &passthrough, hold) {
+            if let Some(message) = &startup_notice {
+                show_startup_notice(app, message);
+            } else if let Err(e) = build_window(
+                app,
+                &vpngate_bin,
+                &passthrough,
+                hold,
+                handoff_token.as_deref().unwrap_or_default(),
+                &default_cache_dir,
+            ) {
                 eprintln!("vpngate-launcher: {e}");
                 app.quit();
             }
         });
+        let _instance_guards = instance_guards;
         app.run_with_args(&[] as &[&str]);
+    }
+
+    fn show_startup_notice(app: &Application, message: &str) {
+        let window = ApplicationWindow::builder()
+            .application(app)
+            .title("VPN Gate Connect")
+            .default_width(440)
+            .default_height(150)
+            .build();
+        let content = GtkBox::new(Orientation::Vertical, 14);
+        content.set_margin_start(20);
+        content.set_margin_end(20);
+        content.set_margin_top(20);
+        content.set_margin_bottom(20);
+        content.append(&Label::new(Some(message)));
+        let close = Button::with_label("Close");
+        let app_quit = app.clone();
+        close.connect_clicked(move |_| app_quit.quit());
+        content.append(&close);
+        window.set_child(Some(&content));
+        let app_quit = app.clone();
+        window.connect_close_request(move |_| {
+            app_quit.quit();
+            glib::Propagation::Proceed
+        });
+        window.present();
     }
 
     fn resolve_vpngate_bin() -> Result<PathBuf, String> {
@@ -139,6 +233,8 @@ mod linux {
         vpngate_bin: &Path,
         passthrough: &[String],
         hold: bool,
+        handoff_token: &str,
+        default_cache_dir: &Path,
     ) -> Result<(), String> {
         if let Some(settings) = gtk4::Settings::default() {
             settings.set_gtk_application_prefer_dark_theme(true);
@@ -155,21 +251,17 @@ mod linux {
 
         let win = ApplicationWindow::builder()
             .application(app)
-            .title("VPN Gate")
+            .title("VPN Gate Connect")
             .build();
         win.set_icon_name(Some("vpngate"));
 
         let header = HeaderBar::new();
         let status = Label::new(Some("○ DISCONNECTED"));
         status.add_css_class("pill-off");
-        let controller_status = Label::new(None);
-        controller_status.add_css_class("pill-control");
-        controller_status.set_visible(false);
         let ip_chip = Button::with_label("");
         ip_chip.add_css_class("ip-chip");
         ip_chip.set_visible(false);
         header.pack_start(&status);
-        header.pack_start(&controller_status);
         header.pack_end(&ip_chip);
         win.set_titlebar(Some(&header));
 
@@ -214,7 +306,8 @@ mod linux {
             format!("TERM=xterm-256color"),
             format!("COLORTERM=truecolor"),
             format!("VPNGATE_RESIZE_SOCK={}", sock_path.display()),
-            "VPNGATE_UI_NAME=GTK terminal".to_string(),
+            format!("VPNGATE_CACHE_DIR={}", default_cache_dir.display()),
+            format!("VPNGATE_INTERACTIVE_INSTANCE_TOKEN={handoff_token}"),
         ];
         let envv_refs: Vec<&str> = envv.iter().map(String::as_str).collect();
         let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
@@ -236,13 +329,12 @@ mod linux {
         );
 
         let status_l = status.clone();
-        let controller_l = controller_status.clone();
         let ip_l = ip_chip.clone();
         glib::timeout_add_local(Duration::from_millis(1000), move || {
-            refresh_header(&status_l, &controller_l, &ip_l);
+            refresh_header(&status_l, &ip_l);
             ControlFlow::Continue
         });
-        refresh_header(&status, &controller_status, &ip_chip);
+        refresh_header(&status, &ip_chip);
 
         let ip_copy = ip_chip.clone();
         ip_chip.connect_clicked(move |_| {
@@ -303,7 +395,7 @@ mod linux {
         win.set_default_size(px_w, px_h);
     }
 
-    fn refresh_header(status: &Label, controller: &Label, ip_chip: &Button) {
+    fn refresh_header(status: &Label, ip_chip: &Button) {
         let snap = read_fast_tunnel_snapshot();
         status.set_text(&snap.badge);
         status.remove_css_class("pill-off");
@@ -314,12 +406,6 @@ mod linux {
             "reconnecting" => "pill-warn",
             _ => "pill-off",
         });
-        if let Some(badge) = snap.control {
-            controller.set_text(&badge);
-            controller.set_visible(true);
-        } else {
-            controller.set_visible(false);
-        }
         if snap.ip.is_empty() {
             ip_chip.set_visible(false);
         } else {
@@ -332,18 +418,9 @@ mod linux {
         mode: String,
         badge: String,
         ip: String,
-        control: Option<String>,
     }
 
     fn read_fast_tunnel_snapshot() -> Snap {
-        let control = ui_control_status(&AppPaths::resolve()).map(|state| {
-            let mode = if state.owner == "GTK terminal" {
-                "BUSY"
-            } else {
-                "OBSERVE ONLY"
-            };
-            format!("{mode} · {}: {}", state.owner, state.operation)
-        });
         let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
         let state = Path::new(&home).join(".cache/vpngate/active_state.json");
         let vpn_devs = list_vpn_devs();
@@ -359,7 +436,6 @@ mod linux {
                     mode: "reconnecting".into(),
                     badge: format!("↻ RECONNECTING · {region}"),
                     ip: String::new(),
-                    control,
                 };
             }
             let dev = st.get("device").and_then(|v| v.as_str()).unwrap_or("");
@@ -379,7 +455,6 @@ mod linux {
                     mode: "connected".into(),
                     badge: format!("● CONNECTED · {cc} ({host}) · {proto}"),
                     ip: egress,
-                    control,
                 };
             }
         }
@@ -388,14 +463,12 @@ mod linux {
                 mode: "connected".into(),
                 badge: format!("● TUNNEL UP ({dev})"),
                 ip: String::new(),
-                control,
             };
         }
         Snap {
             mode: "disconnected".into(),
             badge: "○ DISCONNECTED".into(),
             ip: String::new(),
-            control,
         }
     }
 

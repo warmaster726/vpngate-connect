@@ -19,11 +19,11 @@ pub mod doh;
 pub mod error;
 pub mod ikev1;
 pub mod ikev1_daemon;
+pub mod interactive_instance;
 pub mod parser;
 pub mod profile;
 pub mod protocol;
 pub mod server;
-pub mod ui_control;
 pub mod update;
 
 pub use cache::{
@@ -44,7 +44,7 @@ pub use desktop_tunnel::{
     find_openvpn_bin, get_default_gateway, get_ppp_interfaces, get_running_monitor_pid,
     get_running_openvpn_pid, get_tun_interfaces, is_root_or_admin, probe_linux_l2tp_kernel_support,
     prune_stale_state_if_dead, query_windows_natt_rule, run_monitor_daemon,
-    spawn_auto_reconnect_monitor, stop_monitor_daemon, which_bin,
+    spawn_auto_reconnect_monitor, stop_monitor_daemon, wait_for_cancel_file, which_bin,
 };
 pub use discovery::{
     DiscoveryClient, DiscoveryOptions, DiscoveryOutcome, MirrorProbeResult, ProgressEvent,
@@ -57,6 +57,10 @@ pub use doh::{is_poisoned_ip, is_poisoned_ipv4, resolve_ipv4_via_cloudflare_doh}
 pub use error::{CoreError, Result};
 pub use ikev1::{L2tpVerifyOutcome, probe_tcp, sweep_ikev1_sa_responders, verify_l2tp_psk_vpn};
 pub use ikev1_daemon::{run_ikev1_crypto_self_test, run_ikev1_daemon};
+pub use interactive_instance::{
+    InteractiveInstanceError, InteractiveInstanceGuard, acquire_interactive_instance,
+    acquire_interactive_instances, validate_interactive_instance_handoff,
+};
 pub use parser::{
     OfficialMirrorSite, normalize_mirror_base_url, parse_sdise_csv_into, parse_vpngate_csv_into,
     parse_vpngate_html_into, parse_vpngate_mirror_sites_html,
@@ -67,12 +71,6 @@ pub use protocol::{
 };
 pub use server::{
     VpnServer, filter_by_country, filter_by_protocol, sort_servers, split_country_query,
-};
-pub use ui_control::{
-    UI_CONTROL_PROTOCOL_VERSION, UiControlAccess, UiControlError, UiControlExecutorGuard,
-    UiControlLease, UiControlSnapshot, acquire_ui_control, join_ui_control,
-    report_ui_control_phase, ui_control_cancel_requested, ui_control_status,
-    ui_control_token_for_process, wait_for_ui_control_cancel,
 };
 pub use update::{
     DesktopVersion, PRODUCT_VERSION, RemoteDesktopVersion, UpdateCheckCache, cache_is_fresh,

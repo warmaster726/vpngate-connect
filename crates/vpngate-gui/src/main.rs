@@ -3,38 +3,37 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
 use eframe::egui::{self, Color32, RichText};
 use vpngate_core::cache::ServerCacheFile;
 use vpngate_core::{
-    ActiveSessionState, AppPaths, PRODUCT_VERSION, ProtocolFilter, RemoteDesktopVersion, SortBy,
-    UI_CONTROL_PROTOCOL_VERSION, UiControlError, UiControlLease, UiControlSnapshot, VpnServer,
-    acquire_ui_control, cpu_isa_label, detect_host_os_label, filter_by_country, filter_by_protocol,
-    installed_desktop_version, is_root_or_admin, load_cached_mirrors, load_update_cache,
-    now_unix_secs, read_json_opt, record_update_declined, refresh_update_cache, should_auto_prompt,
-    sort_servers, summarize_countries, tunnel_aid_dns_cli, ui_control_status,
+    ActiveSessionState, AppPaths, InteractiveInstanceError, PRODUCT_VERSION, ProtocolFilter,
+    RemoteDesktopVersion, SortBy, VpnServer, acquire_interactive_instances, cpu_isa_label,
+    detect_host_os_label, filter_by_country, filter_by_protocol, installed_desktop_version,
+    is_root_or_admin, load_cached_mirrors, load_update_cache, now_unix_secs, read_json_opt,
+    record_update_declined, refresh_update_cache, should_auto_prompt, sort_servers,
+    summarize_countries, tunnel_aid_dns_cli,
 };
 
 const APP_ID: &str = "net.vpngate.connect";
 const ACTIVE_STATE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const IDLE_STATE_POLL_INTERVAL: Duration = Duration::from_secs(15);
 const CACHE_POLL_INTERVAL: Duration = Duration::from_secs(60);
-const BUSY_CACHE_POLL_INTERVAL: Duration = Duration::from_secs(3);
-const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(700);
 const MAX_RELAY_ROWS: usize = 100;
 const MAX_LOG_LINES: usize = 600;
-const MAX_UI_OBSERVER_LOG_BYTES: u64 = 2 * 1024 * 1024;
+static CANCEL_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 fn main() -> eframe::Result {
     if let Err(error) = vpngate_core::assert_supported_native_host() {
@@ -42,19 +41,74 @@ fn main() -> eframe::Result {
         std::process::exit(2);
     }
 
+    let paths = AppPaths::resolve();
+    let default_cache_dir = AppPaths::default_cache_dir();
+    let instance_guards = match acquire_interactive_instances(&paths, &default_cache_dir) {
+        Ok(guards) => guards,
+        Err(InteractiveInstanceError::AlreadyRunning) => {
+            return run_startup_notice(
+                "Another VPN Gate Connect frontend is already open. Close it before starting this one.",
+            );
+        }
+        Err(error) => {
+            return run_startup_notice(&format!("Could not start VPN Gate Connect GUI: {error}"));
+        }
+    };
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("VPN Gate Connect")
+            .with_title("VPN Gate Connect GUI")
             .with_inner_size([1080.0, 760.0])
             .with_min_inner_size([820.0, 620.0]),
         ..Default::default()
     };
 
-    eframe::run_native(
+    let result = eframe::run_native(
         APP_ID,
         options,
         Box::new(|cc| Ok(Box::new(GuiApp::new(cc)))),
+    );
+    drop(instance_guards);
+    result
+}
+
+fn run_startup_notice(message: &str) -> eframe::Result {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("VPN Gate Connect")
+            .with_inner_size([480.0, 190.0])
+            .with_min_inner_size([420.0, 170.0]),
+        ..Default::default()
+    };
+    let message = message.to_string();
+    eframe::run_native(
+        "net.vpngate.connect.notice",
+        options,
+        Box::new(move |_| Ok(Box::new(InstanceNoticeApp { message }))),
     )
+}
+
+struct InstanceNoticeApp {
+    message: String,
+}
+
+impl eframe::App for InstanceNoticeApp {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        ctx.request_repaint_after(Duration::from_secs(3600));
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        ui.vertical_centered(|ui| {
+            ui.add_space(18.0);
+            ui.heading("Could not start VPN Gate Connect");
+            ui.add_space(10.0);
+            ui.label(&self.message);
+            ui.add_space(16.0);
+            if ui.button("Close").clicked() {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        });
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,9 +138,7 @@ impl Page {
             }
             Self::Relays => "Browse, filter, list, and start a connection from a ranked relay",
             Self::Tools => "Manage relay discovery, diagnostics, and connection preferences",
-            Self::Activity => {
-                "Live tunnel state, shared control, system checks, and recent activity"
-            }
+            Self::Activity => "Live tunnel state, system checks, and recent activity",
         }
     }
 
@@ -149,6 +201,7 @@ struct CommandWorker {
     started_at: Instant,
     cancellable: bool,
     cancel_requested: bool,
+    cancel_file: Option<PathBuf>,
 }
 
 struct GuiApp {
@@ -168,13 +221,9 @@ struct GuiApp {
     selected_relay_ip: Option<String>,
     last_state_poll: Instant,
     last_cache_poll: Instant,
-    last_control_poll: Instant,
-    control_status: Option<UiControlSnapshot>,
-    control_lease: Option<UiControlLease>,
     worker: Option<CommandWorker>,
     command_log: VecDeque<String>,
     status_message: String,
-    observer_status: String,
     host_label: String,
     native_arch: &'static str,
     elevated: bool,
@@ -210,7 +259,6 @@ impl GuiApp {
 
         let paths = AppPaths::resolve();
         let (cli_binary, cli_notice) = resolve_cli_binary();
-        let observer_status = start_legacy_observer(cli_binary.as_deref(), &paths, "started");
         let mut app = Self {
             paths,
             cli_binary,
@@ -228,13 +276,9 @@ impl GuiApp {
             selected_relay_ip: None,
             last_state_poll: Instant::now(),
             last_cache_poll: Instant::now(),
-            last_control_poll: Instant::now(),
-            control_status: None,
-            control_lease: None,
             worker: None,
             command_log: VecDeque::new(),
             status_message: String::new(),
-            observer_status,
             host_label: detect_host_os_label(),
             native_arch: cpu_isa_label(),
             elevated: is_root_or_admin(),
@@ -264,7 +308,6 @@ impl GuiApp {
         };
         app.reload_session();
         app.reload_cache();
-        app.control_status = ui_control_status(&app.paths);
         app
     }
 
@@ -285,76 +328,14 @@ impl GuiApp {
         self.last_cache_poll = Instant::now();
     }
 
-    fn reload_control(&mut self) {
-        self.control_status = ui_control_status(&self.paths);
-        self.last_control_poll = Instant::now();
-    }
-
     fn actions_blocked(&self) -> bool {
         self.worker.is_some()
-            || self.control_lease.is_some()
-            || self
-                .control_status
-                .as_ref()
-                .is_some_and(|state| state.owner_pid != std::process::id())
     }
 
     fn action_service_notice(&self) -> &str {
         self.cli_notice.as_deref().unwrap_or(
-            "The synchronized desktop action service is unavailable. Install the desktop components together and restart this app.",
+            "The VPN Gate Connect command-line action service was not found. Install it beside this app or make it available in PATH.",
         )
-    }
-
-    fn control_badge(&self) -> Option<(String, Color32)> {
-        if let Some(worker) = &self.worker {
-            return Some((
-                format!("RUNNING · {}", worker.operation),
-                Color32::from_rgb(53, 132, 228),
-            ));
-        }
-        self.control_status.as_ref().and_then(|state| {
-            (state.owner_pid != std::process::id()).then(|| {
-                (
-                    format!("OBSERVE ONLY · {}: {}", state.owner, state.operation),
-                    Color32::from_rgb(190, 125, 30),
-                )
-            })
-        })
-    }
-
-    fn control_banner(&self, ui: &mut egui::Ui) {
-        if let Some(state) = self.control_status.as_ref()
-            && state.owner_pid != std::process::id()
-        {
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.colored_label(
-                        Color32::from_rgb(190, 125, 30),
-                        RichText::new("OBSERVE ONLY").strong(),
-                    );
-                    ui.label(format!(
-                        "{} is running {} — {}. Controls unlock when that window finishes.",
-                        state.owner, state.operation, state.phase
-                    ));
-                });
-            });
-            ui.add_space(8.0);
-        } else if let Some(worker) = &self.worker {
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.colored_label(
-                        Color32::from_rgb(53, 132, 228),
-                        RichText::new("GUI HAS CONTROL").strong(),
-                    );
-                    ui.label(format!(
-                        "{} · elapsed {}s",
-                        worker.operation,
-                        worker.started_at.elapsed().as_secs()
-                    ));
-                });
-            });
-            ui.add_space(8.0);
-        }
     }
 
     fn available_countries(&self) -> Vec<(String, String)> {
@@ -468,47 +449,41 @@ impl GuiApp {
         cancellable: bool,
         requires_privilege: bool,
     ) {
-        if self.actions_blocked() {
-            self.status_message =
-                "Another UI currently owns the shared control lock; this window is observe-only."
-                    .to_string();
+        if self.worker.is_some() {
+            self.status_message = "An operation is already running in this window.".to_string();
             return;
         }
         let Some(cli_binary) = self.cli_binary.clone() else {
             self.status_message = self.action_service_notice().to_string();
             return;
         };
-
-        let lease = match acquire_ui_control(&self.paths, "GUI", operation) {
-            Ok(lease) => lease,
-            Err(UiControlError::Busy(state)) => {
-                self.control_status = Some(state.clone());
-                self.status_message = format!(
-                    "Observe-only: {} is running {} ({}).",
-                    state.owner, state.operation, state.phase
-                );
-                return;
-            }
-            Err(error) => {
-                self.status_message =
-                    format!("Could not acquire the shared UI control lock: {error}");
-                return;
-            }
-        };
-        let token = lease.token().to_string();
-        lease.set_phase("Starting desktop operation");
-        self.command_log.clear();
-        self.push_log(format!("Starting {operation}…"));
-        let _ = append_observer_log(&self.paths, &format!("=== GUI started {operation} ==="));
-        self.status_message.clear();
-        self.control_lease = Some(lease);
-        self.reload_control();
+        if let Err(error) = fs::create_dir_all(&self.paths.cache_dir) {
+            self.status_message =
+                format!("Could not prepare the VPN Gate cache directory: {error}");
+            return;
+        }
 
         let paths = self.paths.clone();
+        let cancel_file = cancellable.then(|| unique_cancel_file_path(&paths));
+        if let Some(path) = &cancel_file {
+            let _ = fs::remove_file(path);
+        }
+        self.command_log.clear();
+        self.push_log(format!("Starting {operation}…"));
+        self.status_message.clear();
+
         let (sender, receiver) = mpsc::channel();
         let worker_operation = operation.to_string();
+        let worker_cancel_file = cancel_file.clone();
         thread::spawn(move || {
-            run_cli_command(cli_binary, args, paths, token, requires_privilege, sender);
+            run_cli_command(
+                cli_binary,
+                args,
+                paths,
+                cancel_file,
+                requires_privilege,
+                sender,
+            );
         });
         self.worker = Some(CommandWorker {
             receiver,
@@ -516,32 +491,17 @@ impl GuiApp {
             started_at: Instant::now(),
             cancellable,
             cancel_requested: false,
+            cancel_file: worker_cancel_file,
         });
     }
 
     fn start_update_check(&mut self, mode: UpdateCheckMode) {
-        if self.worker.is_some() || self.control_lease.is_some() {
+        if self.worker.is_some() {
             return;
         }
-        let lease = match acquire_ui_control(&self.paths, "GUI", "Check desktop updates") {
-            Ok(lease) => lease,
-            Err(UiControlError::Busy(state)) => {
-                self.control_status = Some(state);
-                return;
-            }
-            Err(error) => {
-                self.pending_update_check = None;
-                self.status_message = format!("Could not start the update check: {error}");
-                return;
-            }
-        };
-        lease.set_phase("Checking the public desktop version");
-        self.control_lease = Some(lease);
         self.command_log.clear();
         self.push_log("Checking for desktop updates…".to_string());
-        let _ = append_observer_log(&self.paths, "=== GUI started desktop update check ===");
         self.status_message.clear();
-        self.reload_control();
 
         let paths = self.paths.clone();
         let (sender, receiver) = mpsc::channel();
@@ -564,34 +524,45 @@ impl GuiApp {
             started_at: Instant::now(),
             cancellable: false,
             cancel_requested: false,
+            cancel_file: None,
         });
         self.pending_update_check = None;
     }
 
     fn cancel_connect(&mut self) {
-        let can_cancel = self
-            .worker
-            .as_ref()
-            .is_some_and(|worker| worker.cancellable && !worker.cancel_requested);
-        if !can_cancel {
+        let Some(worker) = self.worker.as_ref() else {
+            return;
+        };
+        if !worker.cancellable || worker.cancel_requested {
             return;
         }
-        let requested = self
-            .control_lease
-            .as_ref()
-            .is_some_and(UiControlLease::request_cancel);
-        if requested {
-            if let Some(worker) = &mut self.worker {
-                worker.cancel_requested = true;
+        let Some(path) = worker.cancel_file.clone() else {
+            self.status_message = "The connect cancellation channel is unavailable.".to_string();
+            return;
+        };
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(path) {
+            Ok(_) => {
+                if let Some(worker) = &mut self.worker {
+                    worker.cancel_requested = true;
+                }
+                let message =
+                    "Cancellation requested — tunnel changes will be rolled back before returning.";
+                self.push_log(message.to_string());
+                self.status_message = "Cancelling and rolling back…".to_string();
             }
-            let message =
-                "Cancellation requested — tunnel changes will be rolled back before returning.";
-            let _ = append_observer_log(&self.paths, message);
-            self.push_log(message.to_string());
-            self.status_message = "Cancelling and rolling back…".to_string();
-            self.reload_control();
-        } else {
-            self.status_message = "The shared cancellation request could not be sent.".to_string();
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if let Some(worker) = &mut self.worker {
+                    worker.cancel_requested = true;
+                }
+                self.status_message = "Cancellation requested — rolling back…".to_string();
+            }
+            Err(error) => {
+                self.status_message = format!("The connect cancellation request failed: {error}");
+            }
         }
     }
 
@@ -764,15 +735,11 @@ impl GuiApp {
             .map(|worker| worker.receiver.try_iter().collect())
             .unwrap_or_default();
         let mut finished = false;
-        let mut latest_phase = None;
-        let mut observer_output = Vec::new();
         for event in events {
             match event {
                 CommandEvent::Output(line) => {
                     let clean = strip_ansi(&line);
                     if !clean.trim().is_empty() {
-                        observer_output.push(clean.clone());
-                        latest_phase = Some(clean.clone());
                         self.push_log(clean);
                     }
                 }
@@ -786,7 +753,6 @@ impl GuiApp {
                                 "Desktop update v{} is available; installing it is strongly recommended.",
                                 remote.raw
                             );
-                            observer_output.push(message.clone());
                             self.push_log(message.clone());
                             self.status_message = message;
                             self.update_offer = Some(remote);
@@ -796,14 +762,12 @@ impl GuiApp {
                                 "Desktop update v{} is available; its reminder is snoozed after your earlier choice.",
                                 remote.raw
                             );
-                            observer_output.push(message.clone());
                             self.push_log(message.clone());
                             self.status_message = message;
                         }
                     } else {
                         let message =
                             format!("VPN Gate Connect is up to date (v{PRODUCT_VERSION}).");
-                        observer_output.push(message.clone());
                         self.push_log(message.clone());
                         self.status_message = message;
                     }
@@ -811,7 +775,6 @@ impl GuiApp {
                 }
                 CommandEvent::UpdateCheck(_, Err(error)) => {
                     let message = format!("Desktop update check did not complete: {error}");
-                    observer_output.push(message.clone());
                     self.push_log(message.clone());
                     self.status_message = message;
                     finished = true;
@@ -823,11 +786,8 @@ impl GuiApp {
                         .map(|worker| worker.operation.as_str())
                         .unwrap_or("Action");
                     let message = action_result_message(operation, code);
-                    observer_output.push(message.clone());
                     if code != 0 {
-                        let detail = format!("Technical result status: {code}");
-                        observer_output.push(detail.clone());
-                        self.push_log(detail);
+                        self.push_log(format!("Technical result status: {code}"));
                     }
                     self.push_log(message.clone());
                     self.status_message = message;
@@ -840,29 +800,27 @@ impl GuiApp {
                         .map(|worker| worker.operation.as_str())
                         .unwrap_or("Action");
                     let message = format!("Could not start {operation}: {error}");
-                    observer_output.push(message.clone());
                     self.push_log(message.clone());
                     self.status_message = message;
                     finished = true;
                 }
             }
         }
-        if !observer_output.is_empty() {
-            let _ = append_observer_log(&self.paths, &observer_output.join("\n"));
-        }
-        if let (Some(phase), Some(lease)) = (latest_phase, self.control_lease.as_ref()) {
-            lease.set_phase(phase.chars().take(180).collect::<String>());
-        }
         if finished {
             let update_after_doctor = self
                 .worker
                 .as_ref()
                 .is_some_and(|worker| worker.operation == "System diagnostics");
+            if let Some(path) = self
+                .worker
+                .as_ref()
+                .and_then(|worker| worker.cancel_file.as_ref())
+            {
+                let _ = fs::remove_file(path);
+            }
             self.worker = None;
-            self.control_lease = None;
             self.reload_session();
             self.reload_cache();
-            self.reload_control();
             if update_after_doctor {
                 self.pending_update_check = Some(UpdateCheckMode::Diagnostics);
             }
@@ -958,10 +916,6 @@ impl GuiApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 self.appearance_picker(ui, ctx);
                 ui.add_space(12.0);
-                if let Some((label, color)) = self.control_badge() {
-                    ui.colored_label(color, RichText::new(label).strong());
-                    ui.add_space(12.0);
-                }
                 let (label, color) = self.status_badge();
                 ui.colored_label(color, RichText::new(label).strong());
             });
@@ -1027,10 +981,6 @@ impl GuiApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let (label, color) = self.status_badge();
                 ui.colored_label(color, RichText::new(label).strong());
-                if let Some((label, color)) = self.control_badge() {
-                    ui.add_space(12.0);
-                    ui.colored_label(color, RichText::new(label).strong());
-                }
             });
         });
     }
@@ -1063,7 +1013,6 @@ impl GuiApp {
         ui.heading(self.page.title());
         ui.label(RichText::new(self.page.subtitle()).weak());
         ui.add_space(10.0);
-        self.control_banner(ui);
 
         match self.page {
             Page::Connect => self.connect_page(ui),
@@ -1663,7 +1612,7 @@ impl GuiApp {
 
     fn activity_page(&mut self, ui: &mut egui::Ui) {
         egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.label(RichText::new("Host and shared state").strong());
+            ui.label(RichText::new("Host and app state").strong());
             egui::Grid::new("host_details")
                 .num_columns(2)
                 .spacing([18.0, 7.0])
@@ -1713,46 +1662,19 @@ impl GuiApp {
                             "No session file"
                         },
                     );
-                    detail_row(ui, "Original UI observer", &self.observer_status);
                     ui.end_row();
                 });
         });
-        let mut reopen_observer = false;
-        ui.horizontal(|ui| {
-            reopen_observer = ui.button("Open another terminal observer").clicked();
-            ui.label(
-                RichText::new("Read-only CLI view; mirrors GUI operations and output.").weak(),
-            );
-        });
-        if reopen_observer {
-            self.observer_status =
-                start_legacy_observer(self.cli_binary.as_deref(), &self.paths, "reopened");
-        }
-        ui.add_space(10.0);
         egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.label(RichText::new("Shared controller").strong());
-            if let Some(control) = &self.control_status {
-                ui.label(format!(
-                    "{} · {} · {}",
-                    control.owner, control.operation, control.phase
-                ));
-                ui.label(
-                    RichText::new(format!(
-                        "Since {} · owner process {}",
-                        control.started_at, control.owner_pid
-                    ))
-                    .weak()
-                    .small(),
-                );
-            } else {
-                ui.label("No UI currently owns the shared exclusive-control lock.");
-            }
+            ui.label(RichText::new("Current GUI operation").strong());
             if let Some(worker) = &self.worker {
                 ui.label(format!(
-                    "This GUI operation: {} ({}s)",
+                    "{} · elapsed {}s",
                     worker.operation,
                     worker.started_at.elapsed().as_secs()
                 ));
+            } else {
+                ui.label("No operation is currently running in this window.");
             }
         });
         ui.add_space(10.0);
@@ -1782,14 +1704,7 @@ impl eframe::App for GuiApp {
         if self.last_state_poll.elapsed() >= self.session_poll_interval() {
             self.reload_session();
         }
-        if self.last_control_poll.elapsed() >= CONTROL_POLL_INTERVAL {
-            self.reload_control();
-        }
-        let cache_interval = if self.control_status.is_some() {
-            BUSY_CACHE_POLL_INTERVAL
-        } else {
-            CACHE_POLL_INTERVAL
-        };
+        let cache_interval = CACHE_POLL_INTERVAL;
         if matches!(self.page, Page::Relays | Page::Tools | Page::Activity)
             && self.last_cache_poll.elapsed() >= cache_interval
         {
@@ -1797,16 +1712,12 @@ impl eframe::App for GuiApp {
         }
         if let Some(mode) = self.pending_update_check
             && self.worker.is_none()
-            && self.control_lease.is_none()
-            && self.control_status.is_none()
         {
             self.start_update_check(mode);
         }
 
         let state_interval = self.session_poll_interval();
         let mut next_repaint = state_interval.saturating_sub(self.last_state_poll.elapsed());
-        next_repaint = next_repaint
-            .min(CONTROL_POLL_INTERVAL.saturating_sub(self.last_control_poll.elapsed()));
         if matches!(self.page, Page::Relays | Page::Tools | Page::Activity) {
             next_repaint =
                 next_repaint.min(cache_interval.saturating_sub(self.last_cache_poll.elapsed()));
@@ -2037,10 +1948,10 @@ fn action_result_message(operation: &str, code: i32) -> String {
     match code {
         0 => format!("{operation} completed."),
         2 => format!(
-            "{operation} was rejected. Expand Technical details to see the reason; if service compatibility is reported, update both desktop components."
+            "{operation} was rejected. Expand Technical details to see the command-line reason."
         ),
         75 => format!(
-            "{operation} did not start because another app window currently controls the connection. Wait for it to finish, then retry."
+            "{operation} did not start because another VPN Gate Connect frontend is already running. Close it and retry."
         ),
         _ => format!(
             "{operation} did not complete (status {code}). Expand Technical details for more information."
@@ -2082,298 +1993,44 @@ fn resolve_cli_binary() -> (Option<PathBuf>, Option<String>) {
     }
 
     let mut seen = HashSet::new();
-    let mut found_candidate = false;
-    let mut unsupported_protocol = None;
-    let mut probe_failure = None;
     for path in candidates {
-        if !path.is_file() || !seen.insert(path.clone()) {
-            continue;
-        }
-        found_candidate = true;
-        match probe_ui_control_protocol(&path) {
-            Ok(version) if protocol_version_compatible(version) => return (Some(path), None),
-            Ok(version) => unsupported_protocol = Some(version),
-            Err(error) => probe_failure = Some(error),
+        if path.is_file() && seen.insert(path.clone()) {
+            return (Some(path), None);
         }
     }
-
-    let notice = if let Some(version) = unsupported_protocol {
-        format!(
-            "The installed desktop service uses synchronization protocol {version}, but this app requires protocol {UI_CONTROL_PROTOCOL_VERSION}. Update or install the desktop components together, then restart this app."
-        )
-    } else if found_candidate {
-        format!(
-            "An installed desktop service could not confirm shared-control support ({}). Update or install the desktop components together, then restart this app.",
-            probe_failure.unwrap_or_else(|| "compatibility check failed".to_string())
-        )
-    } else {
-        "The synchronized desktop action service was not found. Install it beside this app or make it available in PATH.".to_string()
-    };
-    (None, Some(notice))
+    (
+        None,
+        Some("The VPN Gate Connect CLI action service was not found. Install it beside this app or make it available in PATH.".to_string()),
+    )
 }
 
-fn start_legacy_observer(cli_binary: Option<&Path>, paths: &AppPaths, reason: &str) -> String {
-    let Some(cli_binary) = cli_binary else {
-        return "Not started — the compatible desktop CLI was not found.".to_string();
-    };
-    if !cli_supports_observer(cli_binary) {
-        return "Not started — update the desktop CLI component to enable live observation."
-            .to_string();
-    }
-    if let Err(error) = append_observer_log(
-        paths,
-        &format!("=== GUI {reason}; launching read-only CLI observer ==="),
-    ) {
-        return format!("Not started — could not prepare the shared output log: {error}");
-    }
-    match launch_legacy_observer_window(cli_binary, paths) {
-        Ok(window) => format!("Running in {window} (observe-only)"),
-        Err(error) => {
-            let message = format!("Could not launch the CLI observer: {error}");
-            let _ = append_observer_log(paths, &message);
-            message
-        }
-    }
-}
-
-fn cli_supports_observer(cli_binary: &Path) -> bool {
-    let mut command = Command::new(cli_binary);
-    command
-        .arg("--help")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    #[cfg(windows)]
-    command.creation_flags(0x0800_0000);
-
-    command.output().is_ok_and(|output| {
-        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("--observe")
-    })
-}
-
-fn append_observer_log(paths: &AppPaths, message: &str) -> std::io::Result<()> {
-    fs::create_dir_all(&paths.cache_dir)?;
-    if fs::metadata(&paths.ui_observer_log)
-        .is_ok_and(|metadata| metadata.len() > MAX_UI_OBSERVER_LOG_BYTES)
-    {
-        fs::write(
-            &paths.ui_observer_log,
-            "=== Older GUI output trimmed to keep the observer log bounded ===\n",
-        )?;
-    }
-
-    let mut options = OpenOptions::new();
-    options.create(true).append(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options.open(&paths.ui_observer_log)?;
-    #[cfg(unix)]
-    fs::set_permissions(&paths.ui_observer_log, fs::Permissions::from_mode(0o600))?;
-
-    for line in message.lines() {
-        writeln!(file, "{}", line.trim_end_matches('\r'))?;
-    }
-    file.flush()
-}
-
-#[cfg(any(target_os = "linux", target_os = "windows"))]
-fn add_observer_cli_args(command: &mut Command, cli_binary: &Path, paths: &AppPaths) {
-    command
-        .arg(cli_binary)
-        .arg("--cache-dir")
-        .arg(&paths.cache_dir)
-        .arg("--observe");
-}
-
-#[cfg(target_os = "linux")]
-fn launch_legacy_observer_window(
-    cli_binary: &Path,
-    paths: &AppPaths,
-) -> Result<&'static str, String> {
-    let mut launcher_candidates = Vec::new();
-    if let Some(directory) = cli_binary.parent() {
-        launcher_candidates.push(directory.join("vpngate-launcher"));
-    }
-    if let Ok(executable) = std::env::current_exe()
-        && let Some(directory) = executable.parent()
-    {
-        launcher_candidates.push(directory.join("vpngate-launcher"));
-    }
-    launcher_candidates.push(PathBuf::from("/usr/local/bin/vpngate-launcher"));
-    if let Some(path) = vpngate_core::which_bin("vpngate-launcher") {
-        launcher_candidates.push(path);
-    }
-
-    if let Some(launcher) = launcher_candidates.into_iter().find(|path| path.is_file()) {
-        let mut command = Command::new(launcher);
-        command
-            .arg("--cache-dir")
-            .arg(&paths.cache_dir)
-            .arg("--observe")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        if command.spawn().is_ok() {
-            return Ok("the GTK/VTE window");
-        }
-    }
-
-    let terminal_candidates: [(&str, &[&str]); 4] = [
-        (
-            "gnome-terminal",
-            &["--wait", "--title", "VPN Gate Observer", "--"],
-        ),
-        (
-            "konsole",
-            &["--separate", "--title", "VPN Gate Observer", "-e"],
-        ),
-        ("x-terminal-emulator", &["-T", "VPN Gate Observer", "-e"]),
-        ("xterm", &["-T", "VPN Gate Observer", "-e"]),
-    ];
-    for (binary, prefix) in terminal_candidates {
-        let Some(path) = vpngate_core::which_bin(binary) else {
-            continue;
-        };
-        let mut command = Command::new(path);
-        command.args(prefix);
-        add_observer_cli_args(&mut command, cli_binary, paths);
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        if command.spawn().is_ok() {
-            return Ok("a terminal window");
-        }
-    }
-    Err("no GTK/VTE launcher or supported terminal emulator was found".to_string())
-}
-
-#[cfg(target_os = "windows")]
-fn launch_legacy_observer_window(
-    cli_binary: &Path,
-    paths: &AppPaths,
-) -> Result<&'static str, String> {
-    if let Some(windows_terminal) =
-        vpngate_core::which_bin("wt.exe").or_else(|| vpngate_core::which_bin("wt"))
-    {
-        let mut command = Command::new(windows_terminal);
-        command.args(["-w", "new", "--title", "VPN Gate Observer"]);
-        add_observer_cli_args(&mut command, cli_binary, paths);
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .creation_flags(0x0800_0000);
-        if command.spawn().is_ok() {
-            return Ok("Windows Terminal");
-        }
-    }
-
-    let powershell = vpngate_core::which_bin("powershell.exe")
-        .or_else(|| vpngate_core::which_bin("powershell"))
-        .unwrap_or_else(|| PathBuf::from("powershell.exe"));
-    let command_line = format!(
-        "& {} {} {} {}",
-        powershell_quote(&cli_binary.display().to_string()),
-        powershell_quote("--cache-dir"),
-        powershell_quote(&paths.cache_dir.display().to_string()),
-        powershell_quote("--observe"),
-    );
-    let mut command = Command::new(powershell);
-    command
-        .args(["-NoLogo", "-NoExit", "-Command", &command_line])
-        .creation_flags(0x0000_0010);
-    command
-        .spawn()
-        .map_err(|error| format!("could not open Windows Terminal or PowerShell: {error}"))?;
-    Ok("a PowerShell window")
-}
-
-#[cfg_attr(not(windows), allow(dead_code))]
-fn powershell_quote(argument: &str) -> String {
-    format!("'{}'", argument.replace('\'', "''"))
-}
-
-#[cfg(target_os = "macos")]
-fn launch_legacy_observer_window(
-    cli_binary: &Path,
-    paths: &AppPaths,
-) -> Result<&'static str, String> {
-    let command_line = [
-        cli_binary.display().to_string(),
-        "--cache-dir".to_string(),
-        paths.cache_dir.display().to_string(),
-        "--observe".to_string(),
-    ]
-    .iter()
-    .map(|argument| shell_quote(argument))
-    .collect::<Vec<_>>()
-    .join(" ");
-    let script = format!(
-        "tell application \"Terminal\"\nactivate\ndo script \"{}\"\nend tell",
-        applescript_escape(&command_line)
-    );
-    let mut command = Command::new("/usr/bin/osascript");
-    command
-        .args(["-e", &script])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    command
-        .spawn()
-        .map_err(|error| format!("could not open the macOS Terminal observer: {error}"))?;
-    Ok("the macOS Terminal window")
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-fn launch_legacy_observer_window(
-    _cli_binary: &Path,
-    _paths: &AppPaths,
-) -> Result<&'static str, String> {
-    Err("automatic terminal observers are not supported on this operating system".to_string())
-}
-
-fn probe_ui_control_protocol(binary: &Path) -> Result<u32, String> {
-    let mut command = Command::new(binary);
-    command
-        .arg("--ui-control-protocol-version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    #[cfg(windows)]
-    command.creation_flags(0x0800_0000);
-
-    let output = command
-        .output()
-        .map_err(|error| format!("could not launch the service: {error}"))?;
-    if !output.status.success() {
-        return Err("service does not support the shared-control handshake".to_string());
-    }
-    parse_ui_control_protocol_output(&String::from_utf8_lossy(&output.stdout))
-        .ok_or_else(|| "service returned an invalid synchronization protocol version".to_string())
-}
-
-fn parse_ui_control_protocol_output(output: &str) -> Option<u32> {
-    output.trim().parse().ok()
-}
-
-fn protocol_version_compatible(version: u32) -> bool {
-    version == UI_CONTROL_PROTOCOL_VERSION
+fn unique_cancel_file_path(paths: &AppPaths) -> PathBuf {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let sequence = CANCEL_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    paths.cache_dir.join(format!(
+        "gui-cancel-{}-{timestamp}-{sequence}.flag",
+        std::process::id()
+    ))
 }
 
 fn build_cli_command(
     cli_binary: &Path,
     args: &[String],
     paths: &AppPaths,
-    token: &str,
+    cancel_file: Option<&Path>,
     requires_privilege: bool,
 ) -> Command {
     let mut cli_args = vec![
         "--cache-dir".to_string(),
         paths.cache_dir.display().to_string(),
-        "--ui-control-token".to_string(),
-        token.to_string(),
     ];
+    if let Some(path) = cancel_file {
+        cli_args.push("--cancel-file".to_string());
+        cli_args.push(path.display().to_string());
+    }
     cli_args.extend_from_slice(args);
     #[cfg(target_os = "windows")]
     let _ = requires_privilege;
@@ -2429,14 +2086,18 @@ fn run_cli_command(
     cli_binary: PathBuf,
     args: Vec<String>,
     paths: AppPaths,
-    token: String,
+    cancel_file: Option<PathBuf>,
     requires_privilege: bool,
     sender: Sender<CommandEvent>,
 ) {
-    let mut command = build_cli_command(&cli_binary, &args, &paths, &token, requires_privilege);
+    let mut command = build_cli_command(
+        &cli_binary,
+        &args,
+        &paths,
+        cancel_file.as_deref(),
+        requires_privilege,
+    );
     command
-        .env("VPNGATE_UI_NAME", "GUI")
-        .env("VPNGATE_UI_CONTROL_TOKEN", &token)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -2574,11 +2235,11 @@ fn strip_ansi(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        action_result_message, append_mirror_args, append_observer_log, connect_regions_fetch_args,
-        country_picker_label, format_age, parse_ui_control_protocol_output, protocol_labels,
-        protocol_version_compatible, relay_matches, selected_relay_start_index, strip_ansi,
+        action_result_message, append_mirror_args, connect_regions_fetch_args,
+        country_picker_label, format_age, protocol_labels, relay_matches,
+        selected_relay_start_index, strip_ansi,
     };
-    use vpngate_core::{AppPaths, ProtocolFilter, SortBy, VpnServer};
+    use vpngate_core::{ProtocolFilter, SortBy, VpnServer};
 
     fn server() -> VpnServer {
         VpnServer {
@@ -2703,34 +2364,6 @@ mod tests {
     }
 
     #[test]
-    fn observer_log_preserves_gui_output_lines() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let cache_dir = std::env::temp_dir().join(format!(
-            "vpngate-observer-test-{}-{nonce}",
-            std::process::id()
-        ));
-        let paths = AppPaths::with_base_dir(cache_dir.clone());
-        append_observer_log(&paths, "=== Connect started ===").unwrap();
-        append_observer_log(&paths, "[Attempt 1/2] Testing relay.example").unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&paths.ui_observer_log).unwrap(),
-            "=== Connect started ===\n[Attempt 1/2] Testing relay.example\n"
-        );
-        std::fs::remove_dir_all(cache_dir).unwrap();
-    }
-
-    #[test]
-    fn synchronized_action_service_protocol_is_checked_explicitly() {
-        assert_eq!(parse_ui_control_protocol_output("1\n"), Some(1));
-        assert_eq!(parse_ui_control_protocol_output("unknown option\n"), None);
-        assert!(protocol_version_compatible(1));
-        assert!(!protocol_version_compatible(2));
-    }
-
-    #[test]
     fn action_failures_are_explained_without_cli_exit_code_jargon() {
         let message = action_result_message("List relays", 2);
         assert!(message.contains("List relays was rejected"));
@@ -2762,10 +2395,9 @@ mod tests {
 
     #[test]
     fn terminal_arguments_are_escaped_for_windows_and_macos() {
-        use super::{applescript_escape, powershell_quote, shell_quote};
+        use super::{applescript_escape, shell_quote};
         assert_eq!(shell_quote("plain"), "'plain'");
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
-        assert_eq!(powershell_quote("a'b"), "'a''b'");
         assert_eq!(applescript_escape("\""), "\\\"");
     }
 }

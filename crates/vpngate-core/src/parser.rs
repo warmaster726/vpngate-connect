@@ -276,11 +276,7 @@ pub fn parse_vpngate_csv_into(csv_raw: &str, servers_by_ip: &mut BTreeMap<String
         let hostname = clean_hostname(&row[0], &ip);
         let operator = {
             let op = strip_markup(&row[12]);
-            if op.is_empty() {
-                String::new()
-            } else {
-                op
-            }
+            if op.is_empty() { String::new() } else { op }
         };
 
         if let Some(existing) = servers_by_ip.get_mut(&ip) {
@@ -356,11 +352,7 @@ pub fn parse_sdise_csv_into(csv_raw: &str, target_by_ip: &mut BTreeMap<String, V
 
         let (country_long, country_short) = normalize_country_pair(&strip_markup(&rec[0]), "");
         let host = strip_opengw_suffix(&strip_markup(&rec[1]));
-        let hostname = if host.is_empty() {
-            ip.clone()
-        } else {
-            host
-        };
+        let hostname = if host.is_empty() { ip.clone() } else { host };
         let speed_bps = rec[3]
             .trim()
             .parse::<f64>()

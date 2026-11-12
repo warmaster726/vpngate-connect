@@ -1,10 +1,9 @@
 use std::collections::HashMap;
 use std::env;
 use std::io::{self, IsTerminal, Write};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use vpngate_core::{AppPaths, ProgressEvent, report_ui_control_phase};
+use vpngate_core::ProgressEvent;
 
 pub const RESET: &str = "\x1b[0m";
 pub const BOLD: &str = "\x1b[1m";
@@ -21,11 +20,6 @@ static DYNAMIC_RESIZE_ENABLED: AtomicBool = AtomicBool::new(true);
 static SCREEN_CLEAR_ENABLED: AtomicBool = AtomicBool::new(true);
 static LAST_TRANSIENT_VIS_LEN: AtomicUsize = AtomicUsize::new(0);
 static WIN_VT_ENABLED: AtomicBool = AtomicBool::new(!cfg!(windows));
-static UI_CONTROL_PATHS: OnceLock<AppPaths> = OnceLock::new();
-
-pub fn set_ui_control_paths(paths: AppPaths) {
-    let _ = UI_CONTROL_PATHS.set(paths);
-}
 
 #[cfg(windows)]
 mod win_console {
@@ -432,36 +426,8 @@ pub fn format_thousands_u64(n: u64) -> String {
     out.chars().rev().collect()
 }
 
-fn report_ui_control_progress(ev: &ProgressEvent) {
-    let Some(paths) = UI_CONTROL_PATHS.get() else {
-        return;
-    };
-    let phase = match ev {
-        ProgressEvent::Info(message) => Some(message.clone()),
-        ProgressEvent::Ok(message) => Some(message.clone()),
-        ProgressEvent::Warn(message) => Some(message.clone()),
-        ProgressEvent::AttemptBanner {
-            index,
-            total,
-            hostname,
-            ..
-        } => Some(format!("Testing relay {index}/{total}: {hostname}")),
-        ProgressEvent::Transient {
-            stage,
-            elapsed_secs,
-            tick,
-            ..
-        } if tick.is_multiple_of(5) => Some(format!("{stage} · {elapsed_secs}s")),
-        ProgressEvent::Transient { .. } | ProgressEvent::ClearTransient => None,
-    };
-    if let Some(phase) = phase {
-        report_ui_control_phase(paths, phase.chars().take(180).collect::<String>());
-    }
-}
-
 /// Renders live `ProgressEvent` items (`PY` branch style in-place counters + step logs).
 pub fn render_progress_event(ev: ProgressEvent) {
-    report_ui_control_progress(&ev);
     match ev {
         ProgressEvent::ClearTransient => clear_transient_line(),
         ProgressEvent::Info(m) => info(&m),
