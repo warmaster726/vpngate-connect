@@ -323,6 +323,12 @@ if ((-not $IsAdmin) -and (-not $UserOnly) -and (-not $ElevatedChild) -and $PSCom
     if ($KeepToolchain)   { $FwdArgs.Add('-KeepToolchain') }
     if ($RemoveToolchain) { $FwdArgs.Add('-RemoveToolchain') }
     if ($Repo)            { $FwdArgs.Add('-Repo'); $FwdArgs.Add($Repo) }
+    $ForwardBranch = $Branch
+    if ([string]::IsNullOrWhiteSpace($ForwardBranch)) { $ForwardBranch = $env:VPNGATE_BRANCH }
+    if (-not [string]::IsNullOrWhiteSpace($ForwardBranch)) {
+        $FwdArgs.Add('-Branch')
+        $FwdArgs.Add($ForwardBranch)
+    }
 
     try {
         $ElevProc = Start-Process -FilePath $PsHostExe -ArgumentList $FwdArgs.ToArray() -WorkingDirectory $CallerWorkDir -Verb RunAs -Wait -PassThru

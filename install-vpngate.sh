@@ -198,7 +198,23 @@ if [ "${MODE}" = "install" ]; then
 fi
 
 if [ "$(id -u)" -eq 0 ]; then
-  sudo() { "$@"; }
+  if ! command -v sudo >/dev/null 2>&1; then
+    sudo() {
+      if [ "${1:-}" = "-u" ]; then
+        [ "$#" -ge 2 ] || { echo "[!] sudo -u requires a user name." >&2; return 2; }
+        _sudo_target="$2"
+        shift 2
+        if command -v runuser >/dev/null 2>&1; then
+          runuser -u "${_sudo_target}" -- env "$@"
+        else
+          echo "[!] Cannot run a command as ${_sudo_target}: install sudo or runuser." >&2
+          return 127
+        fi
+      else
+        env "$@"
+      fi
+    }
+  fi
 elif ! command -v sudo >/dev/null 2>&1; then
   warn "Root privileges are required (and 'sudo' was not found). Please run as root."
   exit 1
