@@ -1,6 +1,16 @@
 use std::collections::HashMap;
 use std::env;
+use std::fs::OpenOptions;
 use std::io::{self, IsTerminal, Write};
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use vpngate_core::ProgressEvent;
@@ -18,6 +28,44 @@ pub const CYAN: &str = "\x1b[1;36m";
 
 static LAST_TRANSIENT_VIS_LEN: AtomicUsize = AtomicUsize::new(0);
 static WIN_VT_ENABLED: AtomicBool = AtomicBool::new(!cfg!(windows));
+static WORK_PROGRESS_FILE: OnceLock<PathBuf> = OnceLock::new();
+
+pub fn set_work_progress_file(path: PathBuf) {
+    let _ = WORK_PROGRESS_FILE.set(path);
+}
+
+pub fn work_progress_file() -> Option<PathBuf> {
+    WORK_PROGRESS_FILE.get().cloned()
+}
+
+fn append_work_progress_file(line: &str) {
+    let Some(path) = WORK_PROGRESS_FILE.get() else {
+        return;
+    };
+    append_work_progress_line(path, line);
+}
+
+fn append_work_progress_line(path: &Path, line: &str) {
+    let line = line.replace(['\r', '\n'], " ");
+    let mut options = OpenOptions::new();
+    options.write(true).append(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    #[cfg(windows)]
+    options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+
+    if let Ok(mut file) = options.open(path)
+        && let Ok(metadata) = file.metadata()
+        && metadata.is_file()
+    {
+        #[cfg(windows)]
+        if metadata.file_attributes() & 0x400 != 0 {
+            return;
+        }
+        let _ = writeln!(file, "{line}");
+        let _ = file.flush();
+    }
+}
 
 #[cfg(windows)]
 mod win_console {
@@ -364,6 +412,17 @@ pub fn render_progress_event(ev: ProgressEvent) {
         ProgressEvent::Info(m) => info(&m),
         ProgressEvent::Ok(m) => ok(&m),
         ProgressEvent::Warn(m) => warn(&m),
+        ProgressEvent::WorkProgress {
+            completed,
+            total,
+            stage,
+        } => {
+            let total = total.max(1);
+            let completed = completed.min(total);
+            append_work_progress_file(&format!("[Progress {completed}/{total}] {stage}"));
+            info(&format!("[Progress {completed}/{total}] {stage}"));
+            let _ = io::stdout().flush();
+        }
         ProgressEvent::AttemptBanner {
             index,
             total,
@@ -375,6 +434,9 @@ pub fn render_progress_event(ev: ProgressEvent) {
             ping_ms,
             score,
         } => {
+            append_work_progress_file(&format!(
+                "[Attempt {index}/{total}] Testing {hostname} ({ip}) | {country_short} ({country_long})"
+            ));
             clear_transient_line();
             let ping_tag = if ping_ms < 9999 {
                 format!("{ping_ms} ms")
@@ -878,5 +940,29 @@ mod tests {
     fn formats_durations_cleanly() {
         assert_eq!(format_duration(65), "01:05");
         assert_eq!(format_duration(3661), "01:01:01");
+    }
+
+    #[test]
+    fn progress_file_records_sanitized_plain_lines() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "vpngate-cli-progress-test-{}-{timestamp}.log",
+            std::process::id()
+        ));
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        append_work_progress_line(&path, "[Progress 1/2] first\nsecond");
+        append_work_progress_line(&path, "[Progress 2/2] finished");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[Progress 1/2] first second\n[Progress 2/2] finished\n"
+        );
+        let _ = std::fs::remove_file(path);
     }
 }

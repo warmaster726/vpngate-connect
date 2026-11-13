@@ -29,6 +29,12 @@ pub enum ProgressEvent {
     },
     /// Clears any active transient spinner line immediately.
     ClearTransient,
+    /// Exact ratio of completed tracked work units in an operation plan (not an elapsed-time estimate).
+    WorkProgress {
+        completed: usize,
+        total: usize,
+        stage: String,
+    },
     /// Permanent `[*] ...` informational step line.
     Info(String),
     /// Permanent `[+] ...` completion step line.

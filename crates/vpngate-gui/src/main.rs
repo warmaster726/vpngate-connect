@@ -2,8 +2,8 @@
 #![forbid(unsafe_code)]
 
 use std::collections::{HashSet, VecDeque};
-use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Read};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -202,12 +202,22 @@ struct CommandWorker {
     cancellable: bool,
     cancel_requested: bool,
     cancel_file: Option<PathBuf>,
+    progress_file: Option<PathBuf>,
+    progress_file_offset: u64,
+    progress_file_pending: Vec<u8>,
+}
+
+struct ParsedProgressUpdate {
+    fraction: Option<f32>,
+    work_units: Option<(usize, usize)>,
+    message: String,
 }
 
 struct OperationProgress {
     operation: String,
     message: String,
     fraction: Option<f32>,
+    work_units: Option<(usize, usize)>,
     completed: bool,
     succeeded: bool,
 }
@@ -218,6 +228,7 @@ impl OperationProgress {
             operation: operation.to_string(),
             message: format!("Starting {operation}…"),
             fraction: None,
+            work_units: None,
             completed: false,
             succeeded: false,
         }
@@ -490,6 +501,7 @@ impl GuiApp {
         if let Some(path) = &cancel_file {
             let _ = fs::remove_file(path);
         }
+        let progress_file = create_work_progress_file(&paths);
         self.command_log.clear();
         self.operation_progress = Some(OperationProgress::new(operation));
         self.push_log(format!("Starting {operation}…"));
@@ -498,12 +510,14 @@ impl GuiApp {
         let (sender, receiver) = mpsc::channel();
         let worker_operation = operation.to_string();
         let worker_cancel_file = cancel_file.clone();
+        let worker_progress_file = progress_file.clone();
         thread::spawn(move || {
             run_cli_command(
                 cli_binary,
                 args,
                 paths,
                 cancel_file,
+                worker_progress_file,
                 requires_privilege,
                 sender,
             );
@@ -515,6 +529,9 @@ impl GuiApp {
             cancellable,
             cancel_requested: false,
             cancel_file: worker_cancel_file,
+            progress_file,
+            progress_file_offset: 0,
+            progress_file_pending: Vec::new(),
         });
     }
 
@@ -549,6 +566,9 @@ impl GuiApp {
             cancellable: false,
             cancel_requested: false,
             cancel_file: None,
+            progress_file: None,
+            progress_file_offset: 0,
+            progress_file_pending: Vec::new(),
         });
         self.pending_update_check = None;
     }
@@ -751,6 +771,15 @@ impl GuiApp {
     }
 
     fn pump_command_events(&mut self) {
+        let progress_lines = self
+            .worker
+            .as_mut()
+            .map(read_worker_progress_file)
+            .unwrap_or_default();
+        for line in progress_lines {
+            self.update_operation_progress(&line);
+        }
+
         let events: Vec<CommandEvent> = self
             .worker
             .as_ref()
@@ -834,6 +863,13 @@ impl GuiApp {
             {
                 let _ = fs::remove_file(path);
             }
+            if let Some(path) = self
+                .worker
+                .as_ref()
+                .and_then(|worker| worker.progress_file.as_ref())
+            {
+                let _ = fs::remove_file(path);
+            }
             self.worker = None;
             self.reload_session();
             self.reload_cache();
@@ -844,12 +880,20 @@ impl GuiApp {
     }
 
     fn update_operation_progress(&mut self, line: &str) {
-        let Some((fraction, message)) = progress_update_from_output(line) else {
+        let Some(update) = progress_update_from_output(line) else {
             return;
         };
         if let Some(progress) = &mut self.operation_progress {
-            progress.fraction = fraction;
-            progress.message = message;
+            if work_progress_is_stale(progress.work_units, update.work_units) {
+                return;
+            }
+            if let Some(fraction) = update.fraction {
+                progress.fraction = Some(fraction);
+            }
+            if let Some(work_units) = update.work_units {
+                progress.work_units = Some(work_units);
+            }
+            progress.message = update.message;
         }
     }
 
@@ -887,6 +931,13 @@ impl GuiApp {
                 }
 
                 if let Some(fraction) = progress.fraction {
+                    if let Some((completed, total)) = progress.work_units {
+                        ui.label(
+                            RichText::new(format!("{completed}/{total} tracked steps"))
+                                .weak()
+                                .small(),
+                        );
+                    }
                     ui.add(
                         egui::ProgressBar::new(fraction)
                             .desired_width(ui.available_width())
@@ -2107,9 +2158,34 @@ fn compact_progress_message(message: &str) -> String {
     truncated
 }
 
-fn progress_update_from_output(line: &str) -> Option<(Option<f32>, String)> {
+fn work_progress_is_stale(current: Option<(usize, usize)>, next: Option<(usize, usize)>) -> bool {
+    matches!(
+        (current, next),
+        (Some((current_completed, current_total)), Some((completed, total)))
+            if current_total == total && completed < current_completed
+    )
+}
+
+fn progress_update_from_output(line: &str) -> Option<ParsedProgressUpdate> {
     let clean = strip_ansi(line);
     let clean = clean.trim();
+
+    if let Some(progress_start) = clean.find("[Progress ") {
+        let rest = &clean[progress_start + "[Progress ".len()..];
+        if let Some(close) = rest.find(']') {
+            let (completed, total) = rest[..close].split_once('/')?;
+            let completed = completed.parse::<usize>().ok()?;
+            let total = total.parse::<usize>().ok()?;
+            if total > 0 && completed <= total {
+                let stage = rest[close + 1..].trim();
+                return Some(ParsedProgressUpdate {
+                    fraction: Some(completed as f32 / total as f32),
+                    work_units: Some((completed, total)),
+                    message: compact_progress_message(stage),
+                });
+            }
+        }
+    }
 
     if let Some(attempt_start) = clean.find("[Attempt ") {
         let rest = &clean[attempt_start + "[Attempt ".len()..];
@@ -2122,12 +2198,13 @@ fn progress_update_from_output(line: &str) -> Option<(Option<f32>, String)> {
                     .trim()
                     .strip_prefix("Testing ")
                     .unwrap_or(rest[close + 1..].trim());
-                return Some((
-                    None,
-                    compact_progress_message(&format!(
+                return Some(ParsedProgressUpdate {
+                    fraction: None,
+                    work_units: None,
+                    message: compact_progress_message(&format!(
                         "Relay attempt {attempt}/{total} · {detail}"
                     )),
-                ));
+                });
             }
         }
     }
@@ -2139,7 +2216,11 @@ fn progress_update_from_output(line: &str) -> Option<(Option<f32>, String)> {
             } else {
                 message.to_string()
             };
-            return Some((None, compact_progress_message(&message)));
+            return Some(ParsedProgressUpdate {
+                fraction: None,
+                work_units: None,
+                message: compact_progress_message(&message),
+            });
         }
     }
     None
@@ -2306,6 +2387,77 @@ fn resolve_cli_binary() -> (Option<PathBuf>, Option<String>) {
     )
 }
 
+fn create_work_progress_file(paths: &AppPaths) -> Option<PathBuf> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let sequence = CANCEL_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let path = paths.cache_dir.join(format!(
+        "gui-progress-{}-{timestamp}-{sequence}.log",
+        std::process::id()
+    ));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(&path).ok()?;
+    Some(path)
+}
+
+fn read_worker_progress_file(worker: &mut CommandWorker) -> Vec<String> {
+    let Some(path) = worker.progress_file.as_deref() else {
+        return Vec::new();
+    };
+    read_appended_progress_lines(
+        path,
+        &mut worker.progress_file_offset,
+        &mut worker.progress_file_pending,
+    )
+}
+
+fn read_appended_progress_lines(
+    path: &Path,
+    offset: &mut u64,
+    pending: &mut Vec<u8>,
+) -> Vec<String> {
+    let Ok(mut file) = File::open(path) else {
+        return Vec::new();
+    };
+    let Ok(metadata) = file.metadata() else {
+        return Vec::new();
+    };
+    if metadata.len() < *offset {
+        *offset = 0;
+        pending.clear();
+    }
+    if file.seek(SeekFrom::Start(*offset)).is_err() {
+        return Vec::new();
+    }
+    let mut appended = Vec::new();
+    if file.read_to_end(&mut appended).is_err() {
+        return Vec::new();
+    }
+    *offset = offset.saturating_add(appended.len() as u64);
+    pending.extend_from_slice(&appended);
+    let Some(complete_len) = pending
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map(|index| index + 1)
+    else {
+        return Vec::new();
+    };
+    let complete: Vec<u8> = pending.drain(..complete_len).collect();
+    complete
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let line = String::from_utf8_lossy(line);
+            line.trim_end_matches('\r').to_string()
+        })
+        .collect()
+}
+
 fn unique_cancel_file_path(paths: &AppPaths) -> PathBuf {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2323,6 +2475,7 @@ fn build_cli_command(
     args: &[String],
     paths: &AppPaths,
     cancel_file: Option<&Path>,
+    progress_file: Option<&Path>,
     requires_privilege: bool,
 ) -> Command {
     let mut cli_args = vec![
@@ -2331,6 +2484,10 @@ fn build_cli_command(
     ];
     if let Some(path) = cancel_file {
         cli_args.push("--cancel-file".to_string());
+        cli_args.push(path.display().to_string());
+    }
+    if let Some(path) = progress_file {
+        cli_args.push("--progress-file".to_string());
         cli_args.push(path.display().to_string());
     }
     cli_args.extend_from_slice(args);
@@ -2389,6 +2546,7 @@ fn run_cli_command(
     args: Vec<String>,
     paths: AppPaths,
     cancel_file: Option<PathBuf>,
+    progress_file: Option<PathBuf>,
     requires_privilege: bool,
     sender: Sender<CommandEvent>,
 ) {
@@ -2397,6 +2555,7 @@ fn run_cli_command(
         &args,
         &paths,
         cancel_file.as_deref(),
+        progress_file.as_deref(),
         requires_privilege,
     );
     command
@@ -2540,8 +2699,12 @@ mod tests {
         CONNECT_ATTEMPT_TIMEOUT_SECS, action_result_message, append_mirror_args,
         connect_regions_fetch_args, country_picker_label, country_selection_contains,
         country_selection_summary, format_age, progress_update_from_output, protocol_labels,
-        relay_matches, selected_relay_start_index, set_country_selection, strip_ansi,
+        read_appended_progress_lines, relay_matches, selected_relay_start_index,
+        set_country_selection, strip_ansi, work_progress_is_stale,
     };
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
     use vpngate_core::{ProtocolFilter, SortBy, VpnServer};
 
     fn server() -> VpnServer {
@@ -2681,20 +2844,70 @@ mod tests {
     }
 
     #[test]
-    fn progress_parser_keeps_relay_attempts_indeterminate() {
-        let (fraction, message) = progress_update_from_output(
+    fn progress_parser_uses_measured_work_units_not_relay_index_as_percent() {
+        let update = progress_update_from_output(
+            "\u{1b}[1;36m[Progress 3/10] Completed OpenVPN UDP check\u{1b}[0m",
+        )
+        .unwrap();
+        assert!((update.fraction.unwrap() - 0.3).abs() < 0.001);
+        assert_eq!(update.work_units, Some((3, 10)));
+        assert_eq!(update.message, "Completed OpenVPN UDP check");
+
+        let update = progress_update_from_output(
             "\u{1b}[1;36m[Attempt 3/10] Testing relay.example (192.0.2.3) | JP (Japan)\u{1b}[0m",
         )
         .unwrap();
-        assert_eq!(fraction, None);
-        assert!(message.contains("Relay attempt 3/10"));
-        assert!(message.contains("relay.example"));
+        assert_eq!(update.fraction, None);
+        assert_eq!(update.work_units, None);
+        assert!(update.message.contains("Relay attempt 3/10"));
+        assert!(update.message.contains("relay.example"));
 
-        let (fraction, message) =
-            progress_update_from_output("[+] Loaded 24 relays from cache").unwrap();
-        assert!(fraction.is_none());
-        assert_eq!(message, "Loaded 24 relays from cache");
+        let update = progress_update_from_output("[+] Loaded 24 relays from cache").unwrap();
+        assert!(update.fraction.is_none());
+        assert!(update.work_units.is_none());
+        assert_eq!(update.message, "Loaded 24 relays from cache");
         assert!(progress_update_from_output("JP Japan 42 relays 12 Mbps").is_none());
+    }
+
+    #[test]
+    fn progress_updates_do_not_regress_within_a_fixed_plan() {
+        assert!(work_progress_is_stale(Some((4, 10)), Some((3, 10))));
+        assert!(!work_progress_is_stale(Some((3, 10)), Some((4, 10))));
+        assert!(!work_progress_is_stale(Some((4, 10)), Some((2, 5))));
+        assert!(!work_progress_is_stale(Some((4, 10)), None));
+    }
+
+    #[test]
+    fn progress_file_reader_handles_appends_and_partial_lines() {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "vpngate-gui-progress-test-{}-{timestamp}.log",
+            std::process::id()
+        ));
+        fs::write(&path, b"[Progress 1/3] Discovery\n[Progress 2/3] Tunnel").unwrap();
+        let mut offset = 0;
+        let mut pending = Vec::new();
+
+        assert_eq!(
+            read_appended_progress_lines(&path, &mut offset, &mut pending),
+            ["[Progress 1/3] Discovery"]
+        );
+        assert_eq!(pending, b"[Progress 2/3] Tunnel");
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"\n")
+            .unwrap();
+        assert_eq!(
+            read_appended_progress_lines(&path, &mut offset, &mut pending),
+            ["[Progress 2/3] Tunnel"]
+        );
+        assert!(read_appended_progress_lines(&path, &mut offset, &mut pending).is_empty());
+        let _ = fs::remove_file(path);
     }
 
     #[test]

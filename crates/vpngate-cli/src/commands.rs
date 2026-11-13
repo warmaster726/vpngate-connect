@@ -33,7 +33,7 @@ use vpngate_core::{
 use crate::term_ui::{
     Align, BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW, clear_transient_line, err, format_duration,
     format_thousands_u64, info, is_stdout_tty, ok, print_line, prompt_input, render_dynamic_box,
-    render_dynamic_table, render_progress_event, truncate_plain, warn,
+    render_dynamic_table, render_progress_event, truncate_plain, warn, work_progress_file,
 };
 
 static UAC_ALREADY_ATTEMPTED: AtomicBool = AtomicBool::new(false);
@@ -267,6 +267,10 @@ pub fn elevate_self(paths: &AppPaths, sub_args: &[String]) -> i32 {
             "--cache-dir".to_string(),
             paths.cache_dir.display().to_string(),
         ];
+        if let Some(progress_file) = work_progress_file() {
+            elevated_args.push("--progress-file".to_string());
+            elevated_args.push(progress_file.display().to_string());
+        }
         elevated_args.extend_from_slice(sub_args);
         let status = Command::new("sudo")
             .arg("-E")
@@ -293,6 +297,10 @@ pub fn elevate_self(paths: &AppPaths, sub_args: &[String]) -> i32 {
             "--cache-dir".to_string(),
             paths.cache_dir.display().to_string(),
         ];
+        if let Some(progress_file) = work_progress_file() {
+            full_args.push("--progress-file".to_string());
+            full_args.push(progress_file.display().to_string());
+        }
         full_args.extend_from_slice(sub_args);
         match win_uac::run_elevated(&self_exe, &full_args, true) {
             Ok(code) => code,
@@ -682,7 +690,10 @@ pub async fn cmd_connect(paths: &AppPaths, args: &ConnectArgs) -> io::Result<i32
         return Ok(rc);
     }
     let extra = parse_custom_mirrors(&args.custom_mirrors);
-    let servers = tokio::select! {
+    render_progress_event(ProgressEvent::Info(
+        "Loading the relay pool and discovering available candidates ...".to_string(),
+    ));
+    let discovery_result = tokio::select! {
         biased;
         _ = tokio::signal::ctrl_c() => {
             warn("Interrupted — returning without connecting.");
@@ -697,12 +708,23 @@ pub async fn cmd_connect(paths: &AppPaths, args: &ConnectArgs) -> io::Result<i32
             args.force_refresh,
             &extra,
             render_progress_event,
-        ) => match res {
-            Ok(s) => s,
-            Err(e) => {
-                err(&format!("Failed fetching VPN Gate server pool: {e}"));
-                return Ok(1);
-            }
+        ) => res,
+    };
+    let servers = match discovery_result {
+        Ok(servers) => servers,
+        Err(error) => {
+            render_progress_event(ProgressEvent::WorkProgress {
+                completed: 1,
+                total: 2,
+                stage: "Relay-pool discovery finished with an error".to_string(),
+            });
+            err(&format!("Failed fetching VPN Gate server pool: {error}"));
+            render_progress_event(ProgressEvent::WorkProgress {
+                completed: 2,
+                total: 2,
+                stage: "Connect command finished after discovery failure".to_string(),
+            });
+            return Ok(1);
         }
     };
     let mut candidates = filter_by_country(
@@ -712,12 +734,22 @@ pub async fn cmd_connect(paths: &AppPaths, args: &ConnectArgs) -> io::Result<i32
     sort_servers(&mut candidates, args.sort_by, args.proto_filter);
 
     if candidates.is_empty() {
+        render_progress_event(ProgressEvent::WorkProgress {
+            completed: 2,
+            total: 3,
+            stage: "Relay pool filtered; no matching candidates were found".to_string(),
+        });
         err(&format!(
             "No VPN Gate servers found for region '{}' with protocol '{}'.",
             args.country,
             args.proto_filter.as_cli_str()
         ));
         info("Tip: Run 'vpngate countries' to see available regions for L2TP and OpenVPN.");
+        render_progress_event(ProgressEvent::WorkProgress {
+            completed: 3,
+            total: 3,
+            stage: "Connect command finished without a matching candidate".to_string(),
+        });
         return Ok(1);
     }
 
@@ -743,7 +775,29 @@ pub async fn cmd_connect(paths: &AppPaths, args: &ConnectArgs) -> io::Result<i32
         args.country.to_ascii_uppercase()
     ));
 
-    let rc = engage_candidates_with_progress(paths, &candidates, &cfg, render_progress_event).await;
+    // The core plan depends on the filtered candidates' actual protocol slots. Count relay-pool
+    // discovery and candidate filtering as two completed units, then reserve one CLI-finalization
+    // unit so we never invent a percentage while the total work is still unknown.
+    let mut total_work_steps = None;
+    let mut core_work_complete = false;
+    let rc = engage_candidates_with_progress(paths, &candidates, &cfg, |event| match event {
+        ProgressEvent::WorkProgress {
+            completed,
+            total,
+            stage,
+        } => {
+            let overall_total = total.saturating_add(3);
+            total_work_steps = Some(overall_total);
+            core_work_complete = completed >= total;
+            render_progress_event(ProgressEvent::WorkProgress {
+                completed: completed.saturating_add(2).min(overall_total),
+                total: overall_total,
+                stage,
+            });
+        }
+        event => render_progress_event(event),
+    })
+    .await;
     if rc == INTERRUPTED_EXIT {
         warn("Connection interrupted. VPN Gate L2TP and OpenVPN profile residue was removed.");
         return Ok(INTERRUPTED_EXIT);
@@ -754,6 +808,17 @@ pub async fn cmd_connect(paths: &AppPaths, args: &ConnectArgs) -> io::Result<i32
         render_established_session_summary(&st)?;
     } else if rc != 0 {
         err("Exhausted candidate servers without establishing a verified tunnel.");
+    }
+    if core_work_complete && let Some(total) = total_work_steps {
+        render_progress_event(ProgressEvent::WorkProgress {
+            completed: total,
+            total,
+            stage: if rc == 0 {
+                "Connect finished; tunnel verified".to_string()
+            } else {
+                "Connect finished; no verified tunnel was established".to_string()
+            },
+        });
     }
     Ok(rc)
 }

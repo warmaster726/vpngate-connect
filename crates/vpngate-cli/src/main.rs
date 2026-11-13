@@ -19,7 +19,7 @@ use commands::{
     cmd_list, cmd_mirrors, cmd_probe, cmd_refresh, cmd_reset_cooldowns, cmd_status, cmd_upgrade,
     cmd_watchdog, set_no_elevate_requested, set_skip_update_check, set_uac_already_attempted,
 };
-use term_ui::{err, init_console, print_line};
+use term_ui::{err, init_console, print_line, set_work_progress_file};
 use vpngate_core::{
     AppPaths, PRODUCT_VERSION, ProtocolFilter, SortBy, assert_supported_native_host,
     run_ikev1_daemon, run_monitor_daemon, tunnel_aid_dns_cli,
@@ -75,6 +75,7 @@ GLOBAL OPTIONS:
       --no-elevate, --read-only    Do not request privilege elevation
       --no-update-check            Skip the update check after `doctor`
       --cancel-file <PATH>         Cancel an in-progress connection when this file appears
+      --progress-file <PATH>       Internal GUI progress log in the selected cache directory
   -h, --help                      Show this command reference
   -v, --version                   Show the desktop version
 
@@ -92,6 +93,7 @@ async fn dispatch() -> io::Result<i32> {
 
     // Consume global path/elevation/update flags before command dispatch.
     let mut cache_dir_override: Option<PathBuf> = None;
+    let mut work_progress_file: Option<PathBuf> = None;
     let mut raw_args: Vec<String> = Vec::with_capacity(raw_all.len());
     let mut idx = 0usize;
     while idx < raw_all.len() {
@@ -102,6 +104,16 @@ async fn dispatch() -> io::Result<i32> {
                     Some(dir) => cache_dir_override = Some(PathBuf::from(dir)),
                     None => {
                         err("--cache-dir requires a path.");
+                        return Ok(2);
+                    }
+                }
+            }
+            "--progress-file" => {
+                idx += 1;
+                match raw_all.get(idx).filter(|path| !path.trim().is_empty()) {
+                    Some(path) => work_progress_file = Some(PathBuf::from(path)),
+                    None => {
+                        err("--progress-file requires a path.");
                         return Ok(2);
                     }
                 }
@@ -118,6 +130,18 @@ async fn dispatch() -> io::Result<i32> {
         Some(dir) => AppPaths::with_base_dir(dir),
         None => AppPaths::resolve(),
     };
+    if let Some(path) = work_progress_file {
+        let is_gui_progress_log = path.parent() == Some(paths.cache_dir.as_path())
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("gui-progress-") && name.ends_with(".log"));
+        if !is_gui_progress_log {
+            err("--progress-file must be a GUI progress log inside the selected cache directory.");
+            return Ok(2);
+        }
+        set_work_progress_file(path);
+    }
 
     // Internal background daemons are still served by this command binary.
     if raw_args.first().map(String::as_str) == Some("_monitor") {
