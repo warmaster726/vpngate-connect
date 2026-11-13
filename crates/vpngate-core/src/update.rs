@@ -610,6 +610,37 @@ edition = "2024"
     }
 
     #[test]
+    fn recorded_decline_snoozes_only_the_declined_version() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let cache_dir = std::env::temp_dir().join(format!(
+            "vpngate-update-decline-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let paths = AppPaths::with_base_dir(cache_dir.clone());
+        paths.ensure_dirs().unwrap();
+        let remote = RemoteDesktopVersion {
+            version: DesktopVersion::parse("9.0.0").unwrap(),
+            raw: "9.0.0".to_string(),
+            source_url: "https://raw.githubusercontent.com/example/repo/main/version.txt"
+                .to_string(),
+        };
+
+        record_update_declined(&paths, &remote);
+        let cache = load_update_cache(&paths).unwrap();
+        assert_eq!(cache.declined_version, remote.raw);
+        assert!(!should_auto_prompt(&cache, &remote.version));
+        assert!(should_auto_prompt(
+            &cache,
+            &DesktopVersion::parse("9.0.1").unwrap()
+        ));
+
+        let _ = std::fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
     fn version_urls_include_plain_text_and_cargo_toml() {
         let urls = version_check_urls("warmaster726/vpngate-connect");
         assert!(

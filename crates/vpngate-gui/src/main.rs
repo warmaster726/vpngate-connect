@@ -19,11 +19,12 @@ use std::os::windows::process::CommandExt;
 use eframe::egui::{self, Color32, RichText};
 use vpngate_core::cache::ServerCacheFile;
 use vpngate_core::{
-    ActiveSessionState, AppPaths, InteractiveInstanceError, PRODUCT_VERSION, ProtocolFilter,
-    RemoteDesktopVersion, SortBy, VpnServer, acquire_interactive_instances, cpu_isa_label,
-    detect_host_os_label, filter_by_country, filter_by_protocol, installed_desktop_version,
-    is_root_or_admin, load_cached_mirrors, now_unix_secs, read_json_opt, refresh_update_cache,
-    sort_servers, summarize_countries, tunnel_aid_dns_cli,
+    ActiveSessionState, AppPaths, DesktopVersion, InteractiveInstanceError, PRODUCT_VERSION,
+    ProtocolFilter, RemoteDesktopVersion, SortBy, UpdateCheckCache, VpnServer,
+    acquire_interactive_instances, cpu_isa_label, detect_host_os_label, filter_by_country,
+    filter_by_protocol, installed_desktop_version, is_root_or_admin, load_cached_mirrors,
+    load_update_cache, now_unix_secs, read_json_opt, record_update_declined, refresh_update_cache,
+    should_auto_prompt, sort_servers, summarize_countries, tunnel_aid_dns_cli,
 };
 
 const APP_ID: &str = "net.vpngate.connect";
@@ -190,7 +191,10 @@ enum ToolAction {
 
 enum CommandEvent {
     Output(String),
-    UpdateCheck(Result<RemoteDesktopVersion, String>),
+    UpdateCheck {
+        mode: UpdateCheckMode,
+        result: Result<RemoteDesktopVersion, String>,
+    },
     Finished(i32),
     Failed(String),
 }
@@ -557,7 +561,7 @@ impl GuiApp {
                 )),
                 Err(error) => Err(format!("Could not start the update-check runtime: {error}")),
             };
-            let _ = sender.send(CommandEvent::UpdateCheck(result));
+            let _ = sender.send(CommandEvent::UpdateCheck { mode, result });
         });
         self.worker = Some(CommandWorker {
             receiver,
@@ -765,7 +769,12 @@ impl GuiApp {
                 self.pending_update = Some(kind);
             }
         } else if dismissed {
-            self.update_offer = None;
+            if let Some(remote) = self.update_offer.take() {
+                record_update_declined(&self.paths, &remote);
+                let message = "Update reminder snoozed for 24 hours. You can install later from More actions.";
+                self.push_log(message.to_string());
+                self.status_message = message.to_string();
+            }
             self.pending_update = None;
         }
     }
@@ -795,8 +804,14 @@ impl GuiApp {
                         self.push_log(clean);
                     }
                 }
-                CommandEvent::UpdateCheck(Ok(remote)) => {
-                    if remote.version > installed_desktop_version() {
+                CommandEvent::UpdateCheck {
+                    mode,
+                    result: Ok(remote),
+                } => {
+                    let installed = installed_desktop_version();
+                    let update_available = remote.version > installed;
+                    let cache = load_update_cache(&self.paths);
+                    if should_prompt_for_update(mode, installed, &remote, cache.as_ref()) {
                         let message = format!(
                             "Desktop update v{} is available; installing it is strongly recommended.",
                             remote.raw
@@ -806,6 +821,14 @@ impl GuiApp {
                         self.finish_operation_progress(&message, true);
                         self.update_offer = Some(remote);
                         self.pending_update = Some(UpdateKind::Update);
+                    } else if update_available {
+                        let message = format!(
+                            "Desktop update v{} remains available; its reminder is snoozed after your recent decline.",
+                            remote.raw
+                        );
+                        self.push_log(message.clone());
+                        self.status_message = message.clone();
+                        self.finish_operation_progress(&message, true);
                     } else {
                         let message =
                             format!("VPN Gate Connect is up to date (v{PRODUCT_VERSION}).");
@@ -815,7 +838,9 @@ impl GuiApp {
                     }
                     finished = true;
                 }
-                CommandEvent::UpdateCheck(Err(error)) => {
+                CommandEvent::UpdateCheck {
+                    result: Err(error), ..
+                } => {
                     let message = format!("Desktop update check did not complete: {error}");
                     self.push_log(message.clone());
                     self.status_message = message.clone();
@@ -2321,6 +2346,17 @@ fn append_mirror_args(args: &mut Vec<String>, value: &str) {
     }
 }
 
+fn should_prompt_for_update(
+    mode: UpdateCheckMode,
+    installed: DesktopVersion,
+    remote: &RemoteDesktopVersion,
+    cache: Option<&UpdateCheckCache>,
+) -> bool {
+    remote.version > installed
+        && (mode == UpdateCheckMode::Diagnostics
+            || cache.is_none_or(|cache| should_auto_prompt(cache, &remote.version)))
+}
+
 fn action_result_message(operation: &str, code: i32) -> String {
     if code == vpngate_core::INTERRUPTED_EXIT {
         return format!(
@@ -2696,16 +2732,19 @@ fn strip_ansi(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONNECT_ATTEMPT_TIMEOUT_SECS, action_result_message, append_mirror_args,
+        CONNECT_ATTEMPT_TIMEOUT_SECS, UpdateCheckMode, action_result_message, append_mirror_args,
         connect_regions_fetch_args, country_picker_label, country_selection_contains,
         country_selection_summary, format_age, progress_update_from_output, protocol_labels,
         read_appended_progress_lines, relay_matches, selected_relay_start_index,
-        set_country_selection, strip_ansi, work_progress_is_stale,
+        set_country_selection, should_prompt_for_update, strip_ansi, work_progress_is_stale,
     };
     use std::fs::{self, OpenOptions};
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
-    use vpngate_core::{ProtocolFilter, SortBy, VpnServer};
+    use vpngate_core::{
+        DesktopVersion, ProtocolFilter, RemoteDesktopVersion, SortBy, UpdateCheckCache, VpnServer,
+        installed_desktop_version, now_unix_secs,
+    };
 
     fn server() -> VpnServer {
         VpnServer {
@@ -2875,6 +2914,59 @@ mod tests {
         assert!(!work_progress_is_stale(Some((3, 10)), Some((4, 10))));
         assert!(!work_progress_is_stale(Some((4, 10)), Some((2, 5))));
         assert!(!work_progress_is_stale(Some((4, 10)), None));
+    }
+
+    #[test]
+    fn startup_update_prompt_respects_decline_snooze_but_diagnostics_forces_prompt() {
+        let remote = RemoteDesktopVersion {
+            version: DesktopVersion::parse("9.0.0").unwrap(),
+            raw: "9.0.0".to_string(),
+            source_url: "https://raw.githubusercontent.com/example/repo/main/version.txt"
+                .to_string(),
+        };
+        let now = now_unix_secs();
+        let declined = UpdateCheckCache {
+            declined_version: remote.raw.clone(),
+            declined_at: now,
+            ..UpdateCheckCache::default()
+        };
+        let installed = installed_desktop_version();
+
+        assert!(!should_prompt_for_update(
+            UpdateCheckMode::Startup,
+            installed,
+            &remote,
+            Some(&declined)
+        ));
+        assert!(should_prompt_for_update(
+            UpdateCheckMode::Diagnostics,
+            installed,
+            &remote,
+            Some(&declined)
+        ));
+
+        let changed_remote = RemoteDesktopVersion {
+            version: DesktopVersion::parse("9.0.1").unwrap(),
+            raw: "9.0.1".to_string(),
+            source_url: remote.source_url.clone(),
+        };
+        assert!(should_prompt_for_update(
+            UpdateCheckMode::Startup,
+            installed,
+            &changed_remote,
+            Some(&declined)
+        ));
+
+        let expired_decline = UpdateCheckCache {
+            declined_at: now.saturating_sub(vpngate_core::update::UPDATE_DECLINE_SNOOZE_SECS),
+            ..declined
+        };
+        assert!(should_prompt_for_update(
+            UpdateCheckMode::Startup,
+            installed,
+            &remote,
+            Some(&expired_decline)
+        ));
     }
 
     #[test]
