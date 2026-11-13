@@ -19,6 +19,7 @@ pub mod doh;
 pub mod error;
 pub mod ikev1;
 pub mod ikev1_daemon;
+pub mod interactive_instance;
 pub mod parser;
 pub mod profile;
 pub mod protocol;
@@ -39,12 +40,11 @@ pub use country::{
 pub use desktop_tunnel::{
     ConnectSessionConfig, GatewayInfo, INTERRUPTED_EXIT, NM_PROFILE_PREFIX, WIN_VPN_PROFILE_NAME,
     assert_supported_native_host, cleanup_existing_vpn, cleanup_existing_vpn_with_progress,
-    cpu_isa_label, detect_host_os_label,
-    engage_candidates, engage_candidates_with_progress, find_openvpn_bin, get_default_gateway,
-    get_ppp_interfaces, get_running_monitor_pid, get_running_openvpn_pid, get_tun_interfaces,
-    is_root_or_admin, probe_linux_l2tp_kernel_support, prune_stale_state_if_dead,
-    query_windows_natt_rule, run_monitor_daemon, spawn_auto_reconnect_monitor,
-    stop_monitor_daemon, which_bin,
+    cpu_isa_label, detect_host_os_label, engage_candidates, engage_candidates_with_progress,
+    find_openvpn_bin, get_default_gateway, get_ppp_interfaces, get_running_monitor_pid,
+    get_running_openvpn_pid, get_tun_interfaces, is_root_or_admin, probe_linux_l2tp_kernel_support,
+    prune_stale_state_if_dead, query_windows_natt_rule, run_monitor_daemon,
+    spawn_auto_reconnect_monitor, stop_monitor_daemon, wait_for_cancel_file, which_bin,
 };
 pub use discovery::{
     DiscoveryClient, DiscoveryOptions, DiscoveryOutcome, MirrorProbeResult, ProgressEvent,
@@ -57,6 +57,10 @@ pub use doh::{is_poisoned_ip, is_poisoned_ipv4, resolve_ipv4_via_cloudflare_doh}
 pub use error::{CoreError, Result};
 pub use ikev1::{L2tpVerifyOutcome, probe_tcp, sweep_ikev1_sa_responders, verify_l2tp_psk_vpn};
 pub use ikev1_daemon::{run_ikev1_crypto_self_test, run_ikev1_daemon};
+pub use interactive_instance::{
+    InteractiveInstanceError, InteractiveInstanceGuard, acquire_interactive_instance,
+    acquire_interactive_instances,
+};
 pub use parser::{
     OfficialMirrorSite, normalize_mirror_base_url, parse_sdise_csv_into, parse_vpngate_csv_into,
     parse_vpngate_html_into, parse_vpngate_mirror_sites_html,
@@ -69,11 +73,10 @@ pub use server::{
     VpnServer, filter_by_country, filter_by_protocol, sort_servers, split_country_query,
 };
 pub use update::{
-    DesktopVersion, RemoteDesktopVersion, UpdateCheckCache, PRODUCT_VERSION, cache_is_fresh,
+    DesktopVersion, PRODUCT_VERSION, RemoteDesktopVersion, UpdateCheckCache, cache_is_fresh,
     cached_newer_than_installed, cached_remote_version, cargo_toml_check_urls,
     check_remote_desktop_version, default_repo_slug, fetch_public_url_text,
-    installer_script_urls, installed_desktop_version, load_update_cache,
-    parse_version_payload, parse_workspace_package_version, record_update_declined,
-    record_update_failure, record_update_scan, refresh_update_cache, should_auto_prompt,
-    version_check_urls,
+    installed_desktop_version, installer_script_urls, load_update_cache, parse_version_payload,
+    parse_workspace_package_version, record_update_declined, record_update_failure,
+    record_update_scan, refresh_update_cache, should_auto_prompt, version_check_urls,
 };

@@ -15,16 +15,16 @@ use crate::doh::resolve_ipv4_via_cloudflare_doh;
 
 /// Skip auto-prompt for this long after the user declines a given remote version.
 pub const UPDATE_DECLINE_SNOOZE_SECS: u64 = 24 * 3600;
-/// Re-use a successful scan for this long on the interactive dashboard.
+/// Re-use a successful anonymous scan for this long across desktop update checks.
 pub const UPDATE_CACHE_TTL_SECS: u64 = 6 * 3600;
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(12);
 const GITHUB_CHECK_TIMEOUT: Duration = Duration::from_secs(12);
 const CDN_CHECK_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// Public desktop label. Cargo crate version stays SemVer (`0.4.4`); a trailing
-/// letter (`0.4.4a`) would be a revision *after* that patch, used for update prompts.
-pub const PRODUCT_VERSION: &str = "0.4.4";
+/// Public desktop label. Cargo crate version stays SemVer; a trailing letter
+/// (`0.3.4a`) is a revision after that numeric patch for update prompts.
+pub const PRODUCT_VERSION: &str = "0.5.2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DesktopVersion {
@@ -165,8 +165,7 @@ pub fn cargo_toml_check_urls(slug: &str) -> Vec<String> {
 
 pub fn is_github_version_url(url: &str) -> bool {
     let u = url.to_ascii_lowercase();
-    u.contains("raw.githubusercontent.com/")
-        || (u.contains("github.com/") && u.contains("/raw/"))
+    u.contains("raw.githubusercontent.com/") || (u.contains("github.com/") && u.contains("/raw/"))
 }
 
 /// Anonymous HTTPS endpoints only (no GitHub API, no tokens, no 2FA).
@@ -180,13 +179,9 @@ pub fn version_check_urls(slug: &str) -> Vec<String> {
         urls.push(format!(
             "https://raw.githubusercontent.com/{slug}/refs/heads/main/{file}"
         ));
-        urls.push(format!(
-            "https://github.com/{slug}/raw/main/{file}"
-        ));
+        urls.push(format!("https://github.com/{slug}/raw/main/{file}"));
         urls.push(format!("https://cdn.jsdelivr.net/gh/{slug}@main/{file}"));
-        urls.push(format!(
-            "https://fastly.jsdelivr.net/gh/{slug}@main/{file}"
-        ));
+        urls.push(format!("https://fastly.jsdelivr.net/gh/{slug}@main/{file}"));
     }
     urls
 }
@@ -358,10 +353,7 @@ pub fn pick_highest_version(hits: &[(String, String)]) -> Option<RemoteDesktopVe
     best
 }
 
-async fn first_parsed_version(
-    urls: &[String],
-    timeout: Duration,
-) -> Option<RemoteDesktopVersion> {
+async fn first_parsed_version(urls: &[String], timeout: Duration) -> Option<RemoteDesktopVersion> {
     let mut set = tokio::task::JoinSet::new();
     for url in urls.iter().cloned() {
         set.spawn(async move {
@@ -426,13 +418,13 @@ pub async fn check_remote_desktop_version() -> Result<RemoteDesktopVersion, Stri
     let urls = version_check_urls(&slug);
     let github: Vec<String> = urls
         .iter()
+        .filter(|&u| is_github_version_url(u))
         .cloned()
-        .filter(|u| is_github_version_url(u))
         .collect();
     let cdn: Vec<String> = urls
         .iter()
+        .filter(|&u| !is_github_version_url(u))
         .cloned()
-        .filter(|u| !is_github_version_url(u))
         .collect();
 
     // GitHub raw is the source of truth for public main. Do not let a stale
@@ -533,7 +525,7 @@ pub fn cache_is_fresh(cache: &UpdateCheckCache) -> bool {
     now_unix_secs().saturating_sub(cache.checked_at) < UPDATE_CACHE_TTL_SECS
 }
 
-/// Auto-prompt on the dashboard unless this remote version was declined recently.
+/// Auto-prompt on the desktop UI unless this remote version was declined recently.
 pub fn should_auto_prompt(cache: &UpdateCheckCache, remote: &DesktopVersion) -> bool {
     if cache.declined_version != remote.as_str() {
         return true;
@@ -572,10 +564,7 @@ mod tests {
         assert!(a < next);
         assert_eq!(a.to_string(), "0.3.4a");
         assert_eq!(plain.to_string(), "0.3.4");
-        assert_eq!(
-            parse_version_payload("0.3.4a\n").as_deref(),
-            Some("0.3.4a")
-        );
+        assert_eq!(parse_version_payload("0.3.4a\n").as_deref(), Some("0.3.4a"));
     }
 
     #[test]
@@ -615,12 +604,40 @@ edition = "2024"
             parse_workspace_package_version(toml).as_deref(),
             Some("0.2.18")
         );
-        assert_eq!(
-            parse_version_payload("0.2.20\n").as_deref(),
-            Some("0.2.20")
-        );
+        assert_eq!(parse_version_payload("0.2.20\n").as_deref(), Some("0.2.20"));
         assert!(parse_version_payload("<html>404</html>").is_none());
         assert!(parse_version_payload("<!DOCTYPE html>").is_none());
+    }
+
+    #[test]
+    fn recorded_decline_snoozes_only_the_declined_version() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let cache_dir = std::env::temp_dir().join(format!(
+            "vpngate-update-decline-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let paths = AppPaths::with_base_dir(cache_dir.clone());
+        paths.ensure_dirs().unwrap();
+        let remote = RemoteDesktopVersion {
+            version: DesktopVersion::parse("9.0.0").unwrap(),
+            raw: "9.0.0".to_string(),
+            source_url: "https://raw.githubusercontent.com/example/repo/main/version.txt"
+                .to_string(),
+        };
+
+        record_update_declined(&paths, &remote);
+        let cache = load_update_cache(&paths).unwrap();
+        assert_eq!(cache.declined_version, remote.raw);
+        assert!(!should_auto_prompt(&cache, &remote.version));
+        assert!(should_auto_prompt(
+            &cache,
+            &DesktopVersion::parse("9.0.1").unwrap()
+        ));
+
+        let _ = std::fs::remove_dir_all(cache_dir);
     }
 
     #[test]

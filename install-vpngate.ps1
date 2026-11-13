@@ -4,12 +4,14 @@
 .DESCRIPTION
     64-bit native (x86_64 and ARM64). No 32-bit. No Windows-on-ARM x64 emulation.
     - Install / Upgrade (default):
-        Cleans legacy Python/Rust residues, builds or installs native `vpngate.exe` into
-        `%LOCALAPPDATA%\Programs\VPNGate\vpngate.exe` using an isolated temporary build root,
+        Cleans legacy Python/Rust residues, builds or installs native `vpngate.exe` and
+        `vpngate-gui.exe` into `%LOCALAPPDATA%\Programs\VPNGate` using an isolated temporary build root,
         wipes all temporary Cargo/source/toolchain staging artifacts, updates User PATH,
         configures Windows 11 L2TP/IPsec NAT-T (`AssumeUDPEncapsulationContextOnSendRule = 2`),
         installs/hardens Zero-Prompt headless OpenVPN Community (`OpenVPN.OpenVPN`), creates
-        Start Menu shortcut, verifies host environment cleanliness, and runs `vpngate doctor`.
+        one native-GUI Start Menu shortcut while retaining `vpngate.exe` as the command service,
+        verifies host environment
+        cleanliness, and runs `vpngate doctor`.
     - Uninstall (`--uninstall` or `-Uninstall`):
         Disconnects active VPNs, restores NAT-T/Firewall/PATH settings, removes binaries & caches,
         and verifies zero remaining residues.
@@ -28,6 +30,8 @@ param(
     [switch]$RemoveToolchain,
 
     [string]$Repo = 'warmaster726/vpngate-connect',
+
+    [string]$Branch = '',
 
     [switch]$RestoreNatTRule,
 
@@ -63,25 +67,29 @@ function Show-Usage {
     Write-Host @"
 Usage: .\install-vpngate.ps1 [OPTIONS]
 
-Installs, upgrades, or removes single-binary Rust `vpngate.exe` on Windows 11
-64-bit hardware (x86_64 and ARM64). No 32-bit. No Windows-on-ARM x64 emulation.
+Installs, upgrades, or removes the native Rust `vpngate.exe` command service and
+`vpngate-gui.exe` desktop app on Windows 11 64-bit hardware (x86_64 and ARM64). No 32-bit
+and no Windows-on-ARM x64 emulation.
 Zero Python dependency. Configures L2TP/IPsec NAT-T and headless OpenVPN Community
 while keeping the host environment free of temporary build caches.
 
 Options:
-  (no arguments)               Clean legacy residues, build/install vpngate.exe, wipe temp build cache & configure OpenVPN
-  --uninstall, -Uninstall, -u  Disconnect active VPNs and completely remove vpngate.exe & caches
+  (no arguments)               Clean legacy residues, build/install CLI service + GUI, wipe temp build cache & configure OpenVPN
+  --uninstall, -Uninstall, -u  Disconnect active VPNs and completely remove both apps & caches
   --restore-natt               With --uninstall, restore previous NAT-T registry value
   --user-only                  Install/uninstall without Administrator (skips HKLM/Service/MSI steps)
   --skip-openvpn               Skip automatic OpenVPN Community winget installation if missing
   --install-openvpn            Explicitly install/repair OpenVPN Community via winget
-  --keep-toolchain             Keep compile tools (Rust toolchain and any MinGW gcc we install) after building vpngate.exe
-  --remove-toolchain           Remove compile tools after building vpngate.exe (default when there is no prompt)
+  --keep-toolchain             Keep compile tools (Rust toolchain and any MinGW gcc we install) after building
+  --remove-toolchain           Remove compile tools after building (default when there is no prompt)
   --repo <owner/repo>          GitHub repository slug when downloading source archive outside a checkout
+  -Branch <name>, --branch <name> Source branch for archive downloads (VPNGATE_BRANCH or main by default)
   --help, -Help, -h            Show this help message and exit
 
+A local checkout is always built as checked out, including non-main branches.
+When no local source is present, -Branch/--branch overrides VPNGATE_BRANCH; the default is main.
 When Rust (cargo.exe) or MinGW gcc must be bootstrapped, an interactive install
-asks whether to keep those compile tools or delete them after vpngate.exe is built.
+asks whether to keep those compile tools or delete them after the CLI service and GUI are built.
 Pre-existing toolchains are never removed. Non-interactive runs default to removing
 tools this installer added.
 "@
@@ -103,6 +111,15 @@ if ($RemainingArgs) {
             '--keep-toolchain'    { $KeepToolchain = $true; $RemoveToolchain = $false }
             '--remove-toolchain'  { $RemoveToolchain = $true; $KeepToolchain = $false }
             '--repo'              { if ($idx + 1 -lt $RemainingArgs.Count) { $idx++; $Repo = $RemainingArgs[$idx] } }
+            '--branch' {
+                if (($idx + 1) -ge $RemainingArgs.Count) {
+                    Write-Err "Missing value for --branch"
+                    Show-Usage
+                    exit 2
+                }
+                $idx++
+                $Branch = $RemainingArgs[$idx]
+            }
             '--help'            { $Help = $true }
             '-h'                { $Help = $true }
             default {
@@ -277,7 +294,41 @@ $VpnProfileName = 'VPNGate-L2TP'
 $OvpnFwInRule   = 'VPNGate-OpenVPN-In'
 $OvpnFwOutRule  = 'VPNGate-OpenVPN-Out'
 $PolicyRegistry = 'HKLM:\SYSTEM\CurrentControlSet\Services\PolicyAgent'
-$StartMenuLnk   = if ($TargetStartMenuLnk -and $TargetStartMenuLnk.Trim()) { $TargetStartMenuLnk.Trim() } else { Join-Path ([Environment]::GetFolderPath('Programs')) 'VPN Gate.lnk' }
+$StartMenuLnk   = if ($TargetStartMenuLnk -and $TargetStartMenuLnk.Trim()) { $TargetStartMenuLnk.Trim() } else { Join-Path ([Environment]::GetFolderPath('Programs')) 'VPN Gate Connect.lnk' }
+$LegacyGuiStartMenuLnk = Join-Path (Split-Path -Parent $StartMenuLnk) 'VPN Gate Connect GUI.lnk'
+$LegacyStartMenuLnk = Join-Path (Split-Path -Parent $StartMenuLnk) 'VPN Gate.lnk'
+
+function ConvertTo-WindowsCommandLineArgument([string]$Value) {
+    if ($null -eq $Value) { $Value = '' }
+    $quoteChar = [char]34
+    $slashChar = [char]92
+    $builder = New-Object System.Text.StringBuilder
+    [void]$builder.Append($quoteChar)
+    $backslashCount = 0
+    foreach ($character in $Value.ToCharArray()) {
+        if ($character -eq $slashChar) {
+            $backslashCount++
+            continue
+        }
+        if ($character -eq $quoteChar) {
+            for ($idx = 0; $idx -lt (2 * $backslashCount + 1); $idx++) {
+                [void]$builder.Append($slashChar)
+            }
+            [void]$builder.Append($quoteChar)
+        } else {
+            for ($idx = 0; $idx -lt $backslashCount; $idx++) {
+                [void]$builder.Append($slashChar)
+            }
+            [void]$builder.Append($character)
+        }
+        $backslashCount = 0
+    }
+    for ($idx = 0; $idx -lt (2 * $backslashCount); $idx++) {
+        [void]$builder.Append($slashChar)
+    }
+    [void]$builder.Append($quoteChar)
+    return $builder.ToString()
+}
 
 # Automatically elevate via Windows UAC when invoked from a non-Admin PowerShell session
 if ((-not $IsAdmin) -and (-not $UserOnly) -and (-not $ElevatedChild) -and $PSCommandPath -and (Test-Path -LiteralPath $PSCommandPath)) {
@@ -309,9 +360,20 @@ if ((-not $IsAdmin) -and (-not $UserOnly) -and (-not $ElevatedChild) -and $PSCom
     if ($KeepToolchain)   { $FwdArgs.Add('-KeepToolchain') }
     if ($RemoveToolchain) { $FwdArgs.Add('-RemoveToolchain') }
     if ($Repo)            { $FwdArgs.Add('-Repo'); $FwdArgs.Add($Repo) }
+    $ForwardBranch = $Branch
+    if ([string]::IsNullOrWhiteSpace($ForwardBranch)) { $ForwardBranch = $env:VPNGATE_BRANCH }
+    if (-not [string]::IsNullOrWhiteSpace($ForwardBranch)) {
+        $FwdArgs.Add('-Branch')
+        $FwdArgs.Add($ForwardBranch)
+    }
 
+    # Start-Process joins ArgumentList items into one string; quote each token so
+    # user paths such as 'Start Menu' survive the UAC child-process boundary.
+    $FwdArgLine = (@($FwdArgs.ToArray() | ForEach-Object {
+        ConvertTo-WindowsCommandLineArgument -Value ([string]$_)
+    }) -join ' ')
     try {
-        $ElevProc = Start-Process -FilePath $PsHostExe -ArgumentList $FwdArgs.ToArray() -WorkingDirectory $CallerWorkDir -Verb RunAs -Wait -PassThru
+        $ElevProc = Start-Process -FilePath $PsHostExe -ArgumentList $FwdArgLine -WorkingDirectory $CallerWorkDir -Verb RunAs -Wait -PassThru
     } catch {
         Write-Err "Windows UAC elevation was cancelled or blocked ($($_.Exception.Message))."
         Write-Host "    Right-click PowerShell -> 'Run as Administrator' and re-run .\install-vpngate.ps1" -ForegroundColor Yellow
@@ -348,7 +410,7 @@ if ((-not $IsAdmin) -and (-not $UserOnly) -and (-not $ElevatedChild) -and $PSCom
             if ($env:Path -notlike "*$NormCallerInstall*") {
                 $env:Path = "$InstallDir;$env:Path"
             }
-            Write-Ok "Installation complete! Run 'vpngate' anytime to launch the console."
+            Write-Ok "Installation complete! Start the native VPN Gate Connect GUI from the Start Menu; `vpngate` remains available as the CLI command service."
         }
     } else {
         Write-Err "Elevated installer exited with code $ElevExit."
@@ -368,7 +430,7 @@ function Invoke-VPNGateResidueCleanup([string]$Mode) {
     if ($IsAdmin -and (Test-Path -LiteralPath $ExistingExe)) {
         $prevEap = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
-        try { & $ExistingExe --uac-elevated --cache-dir $CacheDir disconnect --no-resize *> $null } catch {}
+        try { & $ExistingExe --uac-elevated --cache-dir $CacheDir disconnect *> $null } catch {}
         $ErrorActionPreference = $prevEap
     }
 
@@ -426,9 +488,11 @@ if ($Uninstall) {
         Add-CleanedRecord "Removed AssumeUDPEncapsulationContextOnSendRule from PolicyAgent"
     }
 
-    if (Test-Path -LiteralPath $StartMenuLnk) {
-        Remove-Item -LiteralPath $StartMenuLnk -Force -ErrorAction SilentlyContinue
-        Add-CleanedRecord "Removed Start Menu shortcut: $StartMenuLnk"
+    foreach ($shortcutPath in @($StartMenuLnk, $LegacyGuiStartMenuLnk, $LegacyStartMenuLnk)) {
+        if (Test-Path -LiteralPath $shortcutPath) {
+            Remove-Item -LiteralPath $shortcutPath -Force -ErrorAction SilentlyContinue
+            Add-CleanedRecord "Removed Start Menu shortcut: $shortcutPath"
+        }
     }
 
     foreach ($dirToRemove in @($InstallDir, $CacheDir)) {
@@ -461,11 +525,21 @@ if ($Uninstall) {
 # INSTALL / UPGRADE MODE (`.\install-vpngate.ps1` or `install-vpngate.cmd`)
 # ==============================================================================
 $SourceDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+$LocalBranch = $null
+try {
+    $DetectedBranch = & git -C $SourceDir branch --show-current 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        $DetectedBranch = (@($DetectedBranch) -join '').Trim()
+        if ($DetectedBranch) { $LocalBranch = $DetectedBranch }
+    }
+} catch {}
 Invoke-VPNGateResidueCleanup -Mode 'Install'
 
 # 1. Resolve or build `vpngate.exe` inside an isolated temporary root so zero build bloat remains
 $BinSource = $null
+$GuiBinSource = $null
 $TargetExe = Join-Path $InstallDir 'vpngate.exe'
+$TargetGuiExe = Join-Path $InstallDir 'vpngate-gui.exe'
 $TempInstallRoot = Join-Path ([System.IO.Path]::GetTempPath()) "vpngate-install-$PID"
 $HadLocalTarget = Test-Path -LiteralPath (Join-Path $SourceDir 'target')
 $CallerCargoTargetDir = $env:CARGO_TARGET_DIR
@@ -481,9 +555,25 @@ try {
     $WorkDir = $SourceDir
     $CargoToml = Join-Path $WorkDir 'Cargo.toml'
     $LocalPrebuilt = Join-Path $WorkDir 'vpngate.exe'
+    $UsingLocalSource = Test-Path -LiteralPath $CargoToml
+    if ($UsingLocalSource) {
+        if ($LocalBranch) {
+            Write-Info "Using the local checkout on branch '$LocalBranch'; building its checked-out source."
+        } else {
+            Write-Info "Using the local source tree at $WorkDir."
+        }
+    }
 
-    if (-not (Test-Path -LiteralPath $CargoToml) -and -not (Test-Path -LiteralPath $LocalPrebuilt)) {
-        $BranchName = if ($env:VPNGATE_BRANCH) { $env:VPNGATE_BRANCH } else { 'main' }
+    if (-not $UsingLocalSource -and -not (Test-Path -LiteralPath $LocalPrebuilt)) {
+        $BranchName = $Branch
+        if ([string]::IsNullOrWhiteSpace($BranchName)) { $BranchName = $env:VPNGATE_BRANCH }
+        if ([string]::IsNullOrWhiteSpace($BranchName)) { $BranchName = 'main' }
+        $BranchName = $BranchName.Trim()
+        if ($BranchName -notmatch '^[A-Za-z0-9._/+@-]+$' -or
+            $BranchName.Contains('..') -or $BranchName.StartsWith('/') -or
+            $BranchName.EndsWith('/') -or $BranchName.Contains('//')) {
+            throw "Invalid source branch name: $BranchName"
+        }
         $ZipUrl = "https://codeload.github.com/$Repo/zip/refs/heads/$BranchName"
         $SrcStageDir = Join-Path $TempInstallRoot 'src'
         New-Item -ItemType Directory -Path $SrcStageDir -Force | Out-Null
@@ -567,6 +657,17 @@ try {
             & $CargoCmd.Source @MsvcArgs
             if ($LASTEXITCODE -ne 0) { throw "Cargo release build failed." }
             $BinSource = Join-Path $EffectiveTargetDir "$MsvcTriple\release\vpngate.exe"
+
+            $GuiCargoToml = Join-Path $WorkDir 'crates\vpngate-gui\Cargo.toml'
+            if (Test-Path -LiteralPath $GuiCargoToml) {
+                $GuiBuildArgs = @('build', '--release')
+                if (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $GuiCargoToml) 'Cargo.lock')) { $GuiBuildArgs += '--locked' }
+                $GuiBuildArgs += @('--manifest-path', $GuiCargoToml, '--target-dir', $EffectiveTargetDir, '--target', $MsvcTriple, '--bin', 'vpngate-gui')
+                Write-Info "Building optimized $($script:HostArch) 'vpngate-gui.exe' via Cargo (MSVC $MsvcTriple) ..."
+                & $CargoCmd.Source @GuiBuildArgs
+                if ($LASTEXITCODE -ne 0) { throw "Cargo native GUI release build failed." }
+                $GuiBinSource = Join-Path $EffectiveTargetDir "$MsvcTriple\release\vpngate-gui.exe"
+            }
         } else {
             # Ensure gcc.exe / MinGW-w64 is present for `x86_64-pc-windows-gnu` (`ring` C objects + linking)
             $foundGccPath = Find-HostGcc
@@ -593,9 +694,23 @@ try {
             & $CargoCmd.Source @GnuArgs
             if ($LASTEXITCODE -ne 0) { throw "Cargo GNU release build failed." }
             $BinSource = Join-Path $EffectiveTargetDir "$GnuTriple\release\vpngate.exe"
+
+            $GuiCargoToml = Join-Path $WorkDir 'crates\vpngate-gui\Cargo.toml'
+            if (Test-Path -LiteralPath $GuiCargoToml) {
+                $GuiBuildArgs = @('build', '--release')
+                if (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $GuiCargoToml) 'Cargo.lock')) { $GuiBuildArgs += '--locked' }
+                $GuiBuildArgs += @('--manifest-path', $GuiCargoToml, '--target-dir', $EffectiveTargetDir, '--target', $GnuTriple, '--bin', 'vpngate-gui')
+                Write-Info "Building optimized $($script:HostArch) 'vpngate-gui.exe' via Cargo ($GnuTriple toolchain) ..."
+                $GuiGnuArgs = @("+stable-$GnuTriple") + $GuiBuildArgs
+                & $CargoCmd.Source @GuiGnuArgs
+                if ($LASTEXITCODE -ne 0) { throw "Cargo GNU native GUI release build failed." }
+                $GuiBinSource = Join-Path $EffectiveTargetDir "$GnuTriple\release\vpngate-gui.exe"
+            }
         }
     } elseif (Test-Path -LiteralPath $LocalPrebuilt) {
         $BinSource = $LocalPrebuilt
+        $LocalGuiPrebuilt = Join-Path $WorkDir 'vpngate-gui.exe'
+        if (Test-Path -LiteralPath $LocalGuiPrebuilt) { $GuiBinSource = $LocalGuiPrebuilt }
     }
 
     if (-not $BinSource -or -not (Test-Path -LiteralPath $BinSource)) {
@@ -605,7 +720,14 @@ try {
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
     Copy-Item -LiteralPath $BinSource -Destination $TargetExe -Force
     try { Unblock-File -LiteralPath $TargetExe -ErrorAction SilentlyContinue } catch {}
-    Write-Ok "Installed native single-binary '$TargetExe'"
+    Write-Ok "Installed vpngate CLI command service '$TargetExe'"
+    if ($GuiBinSource -and (Test-Path -LiteralPath $GuiBinSource)) {
+        Copy-Item -LiteralPath $GuiBinSource -Destination $TargetGuiExe -Force
+        try { Unblock-File -LiteralPath $TargetGuiExe -ErrorAction SilentlyContinue } catch {}
+        Write-Ok "Installed native GUI '$TargetGuiExe'"
+    } else {
+        Write-Warn "This source/prebuilt package did not include vpngate-gui.exe; the CLI command service remains installed."
+    }
     foreach ($iconCand in @(
         (Join-Path $WorkDir 'assets\vpngate.ico'),
         (Join-Path $SourceDir 'assets\vpngate.ico')
@@ -761,35 +883,37 @@ if ($IsAdmin) {
     }
 }
 
-# 5. Create Start Menu shortcut (configured with SLDF_RUNAS_USER so Start Menu launches elevated)
+# 5. Create one primary native GUI Start Menu shortcut; retire old console shortcuts.
 $WshShell = $null
-$Shortcut = $null
-try {
-    $LnkParent = Split-Path -Parent $StartMenuLnk
-    if ($LnkParent -and -not (Test-Path -LiteralPath $LnkParent)) {
-        New-Item -ItemType Directory -Path $LnkParent -Force | Out-Null
-    }
-    $WshShell = New-Object -ComObject WScript.Shell
-    $Shortcut = $WshShell.CreateShortcut($StartMenuLnk)
-    $Shortcut.TargetPath = $TargetExe
-    $Shortcut.WorkingDirectory = $InstallDir
-    $Shortcut.Description = 'VPN Gate Connect Console'
-    $IconLnk = Join-Path $InstallDir 'vpngate.ico'
-    if (Test-Path -LiteralPath $IconLnk) {
-        $Shortcut.IconLocation = "$IconLnk,0"
-    }
-    $Shortcut.Save()
-    if (-not $UserOnly -and (Test-Path -LiteralPath $StartMenuLnk)) {
-        $LnkBytes = [System.IO.File]::ReadAllBytes($StartMenuLnk)
-        if ($LnkBytes.Length -gt 0x15) {
-            $LnkBytes[0x15] = $LnkBytes[0x15] -bor 0x20
-            [System.IO.File]::WriteAllBytes($StartMenuLnk, $LnkBytes)
+$GuiShortcut = $null
+if ($GuiBinSource -and (Test-Path -LiteralPath $TargetGuiExe)) {
+    try {
+        $LnkParent = Split-Path -Parent $StartMenuLnk
+        if ($LnkParent -and -not (Test-Path -LiteralPath $LnkParent)) {
+            New-Item -ItemType Directory -Path $LnkParent -Force | Out-Null
         }
+        $WshShell = New-Object -ComObject WScript.Shell
+        $GuiShortcut = $WshShell.CreateShortcut($StartMenuLnk)
+        $GuiShortcut.TargetPath = $TargetGuiExe
+        $GuiShortcut.WorkingDirectory = $InstallDir
+        $GuiShortcut.Description = 'VPN Gate Connect'
+        $IconLnk = Join-Path $InstallDir 'vpngate.ico'
+        if (Test-Path -LiteralPath $IconLnk) { $GuiShortcut.IconLocation = "$IconLnk,0" }
+        $GuiShortcut.Save()
+        Write-Ok "Created native GUI Start Menu shortcut: $StartMenuLnk"
+    } catch {
+        Write-Warn "Could not create the GUI Start Menu shortcut ($($_.Exception.Message))."
+    } finally {
+        if ($GuiShortcut) { try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($GuiShortcut) | Out-Null } catch {} }
+        if ($WshShell) { try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($WshShell) | Out-Null } catch {} }
     }
-    Write-Ok "Created Start Menu shortcut: $StartMenuLnk"
-} catch {} finally {
-    if ($Shortcut) { try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($Shortcut) | Out-Null } catch {} }
-    if ($WshShell) { try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($WshShell) | Out-Null } catch {} }
+} else {
+    Write-Warn "No GUI Start Menu shortcut was created because vpngate-gui.exe is unavailable."
+}
+foreach ($legacyShortcut in @($LegacyGuiStartMenuLnk, $LegacyStartMenuLnk)) {
+    if (($legacyShortcut -ine $StartMenuLnk) -and (Test-Path -LiteralPath $legacyShortcut)) {
+        Remove-Item -LiteralPath $legacyShortcut -Force -ErrorAction SilentlyContinue
+    }
 }
 
 Write-Host ""
@@ -797,12 +921,13 @@ Write-Ok "Installation complete! Running 'vpngate doctor' readiness check:"
 $prevEapDoc = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
 try {
-    & $TargetExe --cache-dir $CacheDir doctor --no-resize
+    & $TargetExe --cache-dir $CacheDir doctor
 } finally {
     $ErrorActionPreference = $prevEapDoc
 }
 Write-Host ""
-Write-Ok "Run 'vpngate' in PowerShell or Windows Terminal anytime to launch the console."
+Write-Ok "CLI command service is installed: vpngate"
+if (Test-Path -LiteralPath $TargetGuiExe) { Write-Ok "Primary native desktop GUI is installed: vpngate-gui" }
 if ($ElevatedChild) {
     Start-Sleep -Seconds 2
 }

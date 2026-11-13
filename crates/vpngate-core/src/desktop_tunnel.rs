@@ -977,9 +977,7 @@ pub fn probe_linux_l2tp_kernel_support() -> std::result::Result<(), String> {
 fn collect_linux_connection_dns(dev: &str) -> Vec<String> {
     let mut out = Vec::new();
     if which_bin("resolvectl").is_some()
-        && let Ok(o) = Command::new("resolvectl")
-            .args(["dns", dev])
-            .output()
+        && let Ok(o) = Command::new("resolvectl").args(["dns", dev]).output()
     {
         out.extend(parse_resolvectl_dns_output(&String::from_utf8_lossy(
             &o.stdout,
@@ -1102,7 +1100,11 @@ fn stop_ikev1_daemon_and_xfrm(paths: &AppPaths) {
 }
 
 /// Deletes leftover VPN Gate L2TP / OpenVPN profile files from the app cache.
-fn purge_cached_ovpn_files(paths: &AppPaths, quiet: bool, on_progress: &mut impl FnMut(ProgressEvent)) {
+fn purge_cached_ovpn_files(
+    paths: &AppPaths,
+    quiet: bool,
+    on_progress: &mut impl FnMut(ProgressEvent),
+) {
     let Ok(rd) = fs::read_dir(&paths.cache_dir) else {
         return;
     };
@@ -2157,6 +2159,23 @@ pub struct ConnectSessionConfig {
     pub start_index: usize,
     pub auto_reconnect: bool,
     pub in_monitor: bool,
+    /// Optional one-operation cancellation marker supplied by a controlling GUI.
+    pub cancel_file: Option<PathBuf>,
+}
+
+/// Wait for a GUI-owned, operation-specific cancellation marker. With no marker
+/// configured this future remains pending, so terminal Ctrl+C stays independent.
+pub async fn wait_for_cancel_file(path: Option<&Path>) {
+    let Some(path) = path else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    loop {
+        if path.is_file() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 /// Attempts connection across ranked `candidates` with plain text log callback.
@@ -2179,7 +2198,9 @@ pub async fn engage_candidates(
         } => on_log(&format!(
             "[{index}/{total}] Testing {hostname} ({ip} - {country_short}, {speed_mbps:.1} Mbps) ..."
         )),
-        ProgressEvent::Transient { .. } | ProgressEvent::ClearTransient => {}
+        ProgressEvent::Transient { .. }
+        | ProgressEvent::ClearTransient
+        | ProgressEvent::WorkProgress { .. } => {}
     })
     .await
 }
@@ -2204,6 +2225,7 @@ pub async fn engage_candidates_with_progress(
     let outcome = tokio::select! {
         biased;
         _ = tokio::signal::ctrl_c() => None,
+        _ = wait_for_cancel_file(cfg.cancel_file.as_deref()) => None,
         rc = engage_candidates_body(paths, candidates, cfg, &mut on_progress) => Some(rc),
     };
     match outcome {
@@ -2215,11 +2237,35 @@ pub async fn engage_candidates_with_progress(
             ));
             cleanup_existing_vpn_with_progress(paths, true, true, false, &mut on_progress);
             on_progress(ProgressEvent::Ok(
-                "Rolled back routes, DNS, firewall, and VPN Gate L2TP/OpenVPN profiles.".to_string(),
+                "Rolled back routes, DNS, firewall, and VPN Gate L2TP/OpenVPN profiles."
+                    .to_string(),
             ));
             INTERRUPTED_EXIT
         }
     }
+}
+
+fn report_connect_work_progress(
+    on_progress: &mut impl FnMut(ProgressEvent),
+    completed: usize,
+    total: usize,
+    stage: impl Into<String>,
+) {
+    on_progress(ProgressEvent::WorkProgress {
+        completed: completed.min(total),
+        total,
+        stage: stage.into(),
+    });
+}
+
+fn advance_connect_work_progress(
+    on_progress: &mut impl FnMut(ProgressEvent),
+    completed: &mut usize,
+    total: usize,
+    stage: impl Into<String>,
+) {
+    *completed = (*completed).saturating_add(1).min(total);
+    report_connect_work_progress(on_progress, *completed, total, stage);
 }
 
 async fn engage_candidates_body(
@@ -2228,6 +2274,26 @@ async fn engage_candidates_body(
     cfg: &ConnectSessionConfig,
     mut on_progress: impl FnMut(ProgressEvent),
 ) -> i32 {
+    let start_pos = cfg.start_index.saturating_sub(1);
+    let mut ordered: Vec<VpnServer> = candidates.iter().skip(start_pos).cloned().collect();
+    if cfg.limit > 0 && ordered.len() > cfg.limit {
+        ordered.truncate(cfg.limit);
+    }
+    let protocol_slots_total = ordered
+        .iter()
+        .map(|server| server.candidate_protocols(cfg.proto_filter).len())
+        .sum::<usize>();
+    // One preflight step, each candidate/protocol outcome (including explicit skips), and one
+    // terminal step. This is a count of tracked work units, not an elapsed-time estimate.
+    let total_work_units = protocol_slots_total.saturating_add(2);
+    let mut completed_work_units = 0usize;
+    report_connect_work_progress(
+        &mut on_progress,
+        completed_work_units,
+        total_work_units,
+        "Relay pool ready; preparing the connection",
+    );
+
     cleanup_existing_vpn(paths, false, !cfg.in_monitor);
 
     // Check pre-VPN public IP with live spinner
@@ -2267,12 +2333,6 @@ async fn engage_candidates_body(
         String::new()
     };
 
-    let start_pos = cfg.start_index.saturating_sub(1);
-    let mut ordered: Vec<VpnServer> = candidates.iter().skip(start_pos).cloned().collect();
-    if cfg.limit > 0 && ordered.len() > cfg.limit {
-        ordered.truncate(cfg.limit);
-    }
-
     let mut cooldowns = load_cooldowns(paths);
     let total = ordered.len();
     let linux_l2tp_err = if cfg!(target_os = "linux") {
@@ -2282,8 +2342,16 @@ async fn engage_candidates_body(
     };
     let mut warned_l2tp_kernel = false;
 
+    advance_connect_work_progress(
+        &mut on_progress,
+        &mut completed_work_units,
+        total_work_units,
+        "Connection preflight complete; processing planned protocols",
+    );
+
     for (idx, srv) in ordered.iter().enumerate() {
         let mut protos = srv.candidate_protocols(cfg.proto_filter);
+        let protocol_slots_for_relay = protos.len();
         if let Some(ref kerr) = linux_l2tp_err
             && protos.contains(&VpnProtocol::L2tpIpsec)
         {
@@ -2294,6 +2362,14 @@ async fn engage_candidates_body(
                 )));
             }
             protos.retain(|p| *p != VpnProtocol::L2tpIpsec);
+        }
+        for _ in 0..protocol_slots_for_relay.saturating_sub(protos.len()) {
+            advance_connect_work_progress(
+                &mut on_progress,
+                &mut completed_work_units,
+                total_work_units,
+                format!("Skipped unsupported protocol option for {}", srv.hostname),
+            );
         }
         if protos.is_empty() {
             continue;
@@ -2312,11 +2388,27 @@ async fn engage_candidates_body(
 
         for proto in protos {
             if cooldowns.is_on_cooldown(&srv.ip, proto) {
+                advance_connect_work_progress(
+                    &mut on_progress,
+                    &mut completed_work_units,
+                    total_work_units,
+                    format!(
+                        "Skipped {} on {} (cooldown)",
+                        proto.as_label(),
+                        srv.hostname
+                    ),
+                );
                 continue;
             }
             match proto {
                 VpnProtocol::L2tpIpsec => {
                     let Ok(ip_v4) = srv.ip.parse() else {
+                        advance_connect_work_progress(
+                            &mut on_progress,
+                            &mut completed_work_units,
+                            total_work_units,
+                            format!("Skipped L2TP/IPsec for {} (invalid relay IP)", srv.hostname),
+                        );
                         continue;
                     };
                     let pre =
@@ -2327,6 +2419,12 @@ async fn engage_candidates_body(
                         )));
                         cooldowns.mark_failed(&srv.ip, proto);
                         save_cooldowns(paths, &mut cooldowns);
+                        advance_connect_work_progress(
+                            &mut on_progress,
+                            &mut completed_work_units,
+                            total_work_units,
+                            format!("L2TP/IPsec pre-flight finished for {}", srv.hostname),
+                        );
                         continue;
                     }
                     on_progress(ProgressEvent::Info(if cfg!(target_os = "windows") {
@@ -2399,6 +2497,34 @@ async fn engage_candidates_body(
                                         )));
                                     }
                                 }
+                                advance_connect_work_progress(
+                                    &mut on_progress,
+                                    &mut completed_work_units,
+                                    total_work_units,
+                                    format!(
+                                        "Verified {} through {}",
+                                        proto.as_label(),
+                                        srv.hostname
+                                    ),
+                                );
+                                let all_protocol_slots = total_work_units.saturating_sub(2);
+                                let completed_protocol_slots =
+                                    completed_work_units.saturating_sub(1);
+                                if completed_protocol_slots < all_protocol_slots {
+                                    completed_work_units = total_work_units - 1;
+                                    report_connect_work_progress(
+                                        &mut on_progress,
+                                        completed_work_units,
+                                        total_work_units,
+                                        "Remaining fallback protocol checks are not needed",
+                                    );
+                                }
+                                advance_connect_work_progress(
+                                    &mut on_progress,
+                                    &mut completed_work_units,
+                                    total_work_units,
+                                    "Tunnel verified and session recorded",
+                                );
                                 return 0;
                             }
                             on_progress(ProgressEvent::Warn(format!(
@@ -2436,6 +2562,15 @@ async fn engage_candidates_body(
                             )));
                             cooldowns.mark_failed(&srv.ip, proto);
                             save_cooldowns(paths, &mut cooldowns);
+                            advance_connect_work_progress(
+                                &mut on_progress,
+                                &mut completed_work_units,
+                                total_work_units,
+                                format!(
+                                    "Skipped OpenVPN TCP on {} (port unreachable)",
+                                    srv.hostname
+                                ),
+                            );
                             continue;
                         }
                     }
@@ -2488,6 +2623,34 @@ async fn engage_candidates_body(
                                         )));
                                     }
                                 }
+                                advance_connect_work_progress(
+                                    &mut on_progress,
+                                    &mut completed_work_units,
+                                    total_work_units,
+                                    format!(
+                                        "Verified {} through {}",
+                                        proto.as_label(),
+                                        srv.hostname
+                                    ),
+                                );
+                                let all_protocol_slots = total_work_units.saturating_sub(2);
+                                let completed_protocol_slots =
+                                    completed_work_units.saturating_sub(1);
+                                if completed_protocol_slots < all_protocol_slots {
+                                    completed_work_units = total_work_units - 1;
+                                    report_connect_work_progress(
+                                        &mut on_progress,
+                                        completed_work_units,
+                                        total_work_units,
+                                        "Remaining fallback protocol checks are not needed",
+                                    );
+                                }
+                                advance_connect_work_progress(
+                                    &mut on_progress,
+                                    &mut completed_work_units,
+                                    total_work_units,
+                                    "Tunnel verified and session recorded",
+                                );
                                 return 0;
                             }
                             on_progress(ProgressEvent::Warn(
@@ -2507,10 +2670,29 @@ async fn engage_candidates_body(
                     save_cooldowns(paths, &mut cooldowns);
                 }
             }
+            advance_connect_work_progress(
+                &mut on_progress,
+                &mut completed_work_units,
+                total_work_units,
+                format!("Completed {} check for {}", proto.as_label(), srv.hostname),
+            );
         }
     }
 
     cleanup_existing_vpn(paths, !cfg.in_monitor, !cfg.in_monitor);
+    let all_protocol_slots = total_work_units.saturating_sub(2);
+    let completed_protocol_slots = completed_work_units.saturating_sub(1);
+    let final_stage = if completed_protocol_slots == all_protocol_slots {
+        "Candidate pass ended; cleanup complete"
+    } else {
+        "Candidate pass ended with uncompleted protocol checks; cleanup complete"
+    };
+    advance_connect_work_progress(
+        &mut on_progress,
+        &mut completed_work_units,
+        total_work_units,
+        final_stage,
+    );
     1
 }
 
@@ -2644,6 +2826,7 @@ pub async fn run_monitor_daemon(paths: &AppPaths) -> i32 {
             start_index: 1,
             auto_reconnect: true,
             in_monitor: true,
+            cancel_file: None,
         };
         let _ = engage_candidates(paths, &cands, &cfg, |msg| append_monitor_log(paths, msg)).await;
     }
