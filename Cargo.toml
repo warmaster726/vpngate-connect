@@ -14,7 +14,6 @@ version = "0.5.2"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/warmaster726/vpngate-connect"
-homepage = "https://github.com/warmaster726/vpngate-connect"
 authors = ["warmaster726 <warmaster726@users.noreply.github.com>"]
 keywords = ["vpn", "vpngate", "l2tp", "ipsec", "openvpn"]
 categories = ["command-line-utilities", "network-programming"]
