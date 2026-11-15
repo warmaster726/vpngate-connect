@@ -5,6 +5,8 @@
 # Priority: Auto (L2TP/IPsec -> OpenVPN UDP -> OpenVPN TCP) | Built-In Rust IKEv1 + Kernel XFRM + xl2tpd/ppp + OpenVPN
 set -eu
 
+err() { echo "[-] $*" >&2; }
+
 main() {
 
 if CDPATH='' cd -- "$(dirname -- "$0")" 2>/dev/null; then
@@ -79,12 +81,12 @@ while [ "$#" -gt 0 ]; do
       TOOLCHAIN_POLICY="remove"
       ;;
     --repo)
-      [ "$#" -gt 0 ] || { echo "[!] Missing value for --repo" >&2; exit 2; }
+      [ "$#" -gt 0 ] || { err "Missing value for --repo"; exit 2; }
       REPO_SLUG="$1"
       shift
       ;;
     --branch)
-      [ "$#" -gt 0 ] || { echo "[!] Missing value for --branch" >&2; exit 2; }
+      [ "$#" -gt 0 ] || { err "Missing value for --branch"; exit 2; }
       BRANCH_NAME="$1"
       shift
       ;;
@@ -93,7 +95,7 @@ while [ "$#" -gt 0 ]; do
       exit 0
       ;;
     *)
-      echo "[!] Unknown option: $arg" >&2
+      err "Unknown option: $arg"
       echo "" >&2
       show_help >&2
       exit 2
@@ -201,13 +203,13 @@ if [ "$(id -u)" -eq 0 ]; then
   if ! command -v sudo >/dev/null 2>&1; then
     sudo() {
       if [ "${1:-}" = "-u" ]; then
-        [ "$#" -ge 2 ] || { echo "[!] sudo -u requires a user name." >&2; return 2; }
+        [ "$#" -ge 2 ] || { err "sudo -u requires a user name."; return 2; }
         _sudo_target="$2"
         shift 2
         if command -v runuser >/dev/null 2>&1; then
           runuser -u "${_sudo_target}" -- env "$@"
         else
-          echo "[!] Cannot run a command as ${_sudo_target}: install sudo or runuser." >&2
+          err "Cannot run a command as ${_sudo_target}: install sudo or runuser."
           return 127
         fi
       else
@@ -216,7 +218,7 @@ if [ "$(id -u)" -eq 0 ]; then
     }
   fi
 elif ! command -v sudo >/dev/null 2>&1; then
-  warn "Root privileges are required (and 'sudo' was not found). Please run as root."
+  err "Root privileges are required (and 'sudo' was not found). Please run as root."
   exit 1
 elif [ ! -t 0 ] && ( : </dev/tty ) 2>/dev/null; then
   # shellcheck disable=SC2024
@@ -589,7 +591,7 @@ if [ "${MODE}" = "uninstall" ]; then
   if [ "${LEFTOVER_COUNT}" -eq 0 ]; then
     ok "Verification PASSED: VPN Gate has been completely removed with zero remaining residues."
   else
-    warn "Verification noticed remaining path(s):${LEFTOVER_LIST}"
+    err "Verification noticed remaining path(s):${LEFTOVER_LIST}"
     exit 1
   fi
   exit 0
@@ -674,8 +676,8 @@ fi
 if [ "${SKIP_DEPS}" -eq 0 ]; then
   if [ "${HOST_UNAME}" = "Darwin" ]; then
     if ! xcode-select -p >/dev/null 2>&1; then
-      warn "Apple Command Line Tools ('cc' linker) not found. Launching 'xcode-select --install' ..."
-      warn "Command Line Tools stay on the Mac; this installer will not remove them."
+      info "Apple Command Line Tools ('cc' linker) not found. Launching 'xcode-select --install' ..."
+      info "Command Line Tools stay on the Mac; this installer will not remove them."
       xcode-select --install || true
     fi
     if command -v brew >/dev/null 2>&1; then
@@ -797,7 +799,7 @@ if [ ! -f "${WORK_SRC_DIR}/Cargo.toml" ] && [ ! -x "${WORK_SRC_DIR}/vpngate" ]; 
   fi
   case "${BRANCH_NAME}" in
     ''|*[!A-Za-z0-9._/+@-]*|*..*|/*|*/|*//*)
-      warn "Invalid source branch name: ${BRANCH_NAME}"
+      err "Invalid source branch name: ${BRANCH_NAME}"
       exit 2
       ;;
   esac
@@ -810,7 +812,7 @@ if [ ! -f "${WORK_SRC_DIR}/Cargo.toml" ] && [ ! -x "${WORK_SRC_DIR}/vpngate" ]; 
   rm -f "${SRC_STAGE_DIR}/src.tar.gz"
   EXTRACTED_DIR="$(find "${SRC_STAGE_DIR}" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
   if [ -z "${EXTRACTED_DIR}" ] || [ ! -f "${EXTRACTED_DIR}/Cargo.toml" ]; then
-    warn "Downloaded source archive did not contain Cargo.toml."
+    err "Downloaded source archive did not contain Cargo.toml."
     exit 1
   fi
   if [ "$(id -u)" -eq 0 ] && [ -n "${TARGET_UID}" ]; then
@@ -955,7 +957,7 @@ elif [ -x "${WORK_SRC_DIR}/vpngate" ]; then
 fi
 
 if [ -z "${BIN_SRC}" ] || [ ! -f "${BIN_SRC}" ]; then
-  warn "Could not build or locate 'vpngate' binary."
+  err "Could not build or locate 'vpngate' binary."
   exit 1
 fi
 if command -v file >/dev/null 2>&1; then

@@ -907,8 +907,6 @@ if ($GuiBinSource -and (Test-Path -LiteralPath $TargetGuiExe)) {
         if ($GuiShortcut) { try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($GuiShortcut) | Out-Null } catch {} }
         if ($WshShell) { try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($WshShell) | Out-Null } catch {} }
     }
-} else {
-    Write-Warn "No GUI Start Menu shortcut was created because vpngate-gui.exe is unavailable."
 }
 foreach ($legacyShortcut in @($LegacyGuiStartMenuLnk, $LegacyStartMenuLnk)) {
     if (($legacyShortcut -ine $StartMenuLnk) -and (Test-Path -LiteralPath $legacyShortcut)) {

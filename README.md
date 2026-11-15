@@ -28,7 +28,7 @@ Censorship-resilient **SoftEther VPN Gate** desktop client engineered around a *
 | Branch | Status | Description |
 | :--- | :--- | :--- |
 | **`main`** | **Active (Default)** | Public **0.4.x** Pure-Rust 64-bit Desktop Edition; it remains unchanged until an authorized merge from `develop`. |
-| **`develop`** | **Active (integration)** | Desktop **0.5.2**: native GUI operation-progress cards/bars and removal of the attempt-time setting from the GUI. The 0.5.1 searchable multi-region selection remains. Push integration work here first. |
+| **`develop`** | **Active (integration)** | Desktop **0.5.3**: retains the 0.5.2 native GUI progress improvements and reduces installer warning noise without changing the web app version. Push integration work here first. |
 
 ---
 
@@ -104,7 +104,7 @@ cargo build --release --locked -p vpngate-cli --target x86_64-unknown-linux-gnu
 
 ## Native GUI and CLI Command Service
 
-Desktop 0.5.2 makes the native GUI the only interactive desktop frontend. It retains the 0.5.1 searchable multi-region selector and responsive Connect layout, and adds operation-progress cards/bars in the available page layout. The attempt-time threshold is no longer exposed as a GUI control.
+Desktop 0.5.3 retains the 0.5.2 native-GUI workflow and progress improvements. Installer output is quieter: fatal argument/build/verification failures are reported as errors, routine macOS Command Line Tools setup as information, and the Windows missing-GUI condition is no longer warned twice.
 
 - **VPN Gate Connect GUI** — run `vpngate-gui` for the eframe/egui interface on Linux, Windows 11, or macOS. It supports light/dark themes, connect, relay browsing, tools, status, diagnostics, watchdog, disconnect, and desktop update actions.
 - **CLI action service** — run `vpngate --help` for the retained command/subcommand and operational flag reference. With no command, `vpngate` prints help; it does not open a terminal dashboard, GTK/VTE host, or Windows Terminal window.
