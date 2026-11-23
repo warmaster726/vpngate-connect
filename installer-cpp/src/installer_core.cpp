@@ -1,4 +1,5 @@
 #include "installer_core.hpp"
+#include "host_integration.hpp"
 
 #include <QCoreApplication>
 #include <QCryptographicHash>
@@ -60,6 +61,25 @@ struct Manifest {
     QString prefix;
     QVector<ManifestEntry> files;
     QVector<QString> createdDirectories;
+};
+
+class ScopedEnvironmentVariable final {
+public:
+    explicit ScopedEnvironmentVariable(const QByteArray &name)
+        : name_(name), wasSet_(qEnvironmentVariableIsSet(name.constData())), previous_(qgetenv(name.constData())) {}
+    ~ScopedEnvironmentVariable() {
+        if (wasSet_) {
+            qputenv(name_.constData(), previous_);
+        } else {
+            qunsetenv(name_.constData());
+        }
+    }
+    void set(const QString &value) { qputenv(name_.constData(), value.toLocal8Bit()); }
+
+private:
+    QByteArray name_;
+    bool wasSet_ = false;
+    QByteArray previous_;
 };
 
 QString executableSuffix() {
@@ -614,16 +634,25 @@ bool createPlan(const QString &sourceRoot, const QString &prefix,
         return false;
     }
 #elif defined(Q_OS_MACOS)
-    if (!addCopy(files, cli, QStringLiteral("Contents/MacOS/vpngate"), true, error, allowMissingArtifacts)
-        || !addCopy(files, gui, QStringLiteral("Contents/MacOS/vpngate-gui"), true, error, allowMissingArtifacts)
-        || !addCopy(files, QDir(sourceRoot).filePath(QStringLiteral("assets/vpngate.svg")),
-                    QStringLiteral("Contents/Resources/vpngate.svg"), false, error)
-        || !addCopy(files, QDir(sourceRoot).filePath(QStringLiteral("assets/vpngate-512.png")),
-                    QStringLiteral("Contents/Resources/vpngate-512.png"), false, error)) {
-        return false;
+    if (absoluteCleanPath(prefix) == absoluteCleanPath(systemInstallPrefix())) {
+        if (!addCopy(files, cli, QStringLiteral("bin/vpngate"), true, error, allowMissingArtifacts)
+            || !addCopy(files, gui, QStringLiteral("bin/vpngate-gui"), true, error, allowMissingArtifacts)
+            || !addCopy(files, QDir(sourceRoot).filePath(QStringLiteral("LICENSE")),
+                        QStringLiteral("share/vpngate/LICENSE"), false, error)) {
+            return false;
+        }
+    } else {
+        if (!addCopy(files, cli, QStringLiteral("Contents/MacOS/vpngate"), true, error, allowMissingArtifacts)
+            || !addCopy(files, gui, QStringLiteral("Contents/MacOS/vpngate-gui"), true, error, allowMissingArtifacts)
+            || !addCopy(files, QDir(sourceRoot).filePath(QStringLiteral("assets/vpngate.svg")),
+                        QStringLiteral("Contents/Resources/vpngate.svg"), false, error)
+            || !addCopy(files, QDir(sourceRoot).filePath(QStringLiteral("assets/vpngate-512.png")),
+                        QStringLiteral("Contents/Resources/vpngate-512.png"), false, error)) {
+            return false;
+        }
+        files->append({QStringLiteral("Contents/Info.plist"), {}, macInfoPlist(), true, false});
+        files->append({QStringLiteral("Contents/PkgInfo"), {}, QByteArrayLiteral("APPL????"), true, false});
     }
-    files->append({QStringLiteral("Contents/Info.plist"), {}, macInfoPlist(), true, false});
-    files->append({QStringLiteral("Contents/PkgInfo"), {}, QByteArrayLiteral("APPL????"), true, false});
 #else
     if (!addCopy(files, cli, QStringLiteral("bin/vpngate%1").arg(exe), true, error, allowMissingArtifacts)
         || !addCopy(files, gui, QStringLiteral("bin/vpngate-gui%1").arg(exe), true, error, allowMissingArtifacts)
@@ -901,33 +930,47 @@ void removeEmptyCreatedDirectories(const QString &prefix, const QStringList &dir
     }
 }
 
-QVector<QString> defaultAppStateDirectories() {
+QVector<QString> defaultAppStateDirectories(const Options &options) {
     QVector<QString> paths;
 #if defined(Q_OS_WIN)
     QString localAppData = qEnvironmentVariable("LOCALAPPDATA");
+    if (!options.targetHome.isEmpty()) {
+        localAppData = QDir(options.targetHome).filePath(QStringLiteral("AppData/Local"));
+    }
     if (localAppData.isEmpty() || !QDir::isAbsolutePath(localAppData) || QDir(localAppData).isRoot()) {
         localAppData = QDir::home().filePath(QStringLiteral("AppData/Local"));
     }
-    paths.append(QDir(localAppData).filePath(QStringLiteral("vpngate")));
+    paths.append(options.cacheDir.isEmpty()
+                     ? QDir(localAppData).filePath(QStringLiteral("vpngate"))
+                     : QDir::cleanPath(options.cacheDir));
 #elif defined(Q_OS_MACOS)
-    QString home = qEnvironmentVariable("HOME");
+    QString home = options.targetHome;
+    if (home.isEmpty()) {
+        home = qEnvironmentVariable("HOME");
+    }
     if (home.isEmpty() || !QDir::isAbsolutePath(home) || QDir(home).isRoot()) {
         home = QDir::homePath();
     }
-    paths.append(QDir(home).filePath(QStringLiteral("Library/Caches/vpngate")));
+    paths.append(options.cacheDir.isEmpty()
+                     ? QDir(home).filePath(QStringLiteral("Library/Caches/vpngate"))
+                     : QDir::cleanPath(options.cacheDir));
     paths.append(QDir(home).filePath(QStringLiteral(".config/vpngate")));
 #else
+    QString home = options.targetHome.isEmpty() ? QDir::homePath() : options.targetHome;
     QString cacheHome = qEnvironmentVariable("XDG_CACHE_HOME");
     if (cacheHome.isEmpty() || !QDir::isAbsolutePath(cacheHome) || QDir(cacheHome).isRoot()) {
-        cacheHome = QDir::home().filePath(QStringLiteral(".cache"));
+        cacheHome = QDir(home).filePath(QStringLiteral(".cache"));
     }
     QString configHome = qEnvironmentVariable("XDG_CONFIG_HOME");
     if (configHome.isEmpty() || !QDir::isAbsolutePath(configHome) || QDir(configHome).isRoot()) {
-        configHome = QDir::home().filePath(QStringLiteral(".config"));
+        configHome = QDir(home).filePath(QStringLiteral(".config"));
     }
-    paths.append(QDir(cacheHome).filePath(QStringLiteral("vpngate")));
+    paths.append(options.cacheDir.isEmpty()
+                     ? QDir(cacheHome).filePath(QStringLiteral("vpngate"))
+                     : QDir::cleanPath(options.cacheDir));
     paths.append(QDir(configHome).filePath(QStringLiteral("vpngate")));
 #endif
+    paths.removeDuplicates();
     return paths;
 }
 
@@ -987,8 +1030,11 @@ QString normalizePrefixOrDefault(const QString &prefix) {
     return absoluteCleanPath(prefix.isEmpty() ? defaultPrefix() : prefix);
 }
 
-bool validatePerUserPrefix(const QString &prefix, QString *error) {
+bool validatePerUserPrefix(const QString &prefix, QString *error, bool allowSystemPrefix = false) {
     const QString normalized = absoluteCleanPath(prefix);
+    if (allowSystemPrefix && normalized == absoluteCleanPath(systemInstallPrefix())) {
+        return true;
+    }
     if (QDir(normalized).isRoot()) {
         if (error) {
             *error = QStringLiteral("The install prefix must be a per-user directory, not a filesystem root.");
@@ -1019,7 +1065,7 @@ bool validatePerUserPrefix(const QString &prefix, QString *error) {
     for (const QString &root : std::as_const(systemRoots)) {
         if (!root.isEmpty() && isWithinPrefix(root, normalized)) {
             if (error) {
-                *error = QStringLiteral("This migration build is per-user only and refuses system-wide install prefixes: %1")
+                *error = QStringLiteral("The install prefix is inside a protected system directory; use the native system prefix or choose a user-owned directory: %1")
                              .arg(normalized);
             }
             return false;
@@ -1092,7 +1138,7 @@ Result uninstall(const QString &prefix, const Options &options) {
     for (const ManifestEntry &entry : manifest.files) {
         result.output.append(QStringLiteral("  - %1").arg(joinedPath(prefix, entry.relativePath)));
     }
-    const QVector<QString> stateDirectories = defaultAppStateDirectories();
+    const QVector<QString> stateDirectories = defaultAppStateDirectories(options);
     for (const QString &directory : stateDirectories) {
         result.output.append(QStringLiteral("  - app-owned state (if present): %1").arg(directory));
     }
@@ -1356,27 +1402,31 @@ bool supportedHost(QString *reason) {
 
 QString manifestPathForPrefix(const QString &prefix) {
 #if defined(Q_OS_MACOS)
-    return QDir(prefix).filePath(QStringLiteral("Contents/Resources/vpngate-installer-manifest.json"));
-#else
-    return QDir(prefix).filePath(QStringLiteral("share/vpngate/installer-manifest.json"));
+    if (absoluteCleanPath(prefix) != absoluteCleanPath(systemInstallPrefix())) {
+        return QDir(prefix).filePath(QStringLiteral("Contents/Resources/vpngate-installer-manifest.json"));
+    }
 #endif
+    return QDir(prefix).filePath(QStringLiteral("share/vpngate/installer-manifest.json"));
 }
 
 QString helpText() {
     return QStringLiteral(
-        "VPN Gate Connect C++ installer (migration prototype)\n\n"
+        "VPN Gate Connect C++ installer (host migration; native validation pending)\n\n"
         "Usage:\n"
-        "  vpngate-installer install   --source <checkout> [--prefix <dir>] [--dry-run] [--no-build] [--yes]\n"
-        "  vpngate-installer uninstall  [--prefix <dir>] [--dry-run] [--yes] [--force]\n"
-        "  vpngate-installer verify     [--prefix <dir>]\n"
+        "  vpngate-installer install   [--source <checkout>] [--prefix <dir>] [--dry-run] [--yes]\n"
+        "  vpngate-installer uninstall [--prefix <dir>] [--dry-run] [--yes] [--force]\n"
+        "  vpngate-installer verify    [--prefix <dir>]\n"
         "  vpngate-installer --help | --version\n\n"
-        "This branch installs per-user only. It builds the existing Rust CLI and GUI with Cargo,\n"
-        "records installed-file SHA-256 hashes, and removes only files from that inventory.\n"
-        "System package installation, machine-wide settings, and toolchain bootstrapping are not\n"
-        "ported yet; the current platform scripts remain the full-featured installer for now.\n"
-        "Use --dry-run to preview. Real changes require --yes (GUI actions confirm before invoking the CLI).\n"
-        "--force permits removing modified files that are already listed in the installer manifest;\n"
-        "it never broadens cleanup to unrelated files or package-manager contents.\n");
+        "The CLI defaults to the full host workflow on Linux, macOS, and Windows; use --dry-run first.\n"
+        "Confirmed system workflows request sudo on POSIX hosts or UAC on Windows when needed.\n"
+        "Use --user-only for a per-user install. Launch with no arguments for the per-user GUI workflow.\n"
+        "Host integrations are implemented but still require native platform parity and side-effect tests;\n"
+        "keep using the existing scripts until those checks pass.\n"
+        "Real changes require --yes. Options include --skip-deps, --skip-openvpn, --install-openvpn,\n"
+        "--restore-natt (uninstall), --purge-packages, --keep-toolchain, --remove-toolchain,\n"
+        "--repo <owner/repo>, --branch <name>, and --cache-dir <dir>.\n"
+        "--force permits replacing/removing modified files already listed in the C++ installer manifest;\n"
+        "it does not expand cleanup to arbitrary files.\n");
 }
 
 namespace {
@@ -1450,7 +1500,9 @@ Result install(const QString &sourceRoot, const QString &prefix, const Options &
         result.output.append(QStringLiteral("  - %1").arg(joinedPath(prefix, file.relativePath)));
     }
     result.output.append(QStringLiteral("Installer manifest: %1").arg(manifestPathForPrefix(prefix)));
-    result.output.append(QStringLiteral("Install mode: per-user; no sudo, UAC, registry, firewall, or package-manager changes."));
+    result.output.append(options.allowSystemPrefix
+        ? QStringLiteral("Install mode: full system workflow; host-level actions are listed separately and files are recorded in the manifest.")
+        : QStringLiteral("Install mode: per-user; no sudo, UAC, registry, firewall, or package-manager changes."));
     if (options.dryRun) {
         result.output.append(QStringLiteral("[dry-run] No files were written."));
         if (options.progress) {
@@ -1671,16 +1723,254 @@ Result install(const QString &sourceRoot, const QString &prefix, const Options &
     }
     result.output.append(QStringLiteral("[ok] Installed %1 file(s) under %2").arg(files.size()).arg(prefix));
     result.output.append(QStringLiteral("[ok] Inventory written with SHA-256 hashes; uninstaller will remove only tracked entries."));
-    result.output.append(QStringLiteral("[note] This migration build is per-user only. System packages, firewall/NAT-T settings, and legacy global installs are not changed."));
+    result.output.append(options.allowSystemPrefix
+        ? QStringLiteral("[note] Host-level setup was handled by the platform integration; this manifest owns only the files listed above.")
+        : QStringLiteral("[note] This is the per-user migration workflow. System packages, firewall/NAT-T settings, and legacy global installs are not changed."));
     return result;
 }
 
 } // namespace
 
-Result run(const Options &options) {
+Result run(const Options &requestedOptions) {
+    Options options = requestedOptions;
+    const bool fullSystemWorkflow = options.fullWorkflow && !options.userOnly;
+#if defined(Q_OS_WIN)
+    const bool windowsHostWorkflow = options.fullWorkflow;
+#else
+    const bool windowsHostWorkflow = false;
+#endif
+    if (fullSystemWorkflow || windowsHostWorkflow) {
+        if (options.prefix.isEmpty()) {
+            options.prefix = systemInstallPrefix();
+        }
+        options.allowSystemPrefix = fullSystemWorkflow;
+        if (options.targetHome.isEmpty()) {
+            options.targetHome = hostTargetHome(options);
+        }
+        if (options.cacheDir.isEmpty()) {
+            options.cacheDir = hostCacheDirectory(options);
+        }
+        if (options.action == Action::Verify) {
+            options.fullWorkflow = false;
+            return run(options);
+        }
+        if (!options.dryRun && !options.assumeYes) {
+            Result confirmation;
+            confirmation.exitCode = 2;
+            confirmation.output.append(QStringLiteral("This workflow changes installed files and may change system packages, registry, firewall, services, PATH, or network state. Review with --dry-run, then rerun with --yes."));
+            return confirmation;
+        }
+#if defined(Q_OS_LINUX) || defined(Q_OS_MACOS)
+        if (fullSystemWorkflow && !options.dryRun && ::geteuid() != 0) {
+            Result denied;
+            denied.exitCode = 1;
+            denied.output.append(QStringLiteral("[error] System installation requires administrator privileges. Run this command with sudo, or use --user-only for a per-user install."));
+            return denied;
+        }
+#elif defined(Q_OS_WIN)
+        if (fullSystemWorkflow && !options.dryRun && !windowsAdministratorAvailable()) {
+            Result denied;
+            denied.exitCode = 1;
+            denied.output.append(QStringLiteral("[error] Windows host integration requires an elevated administrator session; rerun and accept the UAC prompt, or use --user-only."));
+            return denied;
+        }
+#endif
+        QString scopeError;
+        const QString fullPrefix = normalizePrefixOrDefault(options.prefix);
+        if (!validatePerUserPrefix(fullPrefix, &scopeError, true)) {
+            Result rejected;
+            rejected.exitCode = 1;
+            rejected.output.append(QStringLiteral("[error] %1").arg(scopeError));
+            return rejected;
+        }
+
+        if (options.action == Action::Install) {
+            QString hostError;
+            if (!supportedHost(&hostError)) {
+                Result rejected;
+                rejected.exitCode = 1;
+                rejected.output.append(QStringLiteral("[error] %1").arg(hostError));
+                return rejected;
+            }
+            QString source = absoluteCleanPath(options.sourceDir.isEmpty() ? defaultSourceDir() : options.sourceDir);
+            QString validationError;
+            bool localSource = validateSourceRoot(source, &validationError);
+            if (!localSource && !options.sourceDir.isEmpty()) {
+                Result rejected;
+                rejected.exitCode = 1;
+                rejected.output.append(QStringLiteral("[error] %1").arg(validationError));
+                return rejected;
+            }
+            if (!localSource && options.noBuild && !options.dryRun) {
+                Result rejected;
+                rejected.exitCode = 1;
+                rejected.output.append(QStringLiteral("[error] --no-build requires a local checkout with prebuilt vpngate and vpngate-gui artifacts."));
+                return rejected;
+            }
+            if (localSource && options.noBuild) {
+                QVector<PlannedFile> prebuiltFiles;
+                if (!createPlan(source, fullPrefix, &prebuiltFiles, &validationError, {}, false)) {
+                    Result rejected;
+                    rejected.exitCode = 1;
+                    rejected.output.append(QStringLiteral("[error] %1").arg(validationError));
+                    return rejected;
+                }
+            }
+            if (!localSource) {
+                QString branch = options.branchName.trimmed();
+                if (branch.isEmpty()) {
+                    branch = qEnvironmentVariable("VPNGATE_BRANCH", QStringLiteral("main"));
+                }
+                static const QRegularExpression repoRe(QStringLiteral("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"));
+                static const QRegularExpression branchRe(QStringLiteral("^[A-Za-z0-9._/+@-]+$"));
+                if (!repoRe.match(options.repoSlug.trimmed()).hasMatch()
+                    || options.repoSlug.contains(QStringLiteral(".."))
+                    || !branchRe.match(branch).hasMatch() || branch.contains(QStringLiteral(".."))
+                    || branch.startsWith(QLatin1Char('/')) || branch.endsWith(QLatin1Char('/'))
+                    || branch.contains(QStringLiteral("//"))) {
+                    Result rejected;
+                    rejected.exitCode = 2;
+                    rejected.output.append(QStringLiteral("[error] Invalid GitHub repository or source branch."));
+                    return rejected;
+                }
+            }
+            Result host = prepareHostInstall(options);
+            if (host.exitCode != 0) {
+                return host;
+            }
+            if (!localSource && options.dryRun) {
+                QString branch = options.branchName.trimmed();
+                if (branch.isEmpty()) {
+                    branch = qEnvironmentVariable("VPNGATE_BRANCH", QStringLiteral("main"));
+                }
+                host.output.append(QStringLiteral("[plan] Download %1 branch '%2' from GitHub into temporary storage; dry-run skips the network fetch and per-file listing.")
+                                      .arg(options.repoSlug, branch));
+                Result finishing = finishHostInstall(options);
+                host.output.append(finishing.output);
+                host.exitCode = finishing.exitCode;
+                return host;
+            }
+
+            QTemporaryDir sourceStaging;
+            if (!localSource) {
+                if (!sourceStaging.isValid()) {
+                    host.exitCode = 1;
+                    host.output.append(QStringLiteral("[error] Could not create temporary source staging storage."));
+                    return host;
+                }
+                if (!downloadSourceArchive(options, sourceStaging.path(), &source, &host.output, &validationError)) {
+                    host.exitCode = 1;
+                    host.output.append(QStringLiteral("[error] %1").arg(validationError));
+                    return host;
+                }
+                if (!validateSourceRoot(source, &validationError)) {
+                    host.exitCode = 1;
+                    host.output.append(QStringLiteral("[error] Downloaded source checkout failed validation: %1").arg(validationError));
+                    return host;
+                }
+            }
+
+            QTemporaryDir toolchainStaging;
+            ScopedEnvironmentVariable cargoEnvironment(QByteArrayLiteral("CARGO_HOME"));
+            ScopedEnvironmentVariable rustupEnvironment(QByteArrayLiteral("RUSTUP_HOME"));
+            ScopedEnvironmentVariable pathEnvironment(QByteArrayLiteral("PATH"));
+            if (!options.noBuild && options.dryRun) {
+                host.output.append(QStringLiteral("[plan] Build the Rust CLI and GUI; if Cargo is missing, bootstrap a temporary stable rustup toolchain unless --keep-toolchain is set."));
+            } else if (!options.noBuild) {
+                if (!toolchainStaging.isValid()) {
+                    host.exitCode = 1;
+                    host.output.append(QStringLiteral("[error] Could not create temporary Rust toolchain staging storage."));
+                    return host;
+                }
+                QString cargoHome;
+                QString rustupHome;
+                if (!prepareBuildToolchain(options, toolchainStaging.path(), &host.output,
+                                           &cargoHome, &rustupHome, &validationError)) {
+                    host.exitCode = 1;
+                    host.output.append(QStringLiteral("[error] %1").arg(validationError));
+                    return host;
+                }
+                const QString invokingUser = qEnvironmentVariable("SUDO_USER");
+                bool keepToolchainForInvokingUser = false;
+#if defined(Q_OS_LINUX) || defined(Q_OS_MACOS)
+                keepToolchainForInvokingUser = options.keepToolchain && !options.removeToolchain
+                    && ::geteuid() == 0 && !invokingUser.isEmpty() && invokingUser != QStringLiteral("root");
+#endif
+                if (keepToolchainForInvokingUser && !cargoHome.isEmpty()) {
+                    const QString buildCargoHome = QDir(toolchainStaging.path()).filePath(QStringLiteral("cargo-build"));
+                    if (!QDir().mkpath(buildCargoHome)) {
+                        host.exitCode = 1;
+                        host.output.append(QStringLiteral("[error] Could not create isolated Cargo cache for the invoking user's persistent Rust toolchain."));
+                        return host;
+                    }
+                    cargoEnvironment.set(buildCargoHome);
+                    if (!rustupHome.isEmpty()) {
+                        rustupEnvironment.set(rustupHome);
+                    }
+                    const QString userCargoBin = QDir(cargoHome).filePath(QStringLiteral("bin"));
+                    pathEnvironment.set(userCargoBin + QDir::listSeparator() + qEnvironmentVariable("PATH"));
+                } else {
+                    if (!cargoHome.isEmpty()) {
+                        cargoEnvironment.set(cargoHome);
+                    }
+                    if (!rustupHome.isEmpty()) {
+                        rustupEnvironment.set(rustupHome);
+                    }
+                }
+            }
+
+            Options coreOptions = options;
+            coreOptions.action = Action::Install;
+            coreOptions.fullWorkflow = false;
+            coreOptions.assumeYes = options.dryRun || options.assumeYes;
+            coreOptions.prefix = fullPrefix;
+            coreOptions.sourceDir = source;
+            Result client = run(coreOptions);
+            host.output.append(client.output);
+            if (client.exitCode != 0) {
+                host.exitCode = client.exitCode;
+                return host;
+            }
+            Result finishing = finishHostInstall(options);
+            host.output.append(finishing.output);
+            if (finishing.exitCode != 0) {
+                host.exitCode = finishing.exitCode;
+            }
+            return host;
+        }
+
+        Result cleanup = cleanupLegacyInstall(options);
+        if (cleanup.exitCode != 0) {
+            return cleanup;
+        }
+        const QString manifestPath = manifestPathForPrefix(fullPrefix);
+        const QFileInfo manifestInfo(manifestPath);
+        if (manifestInfo.exists() || manifestInfo.isSymLink()) {
+            Options coreOptions = options;
+            coreOptions.action = Action::Uninstall;
+            coreOptions.fullWorkflow = false;
+            coreOptions.assumeYes = options.dryRun || options.assumeYes;
+            coreOptions.prefix = fullPrefix;
+            Result client = run(coreOptions);
+            cleanup.output.append(client.output);
+            if (client.exitCode != 0) {
+                cleanup.exitCode = client.exitCode;
+                return cleanup;
+            }
+        } else {
+            cleanup.output.append(QStringLiteral("[info] No C++ installer manifest was present; legacy VPN Gate residue cleanup was attempted."));
+        }
+        Result verification = finishHostUninstall(options);
+        cleanup.output.append(verification.output);
+        if (verification.exitCode != 0) {
+            cleanup.exitCode = verification.exitCode;
+        }
+        return cleanup;
+    }
+
     const QString prefix = normalizePrefixOrDefault(options.prefix);
     QString scopeError;
-    if (!validatePerUserPrefix(prefix, &scopeError)) {
+    if (!validatePerUserPrefix(prefix, &scopeError, options.allowSystemPrefix)) {
         Result rejected;
         rejected.exitCode = 1;
         rejected.output.append(QStringLiteral("[error] %1").arg(scopeError));
@@ -1710,13 +2000,16 @@ int runCli(const QStringList &arguments) {
     }
 
     Options options;
+    options.fullWorkflow = true;
     QString action;
     int index = 0;
-    if (arguments.first() == QStringLiteral("--uninstall")) {
+    const QString first = arguments.first().toLower();
+    if (first == QStringLiteral("--uninstall") || first == QStringLiteral("-u")
+        || first == QStringLiteral("--remove") || first == QStringLiteral("-uninstall")) {
         action = QStringLiteral("uninstall");
         index = 1;
     } else {
-        action = arguments.first();
+        action = first;
         index = 1;
     }
     if (action == QStringLiteral("install")) {
@@ -1733,26 +2026,60 @@ int runCli(const QStringList &arguments) {
     bool machineProgress = false;
     while (index < arguments.size()) {
         const QString argument = arguments[index++];
-        if (argument == QStringLiteral("--machine-progress")) {
+        const QString flag = argument.toLower();
+        if (flag == QStringLiteral("--machine-progress")) {
             machineProgress = true;
-        } else if (argument == QStringLiteral("--dry-run")) {
+        } else if (flag == QStringLiteral("--dry-run")) {
             options.dryRun = true;
-        } else if (argument == QStringLiteral("--no-build")) {
+        } else if (flag == QStringLiteral("--no-build")) {
             options.noBuild = true;
-        } else if (argument == QStringLiteral("--yes") || argument == QStringLiteral("-y")) {
+        } else if (flag == QStringLiteral("--yes") || flag == QStringLiteral("-y")) {
             options.assumeYes = true;
-        } else if (argument == QStringLiteral("--force")) {
+        } else if (flag == QStringLiteral("--force")) {
             options.force = true;
-        } else if (argument == QStringLiteral("--source") || argument == QStringLiteral("--prefix")) {
+        } else if (flag == QStringLiteral("--user-only")) {
+            options.userOnly = true;
+        } else if (flag == QStringLiteral("--system") || flag == QStringLiteral("--full")) {
+            options.fullWorkflow = true;
+            options.userOnly = false;
+        } else if (flag == QStringLiteral("--skip-apt") || flag == QStringLiteral("--skip-deps")) {
+            options.skipDependencies = true;
+        } else if (flag == QStringLiteral("--purge-packages")) {
+            options.purgePackages = true;
+        } else if (flag == QStringLiteral("--keep-toolchain")) {
+            options.keepToolchain = true;
+            options.removeToolchain = false;
+        } else if (flag == QStringLiteral("--remove-toolchain")) {
+            options.removeToolchain = true;
+            options.keepToolchain = false;
+        } else if (flag == QStringLiteral("--install-openvpn")) {
+            options.installOpenVPN = true;
+        } else if (flag == QStringLiteral("--skip-openvpn")) {
+            options.skipOpenVPN = true;
+        } else if (flag == QStringLiteral("--restore-natt")) {
+            options.restoreNatTRule = true;
+        } else if (flag == QStringLiteral("--elevated-child")) {
+            // Internal compatibility switch. Privileged re-execution is handled by the host launcher.
+        } else if (flag == QStringLiteral("--source") || flag == QStringLiteral("--prefix")
+                   || flag == QStringLiteral("--cache-dir") || flag == QStringLiteral("--target-home")
+                   || flag == QStringLiteral("--repo") || flag == QStringLiteral("--branch")) {
             if (index >= arguments.size()) {
-                err << "[error] " << argument << " requires a path." << Qt::endl;
+                err << "[error] " << argument << " requires a value." << Qt::endl;
                 return 2;
             }
             const QString value = arguments[index++];
-            if (argument == QStringLiteral("--source")) {
+            if (flag == QStringLiteral("--source")) {
                 options.sourceDir = value;
-            } else {
+            } else if (flag == QStringLiteral("--prefix")) {
                 options.prefix = value;
+            } else if (flag == QStringLiteral("--cache-dir")) {
+                options.cacheDir = value;
+            } else if (flag == QStringLiteral("--target-home")) {
+                options.targetHome = value;
+            } else if (flag == QStringLiteral("--repo")) {
+                options.repoSlug = value;
+            } else {
+                options.branchName = value;
             }
         } else {
             err << "[error] Unknown option: " << argument << Qt::endl;

@@ -21,6 +21,22 @@ struct Options {
     bool noBuild = false;
     bool assumeYes = false;
     bool force = false;
+    bool fullWorkflow = false;
+    bool allowSystemPrefix = false;
+    bool skipDependencies = false;
+    bool purgePackages = false;
+    bool keepToolchain = false;
+    bool removeToolchain = false;
+    bool installOpenVPN = false;
+    bool skipOpenVPN = false;
+    bool restoreNatTRule = false;
+    bool userOnly = false;
+    QString repoSlug = QStringLiteral("warmaster726/vpngate-connect");
+    QString branchName;
+    QString targetHome;
+    QString cacheDir;
+    QString compilePackageManager;
+    QStringList compilePackagesInstalled;
     std::function<void(int completed, int total, const QString &phase)> progress;
 };
 

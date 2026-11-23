@@ -1,4 +1,5 @@
 #include "installer_core.hpp"
+#include "host_integration.hpp"
 
 #include <QCoreApplication>
 #include <QDir>
@@ -164,6 +165,119 @@ Options fakeInstallOptions(const QString &source, const QString &prefix) {
     options.assumeYes = true;
     return options;
 }
+
+void testFullWorkflowRequiresExplicitAuthorization() {
+    Options options;
+    options.action = Action::Install;
+    options.fullWorkflow = true;
+    const Result denied = run(options);
+    require(denied.exitCode == 2, QStringLiteral("full workflow proceeded without explicit authorization"));
+    require(denied.output.join('\n').contains(QStringLiteral("--yes")),
+            QStringLiteral("full workflow did not explain the explicit confirmation requirement"));
+}
+
+void testSourceArchiveEntryValidation() {
+    QString error;
+    const QStringList safePaths{QStringLiteral("vpngate-connect-main/"),
+                                QStringLiteral("vpngate-connect-main/Cargo.toml")};
+    const QStringList safeTypes{QStringLiteral("drwxr-xr-x root/root 0 2026-01-01 vpngate-connect-main/"),
+                                QStringLiteral("-rw-r--r-- root/root 12 2026-01-01 vpngate-connect-main/Cargo.toml")};
+    require(validateSourceArchiveEntries(safePaths, safeTypes, &error),
+            QStringLiteral("normal source archive entries were rejected: %1").arg(error));
+
+    error.clear();
+    require(!validateSourceArchiveEntries({QStringLiteral("../outside")},
+                {QStringLiteral("-rw-r--r-- root/root 1 2026-01-01 ../outside")}, &error)
+                && error.contains(QStringLiteral("unsafe path")),
+            QStringLiteral("archive traversal entry was not rejected"));
+
+    error.clear();
+    require(!validateSourceArchiveEntries({QStringLiteral("C:/outside")},
+                {QStringLiteral("-rw-r--r-- root/root 1 2026-01-01 C:/outside")}, &error),
+            QStringLiteral("Windows drive-absolute archive entry was not rejected"));
+
+    error.clear();
+    require(!validateSourceArchiveEntries({QStringLiteral("dir\\\\outside")},
+                {QStringLiteral("-rw-r--r-- root/root 1 2026-01-01 dir\\\\outside")}, &error),
+            QStringLiteral("backslash archive entry was not rejected"));
+
+    error.clear();
+    require(!validateSourceArchiveEntries({QStringLiteral("repo/link")},
+                {QStringLiteral("lrwxrwxrwx root/root 0 2026-01-01 repo/link -> ../outside")}, &error)
+                && error.contains(QStringLiteral("symlink")),
+            QStringLiteral("symbolic link archive entry was not rejected"));
+
+    error.clear();
+    require(!validateSourceArchiveEntries({QStringLiteral("repo/hardlink")},
+                {QStringLiteral("hrw-r--r-- root/root 0 2026-01-01 repo/hardlink link to repo/file")}, &error)
+                && error.contains(QStringLiteral("hardlink")),
+            QStringLiteral("hardlink archive entry was not rejected"));
+
+    error.clear();
+    require(!validateSourceArchiveEntries({QStringLiteral("repo/file")}, {}, &error),
+            QStringLiteral("inconsistent archive listings were not rejected"));
+}
+
+#if defined(Q_OS_LINUX)
+void testFullSystemDryRunPlansHostAndManifestFiles() {
+    QTemporaryDir temp;
+    require(temp.isValid(), QStringLiteral("temporary directory unavailable"));
+    const QString source = QDir(temp.path()).filePath(QStringLiteral("source"));
+    const QString targetHome = QDir(temp.path()).filePath(QStringLiteral("target-home"));
+    require(QDir().mkpath(source), QStringLiteral("could not create source root"));
+    require(QDir().mkpath(targetHome), QStringLiteral("could not create target home"));
+    makeFakeCheckout(source);
+
+    Options options;
+    options.action = Action::Install;
+    options.sourceDir = source;
+    options.prefix = systemInstallPrefix();
+    options.targetHome = targetHome;
+    options.cacheDir = QDir(targetHome).filePath(QStringLiteral(".cache/vpngate"));
+    options.fullWorkflow = true;
+    options.dryRun = true;
+    options.noBuild = true;
+    const Result preview = run(options);
+    require(preview.exitCode == 0, preview.output.join('\n'));
+    require(preview.output.join('\n').contains(QStringLiteral("[plan]")),
+            QStringLiteral("full workflow dry-run omitted host actions"));
+    require(preview.output.join('\n').contains(QStringLiteral("/usr/local/bin/vpngate")),
+            QStringLiteral("full workflow dry-run omitted the system client path"));
+}
+#endif
+
+#if defined(Q_OS_MACOS)
+void testMacSystemDryRunUsesNativeCommandLayout() {
+    QTemporaryDir temp;
+    require(temp.isValid(), QStringLiteral("temporary directory unavailable"));
+    const QString source = QDir(temp.path()).filePath(QStringLiteral("source"));
+    const QString targetHome = QDir(temp.path()).filePath(QStringLiteral("target-home"));
+    require(QDir().mkpath(source), QStringLiteral("could not create source root"));
+    require(QDir().mkpath(targetHome), QStringLiteral("could not create target home"));
+    makeFakeCheckout(source);
+
+    Options options;
+    options.action = Action::Install;
+    options.sourceDir = source;
+    options.prefix = systemInstallPrefix();
+    options.targetHome = targetHome;
+    options.cacheDir = QDir(targetHome).filePath(QStringLiteral("Library/Caches/vpngate"));
+    options.fullWorkflow = true;
+    options.dryRun = true;
+    options.noBuild = true;
+    const Result preview = run(options);
+    const QString transcript = preview.output.join('\n');
+    require(preview.exitCode == 0, transcript);
+    require(transcript.contains(QStringLiteral("/usr/local/bin/vpngate")),
+            QStringLiteral("macOS system install did not plan the CLI command path"));
+    require(transcript.contains(QStringLiteral("/usr/local/bin/vpngate-gui")),
+            QStringLiteral("macOS system install did not plan the GUI command path"));
+    require(transcript.contains(QStringLiteral("/usr/local/share/vpngate/installer-manifest.json")),
+            QStringLiteral("macOS system manifest was not planned under /usr/local/share"));
+    require(!transcript.contains(QStringLiteral("/usr/local/Contents/MacOS")),
+            QStringLiteral("macOS system workflow incorrectly planned an application bundle inside /usr/local"));
+}
+#endif
 
 void testInstallVerifyUninstallPreservesUnrelatedData() {
     QTemporaryDir temp;
@@ -493,6 +607,13 @@ void testManifestCannotClaimUnrelatedFiles() {
 
 int main(int argc, char **argv) {
     QCoreApplication app(argc, argv);
+    testFullWorkflowRequiresExplicitAuthorization();
+    testSourceArchiveEntryValidation();
+#if defined(Q_OS_LINUX)
+    testFullSystemDryRunPlansHostAndManifestFiles();
+#elif defined(Q_OS_MACOS)
+    testMacSystemDryRunUsesNativeCommandLayout();
+#endif
     testInstallVerifyUninstallPreservesUnrelatedData();
     testDryRunAndNoOverwrite();
     testModifiedFilesArePreservedUnlessForced();

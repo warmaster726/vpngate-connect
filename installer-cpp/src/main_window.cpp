@@ -55,9 +55,10 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     layout->addWidget(subtitle);
 
     auto *migrationNotice = new QLabel(
-        QStringLiteral("Migration build: per-user install and manifest-based cleanup are implemented. "
-                       "The existing platform scripts remain the full-featured path for system packages, "
-                       "machine-wide VPN settings, and legacy installs."), central);
+        QStringLiteral("This GUI currently performs per-user install and manifest-based cleanup. "
+                       "Full host workflows are available from the CLI on Linux, macOS, and Windows, but "
+                       "macOS/Windows behavior still needs native parity and side-effect testing. Keep using "
+                       "the existing platform scripts until those checks pass."), central);
     migrationNotice->setWordWrap(true);
     migrationNotice->setStyleSheet(QStringLiteral("background: #fff4d8; color: #704b00; padding: 10px; border-radius: 6px;"));
     layout->addWidget(migrationNotice);
@@ -117,7 +118,7 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     logView_->setPlaceholderText(QStringLiteral("Operation plan and installer output will appear here."));
     layout->addWidget(logView_, 1);
 
-    statusLabel_ = new QLabel(QStringLiteral("System-wide installation and legacy-script migration are not part of this first milestone."), central);
+    statusLabel_ = new QLabel(QStringLiteral("GUI actions are per-user. CLI host workflows are implemented; native macOS/Windows validation and script replacement remain pending."), central);
     statusLabel_->setWordWrap(true);
     statusLabel_->setStyleSheet(QStringLiteral("color: #586477;"));
     layout->addWidget(statusLabel_);
@@ -194,7 +195,7 @@ void MainWindow::startInstall(bool dryRun) {
         }
     }
     QStringList arguments{QStringLiteral("install"), QStringLiteral("--source"), source,
-                          QStringLiteral("--prefix"), prefix};
+                          QStringLiteral("--prefix"), prefix, QStringLiteral("--user-only")};
     if (dryRun) {
         arguments.append(QStringLiteral("--dry-run"));
     } else {
@@ -215,7 +216,8 @@ void MainWindow::startUninstall() {
                              QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel) != QMessageBox::Yes) {
         return;
     }
-    QStringList arguments{QStringLiteral("uninstall"), QStringLiteral("--prefix"), prefix, QStringLiteral("--yes")};
+    QStringList arguments{QStringLiteral("uninstall"), QStringLiteral("--prefix"), prefix,
+                          QStringLiteral("--yes"), QStringLiteral("--user-only")};
     if (forceModifiedCheck_->isChecked()) {
         arguments.append(QStringLiteral("--force"));
     }
@@ -223,7 +225,8 @@ void MainWindow::startUninstall() {
 }
 
 void MainWindow::startVerify() {
-    launchCli({QStringLiteral("verify"), QStringLiteral("--prefix"), prefixEdit_->text().trimmed()});
+    launchCli({QStringLiteral("verify"), QStringLiteral("--prefix"), prefixEdit_->text().trimmed(),
+               QStringLiteral("--user-only")});
 }
 
 QString MainWindow::cliExecutable() const {

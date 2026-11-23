@@ -10,6 +10,8 @@ find_package(Qt6 6.4 REQUIRED COMPONENTS Core Widgets)
 add_library(vpngate_installer_core
     src/installer_core.cpp
     src/installer_core.hpp
+    src/host_integration.cpp
+    src/host_integration.hpp
 )
 target_link_libraries(vpngate_installer_core PUBLIC Qt6::Core)
 target_include_directories(vpngate_installer_core PUBLIC src)
@@ -24,7 +26,7 @@ target_link_libraries(vpngate-installer PRIVATE vpngate_installer_core Qt6::Widg
 target_compile_definitions(vpngate-installer PRIVATE VPNGATE_INSTALLER_VERSION="${PROJECT_VERSION}")
 if(WIN32)
     set_target_properties(vpngate-installer PROPERTIES WIN32_EXECUTABLE TRUE)
-    target_link_libraries(vpngate-installer PRIVATE ole32 shell32 advapi32 user32)
+    target_link_libraries(vpngate_installer_core PUBLIC ole32 shell32 advapi32 user32 rasapi32 uuid)
 elseif(APPLE)
     set_target_properties(vpngate-installer PROPERTIES MACOSX_BUNDLE TRUE)
 endif()
