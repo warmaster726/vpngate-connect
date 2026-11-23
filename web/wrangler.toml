@@ -9,7 +9,7 @@
 #   cd web && npx wrangler deploy
 # =============================================================================
 
-name = "vpngate-connect"
+name = 'connect'
 main = "build/index.js"
 compatibility_date = "2026-10-26"
 workers_dev = true
