@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-find_package(Qt6 6.4 REQUIRED COMPONENTS Core Widgets)
+find_package(Qt6 6.8 REQUIRED COMPONENTS Core Widgets)
 
 add_library(vpngate_installer_core
     src/installer_core.cpp

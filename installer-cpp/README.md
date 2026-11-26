@@ -6,7 +6,7 @@ Host-integration implementations now exist for all three platforms. Native CI bu
 
 ## Build
 
-Requirements: CMake 3.24+, a C++20 compiler, and Qt 6.4+ Core and Widgets.
+Requirements: CMake 3.24+, a C++20 compiler, and Qt 6.8+ Core and Widgets. Qt 6.9+ is required when building against the macOS 26 SDK.
 
 ```sh
 cmake -S installer-cpp -B installer-cpp/build -DCMAKE_BUILD_TYPE=Release
