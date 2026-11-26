@@ -14,7 +14,11 @@ cmake --build installer-cpp/build --parallel
 ctest --test-dir installer-cpp/build --output-on-failure
 ```
 
-The client payload is built from the existing Rust CLI and GUI projects. The full CLI workflow can bootstrap a temporary minimal Rust toolchain if Cargo is missing; `--keep-toolchain` requests a persistent toolchain. Windows selects native MSVC tools when available or MinGW-w64 for a GNU Rust target. Release packaging, signing, and deployment of the C++ executable/Qt runtime are outside this migration work.
+The client payload is built from the existing Rust CLI and GUI projects. The full CLI workflow can bootstrap a temporary minimal Rust toolchain if Cargo is missing; `--keep-toolchain` requests a persistent toolchain. Windows selects native MSVC tools when available or MinGW-w64 for a GNU Rust target. Signing and release publishing are outside this migration work.
+
+## Native CI bundles
+
+`.github/workflows/build-installers.yml` builds and tests the app on native Windows Server 2022 and Ubuntu 24.04 runners. It packages `vpngate-installer-windows-x64.zip` (Qt runtime deployed with `windeployqt`) and `vpngate-installer-linux-x64.tar.gz` (a Qt-deployed AppDir), then uploads each as a 14-day GitHub Actions artifact. The workflow runs for relevant pushes to `feature/cpp-installer` or via `workflow_dispatch`; it does not create release tags or GitHub Releases. These bundles contain the C++ installer only: the Rust VPN client is downloaded/built when an install workflow is invoked. Passing CI packaging checks does not establish host-level parity or replace the legacy scripts.
 
 ## CLI
 
