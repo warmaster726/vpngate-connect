@@ -10,6 +10,8 @@
 #include <QRegularExpression>
 #include <QSet>
 #include <QStandardPaths>
+#include <QSysInfo>
+#include <QtEndian>
 
 #include <algorithm>
 #include <string>
@@ -1552,6 +1554,214 @@ bool windowsAdministratorAvailable() {
 #endif
 }
 
+bool validateNativeBinaryArchitecture(const QString &path, QString *error) {
+    auto reject = [error, &path](const QString &reason) {
+        if (error) {
+            *error = QStringLiteral("Native artifact validation failed for %1: %2").arg(path, reason);
+        }
+        return false;
+    };
+
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        return reject(QStringLiteral("could not open the file: %1").arg(file.errorString()));
+    }
+    const qint64 fileSize = file.size();
+    const auto readAt = [&file, fileSize](qint64 offset, qsizetype length, QByteArray *contents) {
+        if (offset < 0 || length < 0 || offset > fileSize || length > fileSize - offset
+            || !file.seek(offset)) {
+            return false;
+        }
+        *contents = file.read(length);
+        return contents->size() == length;
+    };
+    const auto hostArchitecture = []() -> QString {
+#if defined(Q_OS_WIN)
+        SYSTEM_INFO info{};
+        GetNativeSystemInfo(&info);
+        if (info.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64) {
+            return QStringLiteral("x86_64");
+        }
+        if (info.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_ARM64) {
+            return QStringLiteral("arm64");
+        }
+        return {};
+#else
+        const QString architecture = QSysInfo::currentCpuArchitecture().toLower();
+        if (architecture == QStringLiteral("x86_64") || architecture == QStringLiteral("amd64")) {
+            return QStringLiteral("x86_64");
+        }
+        if (architecture == QStringLiteral("arm64") || architecture == QStringLiteral("aarch64")) {
+            return QStringLiteral("arm64");
+        }
+        return {};
+#endif
+    };
+    const QString expected = hostArchitecture();
+    if (expected.isEmpty()) {
+        return reject(QStringLiteral("the native host architecture is not supported"));
+    }
+
+#if defined(Q_OS_WIN)
+    constexpr quint16 kImageFileMachineAmd64 = 0x8664;
+    constexpr quint16 kImageFileMachineArm64 = 0xaa64;
+    const quint16 expectedMachine = expected == QStringLiteral("arm64")
+        ? kImageFileMachineArm64 : kImageFileMachineAmd64;
+    QByteArray dosHeader;
+    if (!readAt(0, 64, &dosHeader) || dosHeader[0] != 'M' || dosHeader[1] != 'Z') {
+        return reject(QStringLiteral("the file is not a valid Windows PE executable (missing DOS header)"));
+    }
+    const quint32 peOffset = qFromLittleEndian<quint32>(
+        reinterpret_cast<const uchar *>(dosHeader.constData() + 0x3c));
+    QByteArray peHeader;
+    if (!readAt(peOffset, 6, &peHeader) || peHeader.left(4) != QByteArrayLiteral("PE\0\0")) {
+        return reject(QStringLiteral("the file is not a valid Windows PE executable (missing PE signature)"));
+    }
+    const quint16 actualMachine = qFromLittleEndian<quint16>(
+        reinterpret_cast<const uchar *>(peHeader.constData() + 4));
+    if (actualMachine != expectedMachine) {
+        const QString actual = actualMachine == kImageFileMachineAmd64 ? QStringLiteral("x86_64")
+            : actualMachine == kImageFileMachineArm64 ? QStringLiteral("arm64")
+            : QStringLiteral("unknown PE machine 0x%1").arg(actualMachine, 0, 16);
+        return reject(QStringLiteral("architecture mismatch: expected native Windows %1, found %2")
+                          .arg(expected, actual));
+    }
+    return true;
+#elif defined(Q_OS_LINUX)
+    constexpr quint16 kElfMachineX86_64 = 62;
+    constexpr quint16 kElfMachineArm64 = 183;
+    const quint16 expectedMachine = expected == QStringLiteral("arm64")
+        ? kElfMachineArm64 : kElfMachineX86_64;
+    QByteArray header;
+    if (!readAt(0, 20, &header)
+        || static_cast<uchar>(header[0]) != 0x7f || header.mid(1, 3) != QByteArrayLiteral("ELF")) {
+        return reject(QStringLiteral("the file is not a valid ELF executable"));
+    }
+    if (static_cast<uchar>(header[4]) != 2 || static_cast<uchar>(header[5]) != 1) {
+        return reject(QStringLiteral("the file is not a 64-bit little-endian ELF executable"));
+    }
+    const quint16 fileType = qFromLittleEndian<quint16>(
+        reinterpret_cast<const uchar *>(header.constData() + 16));
+    if (fileType != 2 && fileType != 3) { // ET_EXEC or position-independent ET_DYN.
+        return reject(QStringLiteral("the ELF file is not an executable image"));
+    }
+    const quint16 actualMachine = qFromLittleEndian<quint16>(
+        reinterpret_cast<const uchar *>(header.constData() + 18));
+    if (actualMachine != expectedMachine) {
+        const QString actual = actualMachine == kElfMachineX86_64 ? QStringLiteral("x86_64")
+            : actualMachine == kElfMachineArm64 ? QStringLiteral("arm64")
+            : QStringLiteral("unknown ELF machine %1").arg(actualMachine);
+        return reject(QStringLiteral("architecture mismatch: expected native Linux %1, found %2")
+                          .arg(expected, actual));
+    }
+    return true;
+#elif defined(Q_OS_MACOS)
+    constexpr quint32 kMachMagic64 = 0xfeedfacf;
+    constexpr quint32 kFatMagic32 = 0xcafebabe;
+    constexpr quint32 kFatMagic64 = 0xcafebabf;
+    constexpr quint32 kCpuTypeX86_64 = 0x01000007;
+    constexpr quint32 kCpuTypeArm64 = 0x0100000c;
+    const quint32 expectedCpu = expected == QStringLiteral("arm64")
+        ? kCpuTypeArm64 : kCpuTypeX86_64;
+    const auto decode32 = [](const char *data, bool littleEndian) {
+        const auto *bytes = reinterpret_cast<const uchar *>(data);
+        return littleEndian ? qFromLittleEndian<quint32>(bytes) : qFromBigEndian<quint32>(bytes);
+    };
+    const auto decode64 = [](const char *data, bool littleEndian) {
+        const auto *bytes = reinterpret_cast<const uchar *>(data);
+        return littleEndian ? qFromLittleEndian<quint64>(bytes) : qFromBigEndian<quint64>(bytes);
+    };
+    QByteArray magicBytes;
+    if (!readAt(0, 4, &magicBytes)) {
+        return reject(QStringLiteral("the file is too small to contain a Mach-O header"));
+    }
+    const quint32 magicLittle = decode32(magicBytes.constData(), true);
+    const quint32 magicBig = decode32(magicBytes.constData(), false);
+    bool fat = false;
+    bool fat64 = false;
+    bool fatLittleEndian = false;
+    if (magicBig == kFatMagic32 || magicBig == kFatMagic64) {
+        fat = true;
+        fat64 = magicBig == kFatMagic64;
+    } else if (magicLittle == kFatMagic32 || magicLittle == kFatMagic64) {
+        fat = true;
+        fat64 = magicLittle == kFatMagic64;
+        fatLittleEndian = true;
+    }
+    if (fat) {
+        QByteArray countBytes;
+        if (!readAt(4, 4, &countBytes)) {
+            return reject(QStringLiteral("the universal Mach-O header is truncated"));
+        }
+        const quint32 count = decode32(countBytes.constData(), fatLittleEndian);
+        const qint64 entrySize = fat64 ? 32 : 20;
+        if (count == 0 || count > 4096
+            || static_cast<qint64>(count) > (fileSize - 8) / entrySize) {
+            return reject(QStringLiteral("the universal Mach-O architecture table is invalid"));
+        }
+        for (quint32 index = 0; index < count; ++index) {
+            const qint64 entryOffset = 8 + static_cast<qint64>(index) * entrySize;
+            QByteArray entry;
+            if (!readAt(entryOffset, static_cast<qsizetype>(entrySize), &entry)) {
+                return reject(QStringLiteral("the universal Mach-O architecture table is truncated"));
+            }
+            const quint32 cpuType = decode32(entry.constData(), fatLittleEndian);
+            const quint64 sliceOffset = fat64
+                ? decode64(entry.constData() + 8, fatLittleEndian)
+                : decode32(entry.constData() + 8, fatLittleEndian);
+            const quint64 sliceSize = fat64
+                ? decode64(entry.constData() + 16, fatLittleEndian)
+                : decode32(entry.constData() + 12, fatLittleEndian);
+            if (sliceOffset > static_cast<quint64>(fileSize)
+                || sliceSize > static_cast<quint64>(fileSize) - sliceOffset) {
+                return reject(QStringLiteral("a universal Mach-O slice extends beyond the file"));
+            }
+            if (cpuType != expectedCpu) {
+                continue;
+            }
+            QByteArray sliceHeader;
+            if (sliceSize < 16 || !readAt(static_cast<qint64>(sliceOffset), 16, &sliceHeader)) {
+                return reject(QStringLiteral("the native universal Mach-O slice is truncated"));
+            }
+            const quint32 sliceMagicLittle = decode32(sliceHeader.constData(), true);
+            const quint32 sliceMagicBig = decode32(sliceHeader.constData(), false);
+            const bool sliceLittleEndian = sliceMagicLittle == kMachMagic64;
+            if (!sliceLittleEndian && sliceMagicBig != kMachMagic64) {
+                return reject(QStringLiteral("the native universal Mach-O slice is not a 64-bit executable"));
+            }
+            const quint32 sliceCpu = decode32(sliceHeader.constData() + 4, sliceLittleEndian);
+            if (sliceCpu != expectedCpu) {
+                return reject(QStringLiteral("the universal Mach-O slice table does not match its native slice"));
+            }
+            return true;
+        }
+        return reject(QStringLiteral("architecture mismatch: universal Mach-O does not contain native macOS %1")
+                          .arg(expected));
+    }
+
+    QByteArray thinHeader;
+    if (!readAt(0, 16, &thinHeader)) {
+        return reject(QStringLiteral("the file is too small to contain a Mach-O executable header"));
+    }
+    const bool littleEndian = magicLittle == kMachMagic64;
+    if (!littleEndian && magicBig != kMachMagic64) {
+        return reject(QStringLiteral("the file is not a 64-bit Mach-O executable"));
+    }
+    const quint32 actualCpu = decode32(thinHeader.constData() + 4, littleEndian);
+    if (actualCpu != expectedCpu) {
+        const QString actual = actualCpu == kCpuTypeX86_64 ? QStringLiteral("x86_64")
+            : actualCpu == kCpuTypeArm64 ? QStringLiteral("arm64")
+            : QStringLiteral("unknown Mach-O CPU type 0x%1").arg(actualCpu, 0, 16);
+        return reject(QStringLiteral("architecture mismatch: expected native macOS %1, found %2")
+                          .arg(expected, actual));
+    }
+    return true;
+#else
+    Q_UNUSED(readAt);
+    return reject(QStringLiteral("native artifact validation is unsupported on this operating system"));
+#endif
+}
+
 bool validateSourceArchiveEntries(const QStringList &paths, const QStringList &verboseEntries,
                                   QString *error) {
     if (paths.isEmpty() || paths.size() != verboseEntries.size()) {
@@ -1685,7 +1895,8 @@ bool downloadSourceArchive(const Options &options, const QString &stagingRoot,
 
 bool prepareBuildToolchain(Options &options, const QString &stagingRoot,
                            QStringList *output, QString *cargoHome,
-                           QString *rustupHome, QString *error) {
+                           QString *rustupHome, QString *targetTriple,
+                           QString *error) {
 #if defined(Q_OS_WIN)
     const QString target = hostTargetHome(options);
     const QString environmentCargo = qEnvironmentVariable("CARGO_HOME");
@@ -1766,17 +1977,63 @@ bool prepareBuildToolchain(Options &options, const QString &stagingRoot,
         }
         const CommandResult hostInfo = rustc.isEmpty()
             ? CommandResult{} : runCommand(rustc, {QStringLiteral("-vV")});
-        if (hostInfo.output.contains(QStringLiteral("windows-gnu"), Qt::CaseInsensitive)) {
-            if (!ensureGcc()) {
-                return false;
-            }
-        } else if (!prepareWindowsMsvcEnvironment(archName, output)) {
+        const QRegularExpression hostRe(QStringLiteral("(?:^|\\n)host:\\s*(\\S+)"));
+        const QString rustHost = hostRe.match(hostInfo.output).captured(1).trimmed();
+        const bool gnuToolchain = hostInfo.output.contains(QStringLiteral("windows-gnu"), Qt::CaseInsensitive);
+        if (arm64 && gnuToolchain) {
             if (error) {
-                *error = QStringLiteral("The existing Rust toolchain targets MSVC but Visual Studio C++ build tools could not be activated. Start from a Visual Studio Developer PowerShell or install the native C++ workload.");
+                *error = QStringLiteral("Windows ARM64 installs require an ARM64 MSVC Rust target; the existing GNU Rust toolchain is x86_64-only.");
             }
             return false;
         }
-        output->append(QStringLiteral("[ok] Using existing Rust/Cargo toolchain: %1").arg(cargo));
+        if (gnuToolchain && !arm64) {
+            if (!ensureGcc()) {
+                return false;
+            }
+            *targetTriple = gnuTriple;
+        } else {
+            if (!prepareWindowsMsvcEnvironment(archName, output)) {
+                if (error) {
+                    *error = QStringLiteral("The existing Rust toolchain targets MSVC but Visual Studio C++ build tools could not be activated. Start from a Visual Studio Developer PowerShell or install the native C++ workload.");
+                }
+                return false;
+            }
+            *targetTriple = msvcTriple;
+            if (!rustHost.isEmpty() && rustHost != *targetTriple) {
+                QString rustup = QDir(QFileInfo(cargo).absolutePath()).filePath(QStringLiteral("rustup.exe"));
+                if (!QFileInfo(rustup).isFile() || QFileInfo(rustup).isSymLink()) {
+                    rustup = QStandardPaths::findExecutable(QStringLiteral("rustup.exe"));
+                }
+                if (!rustup.isEmpty()) {
+                    const CommandResult added = runCommand(rustup,
+                        {QStringLiteral("target"), QStringLiteral("add"), *targetTriple});
+                    if (!added.output.isEmpty()) {
+                        output->append(added.output.split(QLatin1Char('\n')));
+                    }
+                    if (!added.started || added.exitCode != 0) {
+                        if (error) {
+                            *error = QStringLiteral("Could not install the native Rust target %1: %2")
+                                         .arg(*targetTriple, added.error);
+                        }
+                        return false;
+                    }
+                } else {
+                    const CommandResult targetLib = runCommand(rustc,
+                        {QStringLiteral("--print"), QStringLiteral("target-libdir"),
+                         QStringLiteral("--target"), *targetTriple});
+                    if (!targetLib.started || targetLib.exitCode != 0
+                        || !QFileInfo(targetLib.output.trimmed()).isDir()) {
+                        if (error) {
+                            *error = QStringLiteral("The existing Rust toolchain cannot build %1 and rustup.exe was not found to add that target.")
+                                         .arg(*targetTriple);
+                        }
+                        return false;
+                    }
+                }
+            }
+        }
+        output->append(QStringLiteral("[ok] Using existing Rust/Cargo toolchain: %1 (target %2)")
+                           .arg(cargo, *targetTriple));
         return true;
     }
 
@@ -1849,6 +2106,7 @@ bool prepareBuildToolchain(Options &options, const QString &stagingRoot,
     QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
     environment.insert(QStringLiteral("CARGO_HOME"), *cargoHome);
     environment.insert(QStringLiteral("RUSTUP_HOME"), *rustupHome);
+    *targetTriple = defaultHost;
     output->append(QStringLiteral("[*] Bootstrap a minimal Rust toolchain for %1 (%2).")
                        .arg(archName, defaultHost));
     const CommandResult installed = runCommand(rustupInit,
@@ -1870,6 +2128,27 @@ bool prepareBuildToolchain(Options &options, const QString &stagingRoot,
     }
     return true;
 #else
+    const QString machine = QSysInfo::currentCpuArchitecture().toLower();
+#if defined(Q_OS_MACOS)
+    if (machine == QStringLiteral("arm64") || machine == QStringLiteral("aarch64")) {
+        *targetTriple = QStringLiteral("aarch64-apple-darwin");
+    } else if (machine == QStringLiteral("x86_64") || machine == QStringLiteral("amd64")) {
+        *targetTriple = QStringLiteral("x86_64-apple-darwin");
+    }
+#elif defined(Q_OS_LINUX)
+    if (machine == QStringLiteral("arm64") || machine == QStringLiteral("aarch64")) {
+        *targetTriple = QStringLiteral("aarch64-unknown-linux-gnu");
+    } else if (machine == QStringLiteral("x86_64") || machine == QStringLiteral("amd64")) {
+        *targetTriple = QStringLiteral("x86_64-unknown-linux-gnu");
+    }
+#endif
+    if (targetTriple->isEmpty()) {
+        if (error) {
+            *error = QStringLiteral("Could not determine a supported native Rust target triple for %1.")
+                         .arg(hostDescription());
+        }
+        return false;
+    }
     const QString target = hostTargetHome(options);
     const QString environmentCargo = qEnvironmentVariable("CARGO_HOME");
     QString cargo = QStandardPaths::findExecutable(QStringLiteral("cargo"));

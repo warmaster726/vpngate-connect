@@ -23,6 +23,7 @@ struct Options {
     bool force = false;
     bool fullWorkflow = false;
     bool allowSystemPrefix = false;
+    bool validateNativeArtifacts = false;
     bool skipDependencies = false;
     bool purgePackages = false;
     bool keepToolchain = false;
@@ -35,6 +36,7 @@ struct Options {
     QString branchName;
     QString targetHome;
     QString cacheDir;
+    QString buildTargetTriple;
     QString compilePackageManager;
     QStringList compilePackagesInstalled;
     std::function<void(int completed, int total, const QString &phase)> progress;

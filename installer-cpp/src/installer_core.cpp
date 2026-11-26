@@ -463,7 +463,20 @@ QString findSourceArtifact(const QString &sourceRoot, const QString &name,
                            const QString &buildTargetDir = {}) {
     const QString binaryName = name + executableSuffix();
     if (!buildTargetDir.isEmpty()) {
-        return QDir(buildTargetDir).filePath(QStringLiteral("release/%1").arg(binaryName));
+        const QString direct = QDir(buildTargetDir).filePath(QStringLiteral("release/%1").arg(binaryName));
+        if (QFileInfo(direct).isFile() && !QFileInfo(direct).isSymLink()) {
+            return direct;
+        }
+        const QFileInfoList targetDirectories = QDir(buildTargetDir).entryInfoList(
+            QDir::Dirs | QDir::NoDotAndDotDot);
+        for (const QFileInfo &targetDirectory : targetDirectories) {
+            const QString targeted = QDir(targetDirectory.filePath())
+                .filePath(QStringLiteral("release/%1").arg(binaryName));
+            if (QFileInfo(targeted).isFile() && !QFileInfo(targeted).isSymLink()) {
+                return targeted;
+            }
+        }
+        return direct;
     }
 
     QStringList candidates;
@@ -539,13 +552,13 @@ bool runCargoBuild(const QString &sourceRoot, const QString &cargo,
 }
 
 bool buildDesktop(const QString &sourceRoot, const QString &buildTargetDir,
-                  QStringList *output,
+                  const QString &targetTriple, QStringList *output,
                   const std::function<void(int, int, const QString &)> &progress,
                   QString *error) {
     const QString cargo = findCargo();
     if (cargo.isEmpty()) {
         if (error) {
-            *error = QStringLiteral("Cargo was not found. This migration build does not bootstrap Rust yet; install the stable Rust toolchain or use the existing platform installer.");
+            *error = QStringLiteral("Cargo was not found. Per-user core installs require an existing stable Rust toolchain; the confirmed full CLI workflow can bootstrap a temporary toolchain when needed.");
         }
         return false;
     }
@@ -553,23 +566,31 @@ bool buildDesktop(const QString &sourceRoot, const QString &buildTargetDir,
     if (progress) {
         progress(1, 5, QStringLiteral("Building the CLI with Cargo"));
     }
-    if (!runCargoBuild(sourceRoot, cargo,
-                       {QStringLiteral("build"), QStringLiteral("--locked"), QStringLiteral("--release"),
-                        QStringLiteral("-p"), QStringLiteral("vpngate-cli"),
-                        QStringLiteral("--target-dir"), buildTargetDir},
-                       output, progress, 1, QStringLiteral("Building the CLI with Cargo"), error)) {
+    QStringList cliArguments{QStringLiteral("build"), QStringLiteral("--locked"),
+                             QStringLiteral("--release"), QStringLiteral("-p"),
+                             QStringLiteral("vpngate-cli")};
+    if (!targetTriple.isEmpty()) {
+        cliArguments.append({QStringLiteral("--target"), targetTriple});
+    }
+    cliArguments.append({QStringLiteral("--target-dir"), buildTargetDir});
+    if (!runCargoBuild(sourceRoot, cargo, cliArguments, output, progress, 1,
+                       QStringLiteral("Building the CLI with Cargo"), error)) {
         return false;
     }
     if (progress) {
         progress(2, 5, QStringLiteral("CLI build complete; preparing the GUI build"));
         progress(3, 5, QStringLiteral("Building the GUI with Cargo"));
     }
-    if (!runCargoBuild(sourceRoot, cargo,
-                       {QStringLiteral("build"), QStringLiteral("--locked"), QStringLiteral("--release"),
-                        QStringLiteral("--manifest-path"), QStringLiteral("crates/vpngate-gui/Cargo.toml"),
-                        QStringLiteral("--bin"), QStringLiteral("vpngate-gui"),
-                        QStringLiteral("--target-dir"), buildTargetDir},
-                       output, progress, 3, QStringLiteral("Building the GUI with Cargo"), error)) {
+    QStringList guiArguments{QStringLiteral("build"), QStringLiteral("--locked"),
+                             QStringLiteral("--release"), QStringLiteral("--manifest-path"),
+                             QStringLiteral("crates/vpngate-gui/Cargo.toml"),
+                             QStringLiteral("--bin"), QStringLiteral("vpngate-gui")};
+    if (!targetTriple.isEmpty()) {
+        guiArguments.append({QStringLiteral("--target"), targetTriple});
+    }
+    guiArguments.append({QStringLiteral("--target-dir"), buildTargetDir});
+    if (!runCargoBuild(sourceRoot, cargo, guiArguments, output, progress, 3,
+                       QStringLiteral("Building the GUI with Cargo"), error)) {
         return false;
     }
     if (progress) {
@@ -1477,7 +1498,8 @@ Result install(const QString &sourceRoot, const QString &prefix, const Options &
             return result;
         }
         artifactRoot = buildOutput->path();
-        if (!buildDesktop(sourceRoot, artifactRoot, &result.output, options.progress, &error)) {
+        if (!buildDesktop(sourceRoot, artifactRoot, options.buildTargetTriple,
+                          &result.output, options.progress, &error)) {
             result.exitCode = 1;
             result.output.append(QStringLiteral("[error] %1").arg(error));
             return result;
@@ -1496,6 +1518,20 @@ Result install(const QString &sourceRoot, const QString &prefix, const Options &
             result.exitCode = 1;
             result.output.append(QStringLiteral("[error] %1").arg(error));
             return result;
+        }
+    }
+    if (options.validateNativeArtifacts && !options.dryRun) {
+        for (const PlannedFile &file : files) {
+            if (!file.executable || file.generated) {
+                continue;
+            }
+            if (!validateNativeBinaryArchitecture(file.sourcePath, &error)) {
+                result.exitCode = 1;
+                result.output.append(QStringLiteral("[error] %1").arg(error));
+                return result;
+            }
+            result.output.append(QStringLiteral("[ok] Confirmed native binary architecture: %1")
+                                     .arg(file.relativePath));
         }
     }
     if (options.progress && (options.dryRun || options.noBuild)) {
@@ -1891,12 +1927,14 @@ Result run(const Options &requestedOptions) {
                 }
                 QString cargoHome;
                 QString rustupHome;
+                QString targetTriple;
                 if (!prepareBuildToolchain(options, toolchainStaging.path(), &host.output,
-                                           &cargoHome, &rustupHome, &validationError)) {
+                                           &cargoHome, &rustupHome, &targetTriple, &validationError)) {
                     host.exitCode = 1;
                     host.output.append(QStringLiteral("[error] %1").arg(validationError));
                     return host;
                 }
+                options.buildTargetTriple = targetTriple;
                 const QString invokingUser = qEnvironmentVariable("SUDO_USER");
                 bool keepToolchainForInvokingUser = false;
 #if defined(Q_OS_LINUX) || defined(Q_OS_MACOS)
@@ -1932,6 +1970,7 @@ Result run(const Options &requestedOptions) {
             coreOptions.assumeYes = options.dryRun || options.assumeYes;
             coreOptions.prefix = fullPrefix;
             coreOptions.sourceDir = source;
+            coreOptions.validateNativeArtifacts = true;
             Result client = run(coreOptions);
             host.output.append(client.output);
             if (client.exitCode != 0) {

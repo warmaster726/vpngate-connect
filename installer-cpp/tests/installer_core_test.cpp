@@ -10,6 +10,7 @@
 #include <QJsonObject>
 #include <QTemporaryDir>
 #include <QTextStream>
+#include <QSysInfo>
 
 #include <cstdlib>
 
@@ -49,11 +50,38 @@ void writeFile(const QString &path, const QByteArray &contents) {
                                    | QFileDevice::ReadOther | QFileDevice::ExeOther);
 }
 
+void setLittleEndian(QByteArray *bytes, qsizetype offset, quint64 value, int width) {
+    for (int index = 0; index < width; ++index) {
+        (*bytes)[offset + index] = static_cast<char>((value >> (index * 8)) & 0xff);
+    }
+}
+
 QByteArray readFile(const QString &path) {
     QFile file(path);
     require(file.open(QIODevice::ReadOnly), QStringLiteral("could not read test file %1").arg(path));
     return file.readAll();
 }
+
+class ScopedTestEnvironmentVariable final {
+public:
+    ScopedTestEnvironmentVariable(const char *name, const QByteArray &value)
+        : name_(name), wasSet_(qEnvironmentVariableIsSet(name)), previous_(qgetenv(name)) {
+        qputenv(name, value);
+    }
+
+    ~ScopedTestEnvironmentVariable() {
+        if (wasSet_) {
+            qputenv(name_.constData(), previous_);
+        } else {
+            qunsetenv(name_.constData());
+        }
+    }
+
+private:
+    QByteArray name_;
+    bool wasSet_ = false;
+    QByteArray previous_;
+};
 
 class ScopedAppStateEnvironment final {
 public:
@@ -184,6 +212,77 @@ void testFullWorkflowRequiresExplicitAuthorization() {
     require(denied.exitCode == 2, QStringLiteral("full workflow proceeded without explicit authorization"));
     require(denied.output.join('\n').contains(QStringLiteral("--yes")),
             QStringLiteral("full workflow did not explain the explicit confirmation requirement"));
+}
+
+void testNativeBinaryArchitectureValidation() {
+    QString error;
+    const QString testExecutable = QCoreApplication::applicationFilePath();
+    require(validateNativeBinaryArchitecture(testExecutable, &error),
+            QStringLiteral("the native test executable failed architecture validation: %1").arg(error));
+
+    QTemporaryDir temp(temporaryDirectoryTemplate());
+    require(temp.isValid(), QStringLiteral("temporary directory unavailable"));
+    const QString architecture = QSysInfo::currentCpuArchitecture().toLower();
+    const bool hostIsArm64 = architecture == QStringLiteral("arm64")
+        || architecture == QStringLiteral("aarch64");
+    require(hostIsArm64 || architecture == QStringLiteral("x86_64")
+                || architecture == QStringLiteral("amd64"),
+            QStringLiteral("test is running on an unexpected host architecture: %1").arg(architecture));
+
+    QByteArray wrongArchitecture;
+#if defined(Q_OS_WIN)
+    wrongArchitecture = QByteArray(0x86, '\0');
+    wrongArchitecture[0] = 'M';
+    wrongArchitecture[1] = 'Z';
+    setLittleEndian(&wrongArchitecture, 0x3c, 0x80, 4);
+    wrongArchitecture[0x80] = 'P';
+    wrongArchitecture[0x81] = 'E';
+    setLittleEndian(&wrongArchitecture, 0x84, hostIsArm64 ? 0x8664 : 0xaa64, 2);
+#elif defined(Q_OS_MACOS)
+    wrongArchitecture = QByteArray(32, '\0');
+    wrongArchitecture[0] = static_cast<char>(0xcf);
+    wrongArchitecture[1] = static_cast<char>(0xfa);
+    wrongArchitecture[2] = static_cast<char>(0xed);
+    wrongArchitecture[3] = static_cast<char>(0xfe);
+    setLittleEndian(&wrongArchitecture, 4, hostIsArm64 ? 0x01000007 : 0x0100000c, 4);
+    setLittleEndian(&wrongArchitecture, 12, 2, 4); // MH_EXECUTE.
+#else
+    wrongArchitecture = QByteArray(64, '\0');
+    wrongArchitecture[0] = static_cast<char>(0x7f);
+    wrongArchitecture[1] = 'E';
+    wrongArchitecture[2] = 'L';
+    wrongArchitecture[3] = 'F';
+    wrongArchitecture[4] = 2; // ELFCLASS64.
+    wrongArchitecture[5] = 1; // ELFDATA2LSB.
+    wrongArchitecture[6] = 1; // EV_CURRENT.
+    setLittleEndian(&wrongArchitecture, 16, 2, 2); // ET_EXEC.
+    setLittleEndian(&wrongArchitecture, 18, hostIsArm64 ? 62 : 183, 2);
+#endif
+    const QString wrongPath = QDir(temp.path()).filePath(QStringLiteral("wrong-architecture"));
+    writeFile(wrongPath, wrongArchitecture);
+    error.clear();
+    require(!validateNativeBinaryArchitecture(wrongPath, &error)
+                && error.contains(QStringLiteral("architecture mismatch")),
+            QStringLiteral("a valid executable header for another architecture was not rejected: %1").arg(error));
+
+    const QString malformedPath = QDir(temp.path()).filePath(QStringLiteral("not-an-executable"));
+    writeFile(malformedPath, QByteArrayLiteral("not a native executable"));
+    error.clear();
+    require(!validateNativeBinaryArchitecture(malformedPath, &error) && !error.isEmpty(),
+            QStringLiteral("a malformed native artifact was not rejected"));
+
+    const QString fakeSource = QDir(temp.path()).filePath(QStringLiteral("fake-source"));
+    const QString rejectedPrefix = QDir(temp.path()).filePath(QStringLiteral("rejected-install"));
+    require(QDir().mkpath(fakeSource), QStringLiteral("could not create fake source root"));
+    makeFakeCheckout(fakeSource);
+    Options guardedInstall = fakeInstallOptions(fakeSource, rejectedPrefix);
+    guardedInstall.validateNativeArtifacts = true;
+    const Result rejectedInstall = run(guardedInstall);
+    require(rejectedInstall.exitCode != 0
+                && rejectedInstall.output.join('\n').contains(QStringLiteral("Native artifact validation failed")),
+            QStringLiteral("installer accepted fake non-native client artifacts"));
+    require(!QFileInfo::exists(rejectedPrefix),
+            QStringLiteral("artifact validation failure created the install prefix"));
 }
 
 void testSourceArchiveEntryValidation() {
@@ -326,6 +425,86 @@ void testMacSystemDryRunUsesNativeCommandLayout() {
             QStringLiteral("macOS system workflow incorrectly planned an application bundle inside /usr/local"));
     require(!QFileInfo::exists(options.cacheDir),
             QStringLiteral("macOS full workflow dry-run created its cache directory"));
+}
+#endif
+
+#if defined(Q_OS_LINUX) || defined(Q_OS_MACOS)
+void testCargoBuildUsesExplicitTargetAndTargetedOutputLayout() {
+    QTemporaryDir temp(temporaryDirectoryTemplate());
+    require(temp.isValid(), QStringLiteral("temporary directory unavailable"));
+    ScopedAppStateEnvironment appState(QDir(temp.path()).filePath(QStringLiteral("app-state")));
+    const QString source = QDir(temp.path()).filePath(QStringLiteral("source"));
+    const QString prefix = QDir(temp.path()).filePath(QStringLiteral("install"));
+    const QString cargoHome = QDir(temp.path()).filePath(QStringLiteral("cargo-home"));
+    const QString cargoBin = QDir(cargoHome).filePath(QStringLiteral("bin"));
+    const QString cargoLog = QDir(temp.path()).filePath(QStringLiteral("cargo-arguments.log"));
+    require(QDir().mkpath(source), QStringLiteral("could not create source root"));
+    require(QDir().mkpath(cargoBin), QStringLiteral("could not create fake Cargo directory"));
+    makeFakeCheckout(source);
+    require(QDir(QDir(source).filePath(QStringLiteral("target"))).removeRecursively(),
+            QStringLiteral("could not remove fake host-default build artifacts"));
+
+    const QString fakeCargoPath = QDir(cargoBin).filePath(QStringLiteral("cargo"));
+    writeFile(fakeCargoPath, QByteArrayLiteral(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$*\" >> \"$CARGO_TEST_LOG\"\n"
+        "target=''\n"
+        "target_dir=''\n"
+        "package=''\n"
+        "while [ \"$#\" -gt 0 ]; do\n"
+        "  case \"$1\" in\n"
+        "    --target) target=\"$2\"; shift 2 ;;\n"
+        "    --target-dir) target_dir=\"$2\"; shift 2 ;;\n"
+        "    -p) package=\"$2\"; shift 2 ;;\n"
+        "    *) shift ;;\n"
+        "  esac\n"
+        "done\n"
+        "[ -n \"$target\" ] && [ -n \"$target_dir\" ] || exit 23\n"
+        "name=vpngate-gui\n"
+        "if [ \"$package\" = 'vpngate-cli' ]; then name=vpngate; fi\n"
+        "out=\"$target_dir/$target/release/$name\"\n"
+        "/bin/mkdir -p \"$target_dir/$target/release\" || exit 24\n"
+        "/bin/cp \"$VPNGATE_TEST_BINARY\" \"$out\" || exit 25\n"
+        "/bin/chmod 755 \"$out\" || exit 26\n"
+    ));
+
+    ScopedTestEnvironmentVariable path("PATH", cargoBin.toLocal8Bit());
+    ScopedTestEnvironmentVariable cargo("CARGO_HOME", cargoHome.toLocal8Bit());
+    ScopedTestEnvironmentVariable log("CARGO_TEST_LOG", cargoLog.toLocal8Bit());
+    ScopedTestEnvironmentVariable nativeBinary("VPNGATE_TEST_BINARY",
+                                                QCoreApplication::applicationFilePath().toLocal8Bit());
+
+    Options options;
+    options.action = Action::Install;
+    options.sourceDir = source;
+    options.prefix = prefix;
+    options.assumeYes = true;
+    options.buildTargetTriple = QStringLiteral("test-native-target");
+    options.validateNativeArtifacts = true;
+    const QByteArray expectedArtifact = readFile(QCoreApplication::applicationFilePath());
+    const Result installed = run(options);
+    require(installed.exitCode == 0, installed.output.join('\n'));
+    const QString arguments = QString::fromLocal8Bit(readFile(cargoLog));
+    require(arguments.count(QStringLiteral("--target test-native-target")) == 2,
+            QStringLiteral("Cargo was not given the explicit target for both binaries: %1").arg(arguments));
+    require(readFile(installedCliPath(prefix)) == expectedArtifact,
+            QStringLiteral("CLI artifact was not discovered in the target-specific Cargo directory"));
+    const QString guiPath = QDir(QFileInfo(installedCliPath(prefix)).path())
+        .filePath(artifactName(QStringLiteral("vpngate-gui")));
+    require(readFile(guiPath) == expectedArtifact,
+            QStringLiteral("GUI artifact was not discovered in the target-specific Cargo directory"));
+
+    Options verify;
+    verify.action = Action::Verify;
+    verify.prefix = prefix;
+    const Result verified = run(verify);
+    require(verified.exitCode == 0, verified.output.join('\n'));
+    Options uninstall;
+    uninstall.action = Action::Uninstall;
+    uninstall.prefix = prefix;
+    uninstall.assumeYes = true;
+    const Result removed = run(uninstall);
+    require(removed.exitCode == 0, removed.output.join('\n'));
 }
 #endif
 
@@ -722,6 +901,7 @@ void testManifestCannotClaimUnrelatedFiles() {
 int main(int argc, char **argv) {
     QCoreApplication app(argc, argv);
     testFullWorkflowRequiresExplicitAuthorization();
+    testNativeBinaryArchitectureValidation();
     testSourceArchiveEntryValidation();
 #if defined(Q_OS_LINUX)
     testFullSystemDryRunPlansHostAndManifestFiles();
@@ -734,6 +914,9 @@ int main(int argc, char **argv) {
     testDryRunAndNoOverwrite();
     testModifiedFilesArePreservedUnlessForced();
     testUpgradeRemovesObsoleteTrackedFiles();
+#if defined(Q_OS_LINUX) || defined(Q_OS_MACOS)
+    testCargoBuildUsesExplicitTargetAndTargetedOutputLayout();
+#endif
 #if defined(Q_OS_LINUX)
     testUpgradeCommitFailureRollsBackFilesAndManifest();
 #endif
