@@ -247,7 +247,8 @@ jobs:
       - name: Install Qt 6 and Ninja
         uses: jurplel/install-qt-action@v4
         with:
-          version: '6.8.2'
+          # Qt 6.9+ no longer links the removed AGL framework from the macOS 26 SDK.
+          version: '6.10.1'
           host: mac
           target: desktop
           arch: clang_64
