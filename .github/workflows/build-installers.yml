@@ -43,7 +43,22 @@ jobs:
         run: cmake --build build/windows --config Release --parallel
 
       - name: Run tests
+        id: windows-tests
         run: ctest --test-dir build/windows -C Release --output-on-failure
+
+      - name: Expose Windows test diagnostics
+        if: failure() && steps.windows-tests.outcome == 'failure'
+        shell: pwsh
+        run: |
+          $lines = & ctest --test-dir build/windows -C Release --output-on-failure --verbose 2>&1
+          $testExit = $LASTEXITCODE
+          $details = ($lines | ForEach-Object { [string]$_ }) -join "`n"
+          $details = $details -replace '%', '%25' -replace "`r", '%0D' -replace "`n", '%0A'
+          if ($details) { Write-Output "::error title=Windows test diagnostics::$details" }
+          if ($testExit -eq 0) {
+            Write-Output '::warning title=Windows test diagnostics::CTest passed on diagnostic retry; failure may be transient.'
+          }
+          exit 0
 
       - name: Deploy Qt runtime and archive
         shell: pwsh
@@ -107,7 +122,27 @@ jobs:
           -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
 
       - name: Build Release
+        id: linux-build
         run: cmake --build build/linux --parallel
+
+      - name: Expose Linux compiler diagnostics
+        if: failure() && steps.linux-build.outcome == 'failure'
+        shell: bash
+        run: |
+          set +e
+          cmake --build build/linux --parallel --verbose > "$RUNNER_TEMP/linux-build-diagnostics.log" 2>&1
+          build_exit=$?
+          diagnostics=$(tail -n 80 "$RUNNER_TEMP/linux-build-diagnostics.log")
+          diagnostics=${diagnostics//%/%25}
+          diagnostics=${diagnostics//$'\r'/%0D}
+          diagnostics=${diagnostics//$'\n'/%0A}
+          if [ -n "$diagnostics" ]; then
+            echo "::error title=Linux compiler diagnostics::$diagnostics"
+          fi
+          if [ "$build_exit" -eq 0 ]; then
+            echo '::warning title=Linux compiler diagnostic::Build passed on diagnostic retry; failure may be transient.'
+          fi
+          exit 0
 
       - name: Run tests
         run: ctest --test-dir build/linux --output-on-failure
