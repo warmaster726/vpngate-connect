@@ -611,6 +611,37 @@ CommandResult runForTargetUser(const Options &options, const QString &program,
 }
 #endif
 
+bool installedClientIsSafeToRun(const QString &prefix, const QString &clientPath,
+                                QStringList *output) {
+    const QFileInfo clientInfo(clientPath);
+    if (!clientInfo.isFile() || clientInfo.isSymLink()) {
+        return false;
+    }
+#if !defined(Q_OS_WIN)
+    if (!clientInfo.isExecutable()) {
+        return false;
+    }
+#endif
+    const QFileInfo manifestInfo(manifestPathForPrefix(prefix));
+    if (!manifestInfo.exists() && !manifestInfo.isSymLink()) {
+        // Before the C++ installer, legacy scripts installed the same command without a manifest.
+        return true;
+    }
+    Options verifyOptions;
+    verifyOptions.action = Action::Verify;
+    verifyOptions.prefix = prefix;
+    verifyOptions.allowSystemPrefix = true;
+    const Result verified = run(verifyOptions);
+    if (verified.exitCode == 0) {
+        return true;
+    }
+    output->append(QStringLiteral("[warn] Skipping the installed CLI before disconnect because C++ manifest verification failed."));
+    for (const QString &line : verified.output) {
+        output->append(line);
+    }
+    return false;
+}
+
 bool removeKnownPath(const Options &options, const QString &path, QStringList *output,
                      const QString &description, bool recursive = false) {
     const QFileInfo info(path);
@@ -906,7 +937,7 @@ void cleanKnownResidues(const Options &options, QStringList *output) {
     const QString cache = cacheDirectory(options);
     const QString rootCache = QStringLiteral("/root/.cache/vpngate");
     const QString cli = QStringLiteral("/usr/local/bin/vpngate");
-    if (QFileInfo(cli).isExecutable() && !QFileInfo(cli).isSymLink()) {
+    if (installedClientIsSafeToRun(systemInstallPrefix(), cli, output)) {
         QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
         environment.insert(QStringLiteral("VPNGATE_CACHE_DIR"), cache);
         if (options.dryRun) {
@@ -1006,8 +1037,7 @@ void cleanMacOSResidues(const Options &options, QStringList *output) {
             }
         }
     }
-    const QFileInfo cliInfo(cli);
-    if (cliInfo.isExecutable() && !cliInfo.isSymLink() && hasSession) {
+    if (hasSession && installedClientIsSafeToRun(systemInstallPrefix(), cli, output)) {
         if (options.dryRun) {
             output->append(QStringLiteral("[plan] Disconnect active/stale VPN Gate session using %1 --cache-dir %2 disconnect.")
                                .arg(cli, cache));
@@ -1159,8 +1189,8 @@ void cleanWindowsResidues(const Options &options, QStringList *output) {
     const QString prefix = options.prefix.isEmpty() ? systemInstallPrefix() : QDir::cleanPath(options.prefix);
     const QString cache = cacheDirectory(options);
     const QString cli = QDir(prefix).filePath(QStringLiteral("vpngate.exe"));
-    const QFileInfo cliInfo(cli);
-    if (!options.userOnly && isWindowsAdmin() && cliInfo.isFile() && !cliInfo.isSymLink()) {
+    if (!options.userOnly && isWindowsAdmin()
+        && installedClientIsSafeToRun(prefix, cli, output)) {
         const QStringList arguments{QStringLiteral("--uac-elevated"), QStringLiteral("--cache-dir"), cache,
                                     QStringLiteral("disconnect")};
         if (options.dryRun) {
@@ -2016,7 +2046,21 @@ Result cleanupLegacyInstall(const Options &options) {
             QStringLiteral("/usr/share/icons/hicolor/scalable/apps/vpngate.svg"),
             QStringLiteral("/usr/share/pixmaps/vpngate.png"),
         };
+        const QString systemPrefix = QDir::cleanPath(systemInstallPrefix());
+        const QFileInfo systemManifestInfo(manifestPathForPrefix(systemPrefix));
+        // The shell-era uninstaller blindly deletes these paths. Defer the two current
+        // system-prefix binaries to the hash-checked manifest transaction when present.
         for (const QString &path : legacySystemFiles) {
+            const QString normalizedPath = QDir::cleanPath(path);
+            const bool isCxxManagedSystemBinary =
+                normalizedPath == QDir(systemPrefix).filePath(QStringLiteral("bin/vpngate"))
+                || normalizedPath == QDir(systemPrefix).filePath(QStringLiteral("bin/vpngate-gui"));
+            if ((systemManifestInfo.exists() || systemManifestInfo.isSymLink())
+                && isCxxManagedSystemBinary) {
+                result.output.append(QStringLiteral("[skip] Preserve %1 until the C++ manifest verifies and removes it.")
+                                         .arg(path));
+                continue;
+            }
             removeKnownPath(options, path, &result.output, QStringLiteral("legacy VPN Gate installation file"));
         }
         for (const int size : {16, 24, 32, 48, 64, 128, 256, 512}) {

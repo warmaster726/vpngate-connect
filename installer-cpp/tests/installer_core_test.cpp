@@ -518,6 +518,70 @@ void testUpgradeRemovesObsoleteTrackedFiles() {
     require(removed.exitCode == 0, removed.output.join('\n'));
 }
 
+#if defined(Q_OS_LINUX)
+void testUpgradeCommitFailureRollsBackFilesAndManifest() {
+    QTemporaryDir temp(temporaryDirectoryTemplate());
+    require(temp.isValid(), QStringLiteral("temporary directory unavailable"));
+    ScopedAppStateEnvironment appState(QDir(temp.path()).filePath(QStringLiteral("app-state")));
+    const QString source = QDir(temp.path()).filePath(QStringLiteral("source"));
+    const QString prefix = QDir(temp.path()).filePath(QStringLiteral("install"));
+    require(QDir().mkpath(source), QStringLiteral("could not create source root"));
+    makeFakeCheckout(source);
+
+    const Result installed = run(fakeInstallOptions(source, prefix));
+    require(installed.exitCode == 0, installed.output.join('\n'));
+
+    const QString cli = installedCliPath(prefix);
+    const QString gui = QDir(QFileInfo(cli).path()).filePath(QStringLiteral("vpngate-gui"));
+    const QString desktop = QDir(prefix).filePath(QStringLiteral("share/applications/vpngate-gui.desktop"));
+    const QString manifestPath = manifestPathForPrefix(prefix);
+    const QByteArray originalCli = readFile(cli);
+    const QByteArray originalGui = readFile(gui);
+    const QByteArray originalDesktop = readFile(desktop);
+    const QByteArray originalManifest = readFile(manifestPath);
+
+    writeFile(QDir(source).filePath(QStringLiteral("assets/icons/hicolor/32x32/apps/vpngate.png")),
+              QByteArrayLiteral("new-icon"));
+    writeFile(QDir(source).filePath(QStringLiteral("target/release/vpngate")), QByteArrayLiteral("upgraded-cli"));
+    writeFile(QDir(source).filePath(QStringLiteral("target/release/vpngate-gui")), QByteArrayLiteral("upgraded-gui"));
+
+    const QString blockingFile = QDir(prefix).filePath(QStringLiteral("share/icons/hicolor/32x32"));
+    bool injectedFailure = false;
+    Options upgrade = fakeInstallOptions(source, prefix);
+    upgrade.progress = [&](int, int, const QString &phase) {
+        if (!injectedFailure
+            && phase == QStringLiteral("Committing share/icons/hicolor/32x32/apps/vpngate.png")) {
+            writeFile(blockingFile, QByteArrayLiteral("unowned path obstruction"));
+            injectedFailure = true;
+        }
+    };
+    const Result rejected = run(upgrade);
+    const QString transcript = rejected.output.join('\n');
+    require(injectedFailure, QStringLiteral("commit-failure injection did not run"));
+    require(rejected.exitCode != 0 && transcript.contains(QStringLiteral("Install transaction rolled back")),
+            QStringLiteral("upgrade did not report a rolled-back commit failure: %1").arg(transcript));
+    require(readFile(cli) == originalCli, QStringLiteral("failed upgrade did not restore the original CLI"));
+    require(readFile(gui) == originalGui, QStringLiteral("failed upgrade did not restore the original GUI"));
+    require(readFile(desktop) == originalDesktop, QStringLiteral("failed upgrade did not restore the original desktop entry"));
+    require(readFile(manifestPath) == originalManifest, QStringLiteral("failed upgrade changed the install manifest"));
+    require(QFileInfo::exists(blockingFile), QStringLiteral("rollback removed the unrelated injected obstruction"));
+
+    require(QFile::remove(blockingFile), QStringLiteral("could not remove the injected obstruction"));
+    Options verify;
+    verify.action = Action::Verify;
+    verify.prefix = prefix;
+    const Result verified = run(verify);
+    require(verified.exitCode == 0, verified.output.join('\n'));
+
+    Options uninstall;
+    uninstall.action = Action::Uninstall;
+    uninstall.prefix = prefix;
+    uninstall.assumeYes = true;
+    const Result removed = run(uninstall);
+    require(removed.exitCode == 0, removed.output.join('\n'));
+}
+#endif
+
 void testStateCleanupFailureKeepsRetryInventory() {
     QTemporaryDir temp(temporaryDirectoryTemplate());
     require(temp.isValid(), QStringLiteral("temporary directory unavailable"));
@@ -660,6 +724,9 @@ int main(int argc, char **argv) {
     testDryRunAndNoOverwrite();
     testModifiedFilesArePreservedUnlessForced();
     testUpgradeRemovesObsoleteTrackedFiles();
+#if defined(Q_OS_LINUX)
+    testUpgradeCommitFailureRollsBackFilesAndManifest();
+#endif
     testStateCleanupFailureKeepsRetryInventory();
     testPathTraversalRejected();
     testManifestCannotClaimUnrelatedFiles();
