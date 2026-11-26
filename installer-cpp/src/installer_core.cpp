@@ -1418,7 +1418,7 @@ QString manifestPathForPrefix(const QString &prefix) {
 
 QString helpText() {
     return QStringLiteral(
-        "VPN Gate Connect C++ installer (host migration; native validation pending)\n\n"
+        "VPN Gate Connect C++ installer (migration build; full host parity validation pending)\n\n"
         "Usage:\n"
         "  vpngate-installer install   [--source <checkout>] [--prefix <dir>] [--dry-run] [--yes]\n"
         "  vpngate-installer uninstall [--prefix <dir>] [--dry-run] [--yes] [--force]\n"

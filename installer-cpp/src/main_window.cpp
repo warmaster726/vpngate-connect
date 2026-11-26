@@ -119,7 +119,7 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     logView_->setPlaceholderText(QStringLiteral("Operation plan and installer output will appear here."));
     layout->addWidget(logView_, 1);
 
-    statusLabel_ = new QLabel(QStringLiteral("GUI actions are per-user. CLI host workflows are implemented; native macOS/Windows validation and script replacement remain pending."), central);
+    statusLabel_ = new QLabel(QStringLiteral("GUI actions are per-user. CLI host workflows are implemented; full cross-platform host parity and side-effect validation remain pending."), central);
     statusLabel_->setWordWrap(true);
     statusLabel_->setStyleSheet(QStringLiteral("color: #586477;"));
     layout->addWidget(statusLabel_);
