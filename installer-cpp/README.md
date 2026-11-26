@@ -2,7 +2,7 @@
 
 This directory contains one Qt 6 / C++20 installer application. Launch `vpngate-installer` with no arguments for the GUI; pass an action for headless CLI mode. The CLI defaults to the full host workflow on Linux, macOS, and Windows. Use `--user-only` for a per-user CLI install; the GUI remains per-user.
 
-Host-integration implementations now exist for all three platforms, but only Linux has been built and unit-tested in this workspace. macOS and Windows still need native builds, parity review, and controlled side-effect tests. Keep `install-vpngate.sh`, `install-vpngate.ps1`, and `install-vpngate.cmd` until those checks pass.
+Host-integration implementations now exist for all three platforms. Linux and Windows have native builds and core tests passing in CI; macOS has not yet been natively built. Full host-level parity review and controlled side-effect tests remain outstanding, so keep `install-vpngate.sh`, `install-vpngate.ps1`, and `install-vpngate.cmd` until those checks pass.
 
 ## Build
 
@@ -65,4 +65,4 @@ These host actions have not all been validated on their native operating systems
 
 ## Migration boundary — do not retire old scripts yet
 
-The legacy entry points are intentionally retained. Linux Debug and Release builds, CTest, and diff checks pass in this workspace, but no live privileged install/uninstall has been performed. macOS and Windows branches have not been natively built or tested; GUI interaction, platform-native end-to-end flows, and C++/Qt runtime deployment also remain unverified. Compare each native workflow against the corresponding script and test install, upgrade, rollback/failure, and uninstall behavior before making the scripts thin launchers.
+The legacy entry points are intentionally retained. Linux Debug and Release builds plus CTest pass in this workspace; native Windows Release build, core CTest, Qt runtime deployment, and CLI help smoke checks pass in CI. No live privileged install/uninstall has been performed. macOS remains natively unbuilt; GUI interaction and full Linux/Windows/macOS host-level install, upgrade, rollback/failure, and uninstall parity still need controlled tests before making the scripts thin launchers.
