@@ -246,6 +246,36 @@ void testFullSystemDryRunPlansHostAndManifestFiles() {
 }
 #endif
 
+#if defined(Q_OS_WIN)
+void testWindowsHostDryRunUsesScopedInstallPaths() {
+    QTemporaryDir temp;
+    require(temp.isValid(), QStringLiteral("temporary directory unavailable"));
+    ScopedAppStateEnvironment appState(QDir(temp.path()).filePath(QStringLiteral("app-state")));
+    const QString source = QDir(temp.path()).filePath(QStringLiteral("source"));
+    const QString targetHome = QDir(temp.path()).filePath(QStringLiteral("target-home"));
+    require(QDir().mkpath(source), QStringLiteral("could not create source root"));
+    require(QDir().mkpath(targetHome), QStringLiteral("could not create target home"));
+    makeFakeCheckout(source);
+
+    Options options;
+    options.action = Action::Install;
+    options.sourceDir = source;
+    options.prefix = systemInstallPrefix();
+    options.targetHome = targetHome;
+    options.cacheDir = QDir(appState.localAppData()).filePath(QStringLiteral(".cache/vpngate"));
+    options.fullWorkflow = true;
+    options.dryRun = true;
+    options.noBuild = true;
+    const Result preview = run(options);
+    const QString transcript = preview.output.join('\n');
+    require(preview.exitCode == 0, transcript);
+    require(transcript.contains(QStringLiteral("[plan]")),
+            QStringLiteral("Windows full workflow dry-run omitted host actions"));
+    require(transcript.contains(QDir(options.prefix).filePath(QStringLiteral("vpngate.exe"))),
+            QStringLiteral("Windows full workflow dry-run omitted the native CLI install path"));
+}
+#endif
+
 #if defined(Q_OS_MACOS)
 void testMacSystemDryRunUsesNativeCommandLayout() {
     QTemporaryDir temp;
@@ -611,6 +641,8 @@ int main(int argc, char **argv) {
     testSourceArchiveEntryValidation();
 #if defined(Q_OS_LINUX)
     testFullSystemDryRunPlansHostAndManifestFiles();
+#elif defined(Q_OS_WIN)
+    testWindowsHostDryRunUsesScopedInstallPaths();
 #elif defined(Q_OS_MACOS)
     testMacSystemDryRunUsesNativeCommandLayout();
 #endif

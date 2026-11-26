@@ -2,13 +2,28 @@ name: Build portable installer bundles
 
 on:
   workflow_dispatch:
-  push:
+  pull_request:
     branches:
-      - feature/cpp-installer
+      - main
     paths:
       - 'installer-cpp/**'
       - 'assets/vpngate-512.png'
       - 'LICENSE'
+      - 'install-vpngate.sh'
+      - 'install-vpngate.ps1'
+      - 'install-vpngate.cmd'
+      - '.github/workflows/build-installers.yml'
+  push:
+    branches:
+      - feature/cpp-installer
+      - main
+    paths:
+      - 'installer-cpp/**'
+      - 'assets/vpngate-512.png'
+      - 'LICENSE'
+      - 'install-vpngate.sh'
+      - 'install-vpngate.ps1'
+      - 'install-vpngate.cmd'
       - '.github/workflows/build-installers.yml'
 
 permissions:
@@ -211,5 +226,156 @@ jobs:
         with:
           name: vpngate-installer-linux-x64
           path: ${{ runner.temp }}/vpngate-installer-linux-x64.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  macos:
+    name: macOS ${{ matrix.arch }} bundle
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x64
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Qt 6 and Ninja
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.2'
+          host: mac
+          target: desktop
+          arch: clang_64
+          cache: true
+
+      - name: Install Ninja
+        run: brew list --versions ninja >/dev/null 2>&1 || brew install ninja
+
+      - name: Verify runner architecture
+        shell: bash
+        run: |
+          actual="$(uname -m)"
+          case "${{ matrix.arch }}:$actual" in
+            arm64:arm64|x64:x86_64) echo "Native runner architecture verified: $actual" ;;
+            *) echo "Expected ${{ matrix.arch }}, got $actual" >&2; exit 1 ;;
+          esac
+
+      - name: Configure
+        run: >-
+          cmake -S installer-cpp -B "build/macos-${{ matrix.arch }}" -G Ninja
+          -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+          "-DCMAKE_PREFIX_PATH=$QT_ROOT_DIR"
+
+      - name: Build Release
+        id: macos-build
+        run: cmake --build "build/macos-${{ matrix.arch }}" --parallel
+
+      - name: Expose macOS compiler diagnostics
+        if: failure() && steps.macos-build.outcome == 'failure'
+        shell: bash
+        run: |
+          set +e
+          cmake --build "build/macos-${{ matrix.arch }}" --parallel --verbose > "$RUNNER_TEMP/macos-build-diagnostics.log" 2>&1
+          build_exit=$?
+          diagnostics=$(tail -n 80 "$RUNNER_TEMP/macos-build-diagnostics.log")
+          diagnostics=${diagnostics//%/%25}
+          diagnostics=${diagnostics//$'\r'/%0D}
+          diagnostics=${diagnostics//$'\n'/%0A}
+          if [ -n "$diagnostics" ]; then
+            echo "::error title=macOS compiler diagnostics::$diagnostics"
+          fi
+          if [ "$build_exit" -eq 0 ]; then
+            echo '::warning title=macOS compiler diagnostic::Build passed on diagnostic retry; failure may be transient.'
+          fi
+          exit 0
+
+      - name: Run tests
+        id: macos-tests
+        run: ctest --test-dir "build/macos-${{ matrix.arch }}" --output-on-failure
+
+      - name: Expose macOS test diagnostics
+        if: failure() && steps.macos-tests.outcome == 'failure'
+        shell: bash
+        run: |
+          set +e
+          ctest --test-dir "build/macos-${{ matrix.arch }}" --output-on-failure --verbose > "$RUNNER_TEMP/macos-test-diagnostics.log" 2>&1
+          test_exit=$?
+          diagnostics=$(tail -n 80 "$RUNNER_TEMP/macos-test-diagnostics.log")
+          diagnostics=${diagnostics//%/%25}
+          diagnostics=${diagnostics//$'\r'/%0D}
+          diagnostics=${diagnostics//$'\n'/%0A}
+          if [ -n "$diagnostics" ]; then
+            echo "::error title=macOS test diagnostics::$diagnostics"
+          fi
+          if [ "$test_exit" -eq 0 ]; then
+            echo '::warning title=macOS test diagnostic::CTest passed on diagnostic retry; failure may be transient.'
+          fi
+          exit 0
+
+      - name: Deploy Qt runtime and archive app bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_bundle="build/macos-${{ matrix.arch }}/vpngate-installer.app"
+          macdeployqt="$QT_ROOT_DIR/bin/macdeployqt"
+          if [[ ! -d "$app_bundle" ]]; then
+            echo "::error title=macOS deployment::Missing macOS app bundle: $app_bundle"
+            exit 1
+          fi
+          if [[ ! -x "$macdeployqt" ]]; then
+            echo "::error title=macOS deployment::Missing macdeployqt: $macdeployqt"
+            exit 1
+          fi
+
+          deploy_log="$RUNNER_TEMP/macdeployqt.log"
+          if ! "$macdeployqt" "$app_bundle" -always-overwrite > "$deploy_log" 2>&1; then
+            cat "$deploy_log"
+            diagnostics=$(tail -n 80 "$deploy_log")
+            diagnostics=${diagnostics//%/%25}
+            diagnostics=${diagnostics//$'\r'/%0D}
+            diagnostics=${diagnostics//$'\n'/%0A}
+            echo "::error title=macOS Qt deployment::$diagnostics"
+            exit 1
+          fi
+          cat "$deploy_log"
+
+          help_log="$RUNNER_TEMP/macos-help.log"
+          if ! "$app_bundle/Contents/MacOS/vpngate-installer" --help > "$help_log" 2>&1; then
+            cat "$help_log"
+            diagnostics=$(tail -n 80 "$help_log")
+            diagnostics=${diagnostics//%/%25}
+            diagnostics=${diagnostics//$'\r'/%0D}
+            diagnostics=${diagnostics//$'\n'/%0A}
+            echo "::error title=macOS CLI smoke test::$diagnostics"
+            exit 1
+          fi
+          cat "$help_log"
+
+          stage="$RUNNER_TEMP/vpngate-installer-macos-${{ matrix.arch }}"
+          mkdir -p "$stage"
+          ditto "$app_bundle" "$stage/vpngate-installer.app"
+          cp LICENSE "$stage/LICENSE"
+          cat > "$stage/README.txt" <<'EOF'
+          VPN Gate Connect Installer - macOS ${{ matrix.arch }}
+
+          Open vpngate-installer.app for the GUI, or run:
+          vpngate-installer.app/Contents/MacOS/vpngate-installer --help
+          The installer downloads/builds the VPN client when an install workflow is run.
+          This CI bundle is unsigned and is intended for testing.
+          EOF
+
+          archive="$RUNNER_TEMP/vpngate-installer-macos-${{ matrix.arch }}.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$stage" "$archive"
+
+      - name: Upload macOS bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: vpngate-installer-macos-${{ matrix.arch }}
+          path: ${{ runner.temp }}/vpngate-installer-macos-${{ matrix.arch }}.zip
           if-no-files-found: error
           retention-days: 14
