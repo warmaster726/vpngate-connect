@@ -109,11 +109,11 @@ jobs:
           Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $archive -Force
           "WINDOWS_BUNDLE=$archive" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
-      - name: Upload Windows bundle
-        uses: actions/upload-artifact@v4
+      - name: Upload Windows bundle without an outer artifact ZIP
+        uses: actions/upload-artifact@v7
         with:
-          name: vpngate-installer-windows-x64
           path: ${{ runner.temp }}/vpngate-installer-windows-x64.zip
+          archive: false
           if-no-files-found: error
           retention-days: 14
 
@@ -221,11 +221,11 @@ jobs:
           tar -czf "$archive" -C "$appdir" .
           echo "LINUX_BUNDLE=$archive" >> "$GITHUB_OUTPUT"
 
-      - name: Upload Linux bundle
-        uses: actions/upload-artifact@v4
+      - name: Upload Linux bundle without an outer artifact ZIP
+        uses: actions/upload-artifact@v7
         with:
-          name: vpngate-installer-linux-x64
           path: ${{ runner.temp }}/vpngate-installer-linux-x64.tar.gz
+          archive: false
           if-no-files-found: error
           retention-days: 14
 
@@ -379,10 +379,10 @@ jobs:
           archive="$RUNNER_TEMP/vpngate-installer-macos-${{ matrix.arch }}.zip"
           ditto -c -k --sequesterRsrc --keepParent "$stage" "$archive"
 
-      - name: Upload macOS bundle
-        uses: actions/upload-artifact@v4
+      - name: Upload macOS bundle without an outer artifact ZIP
+        uses: actions/upload-artifact@v7
         with:
-          name: vpngate-installer-macos-${{ matrix.arch }}
           path: ${{ runner.temp }}/vpngate-installer-macos-${{ matrix.arch }}.zip
+          archive: false
           if-no-files-found: error
           retention-days: 14
