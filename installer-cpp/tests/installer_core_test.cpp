@@ -241,7 +241,7 @@ void testFullSystemDryRunPlansHostAndManifestFiles() {
     Options options;
     options.action = Action::Install;
     options.sourceDir = source;
-    options.prefix = systemInstallPrefix();
+    options.prefix = QDir(temp.path()).filePath(QStringLiteral("system-install"));
     options.targetHome = targetHome;
     options.cacheDir = QDir(targetHome).filePath(QStringLiteral(".cache/vpngate"));
     options.fullWorkflow = true;
@@ -251,8 +251,12 @@ void testFullSystemDryRunPlansHostAndManifestFiles() {
     require(preview.exitCode == 0, preview.output.join('\n'));
     require(preview.output.join('\n').contains(QStringLiteral("[plan]")),
             QStringLiteral("full workflow dry-run omitted host actions"));
-    require(preview.output.join('\n').contains(QStringLiteral("/usr/local/bin/vpngate")),
-            QStringLiteral("full workflow dry-run omitted the system client path"));
+    require(preview.output.join('\n').contains(QDir(options.prefix).filePath(QStringLiteral("bin/vpngate"))),
+            QStringLiteral("full workflow dry-run omitted the native CLI install path"));
+    require(!QFileInfo::exists(options.prefix),
+            QStringLiteral("full workflow dry-run created its install prefix"));
+    require(!QFileInfo::exists(options.cacheDir),
+            QStringLiteral("full workflow dry-run created its cache directory"));
 }
 #endif
 
@@ -272,7 +276,7 @@ void testWindowsHostDryRunUsesScopedInstallPaths() {
     options.sourceDir = source;
     options.prefix = systemInstallPrefix();
     options.targetHome = targetHome;
-    options.cacheDir = QDir(appState.localAppData()).filePath(QStringLiteral(".cache/vpngate"));
+    options.cacheDir = QDir(appState.localAppData()).filePath(QStringLiteral("vpngate"));
     options.fullWorkflow = true;
     options.dryRun = true;
     options.noBuild = true;
@@ -283,6 +287,10 @@ void testWindowsHostDryRunUsesScopedInstallPaths() {
             QStringLiteral("Windows full workflow dry-run omitted host actions"));
     require(transcript.contains(QDir(options.prefix).filePath(QStringLiteral("vpngate.exe"))),
             QStringLiteral("Windows full workflow dry-run omitted the native CLI install path"));
+    require(!QFileInfo::exists(options.prefix),
+            QStringLiteral("Windows full workflow dry-run created its install directory"));
+    require(!QFileInfo::exists(options.cacheDir),
+            QStringLiteral("Windows full workflow dry-run created its cache directory"));
 }
 #endif
 
@@ -316,6 +324,8 @@ void testMacSystemDryRunUsesNativeCommandLayout() {
             QStringLiteral("macOS system manifest was not planned under /usr/local/share"));
     require(!transcript.contains(QStringLiteral("/usr/local/Contents/MacOS")),
             QStringLiteral("macOS system workflow incorrectly planned an application bundle inside /usr/local"));
+    require(!QFileInfo::exists(options.cacheDir),
+            QStringLiteral("macOS full workflow dry-run created its cache directory"));
 }
 #endif
 
