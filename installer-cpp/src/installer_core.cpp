@@ -215,11 +215,18 @@ QString joinedPath(const QString &root, const QString &relative) {
 bool pathHasSymlinkParent(const QString &prefix, const QString &relative);
 
 bool isWithinPrefix(const QString &prefix, const QString &candidate) {
+#if defined(Q_OS_WIN)
+    const QString root = QDir::fromNativeSeparators(absoluteCleanPath(prefix));
+    const QString path = QDir::fromNativeSeparators(absoluteCleanPath(candidate));
+    const QChar separator = QLatin1Char('/');
+#else
     const QString root = absoluteCleanPath(prefix);
     const QString path = absoluteCleanPath(candidate);
+    const QChar separator = QDir::separator();
+#endif
     QString childPrefix = root;
-    if (!childPrefix.endsWith(QDir::separator())) {
-        childPrefix.append(QDir::separator());
+    if (!childPrefix.endsWith(separator)) {
+        childPrefix.append(separator);
     }
 #if defined(Q_OS_WIN)
     return path.compare(root, Qt::CaseInsensitive) == 0
