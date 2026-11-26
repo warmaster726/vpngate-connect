@@ -17,6 +17,16 @@ using namespace vpngate::installer;
 
 namespace {
 
+QString temporaryDirectoryTemplate() {
+#if defined(Q_OS_MACOS)
+    // macOS rejects installer prefixes under /private/var, where QTemporaryDir
+    // normally lives. Keep test fixtures under the user's home instead.
+    return QDir(QDir::homePath()).filePath(QStringLiteral(".vpngate-installer-test-XXXXXX"));
+#else
+    return {};
+#endif
+}
+
 [[noreturn]] void fail(const QString &message) {
     QTextStream(stderr) << "TEST FAILURE: " << message << Qt::endl;
     std::exit(1);
@@ -220,7 +230,7 @@ void testSourceArchiveEntryValidation() {
 
 #if defined(Q_OS_LINUX)
 void testFullSystemDryRunPlansHostAndManifestFiles() {
-    QTemporaryDir temp;
+    QTemporaryDir temp(temporaryDirectoryTemplate());
     require(temp.isValid(), QStringLiteral("temporary directory unavailable"));
     const QString source = QDir(temp.path()).filePath(QStringLiteral("source"));
     const QString targetHome = QDir(temp.path()).filePath(QStringLiteral("target-home"));
@@ -248,7 +258,7 @@ void testFullSystemDryRunPlansHostAndManifestFiles() {
 
 #if defined(Q_OS_WIN)
 void testWindowsHostDryRunUsesScopedInstallPaths() {
-    QTemporaryDir temp;
+    QTemporaryDir temp(temporaryDirectoryTemplate());
     require(temp.isValid(), QStringLiteral("temporary directory unavailable"));
     ScopedAppStateEnvironment appState(QDir(temp.path()).filePath(QStringLiteral("app-state")));
     const QString source = QDir(temp.path()).filePath(QStringLiteral("source"));
@@ -278,7 +288,7 @@ void testWindowsHostDryRunUsesScopedInstallPaths() {
 
 #if defined(Q_OS_MACOS)
 void testMacSystemDryRunUsesNativeCommandLayout() {
-    QTemporaryDir temp;
+    QTemporaryDir temp(temporaryDirectoryTemplate());
     require(temp.isValid(), QStringLiteral("temporary directory unavailable"));
     const QString source = QDir(temp.path()).filePath(QStringLiteral("source"));
     const QString targetHome = QDir(temp.path()).filePath(QStringLiteral("target-home"));
@@ -310,7 +320,7 @@ void testMacSystemDryRunUsesNativeCommandLayout() {
 #endif
 
 void testInstallVerifyUninstallPreservesUnrelatedData() {
-    QTemporaryDir temp;
+    QTemporaryDir temp(temporaryDirectoryTemplate());
     require(temp.isValid(), QStringLiteral("temporary directory unavailable"));
     ScopedAppStateEnvironment appState(QDir(temp.path()).filePath(QStringLiteral("app-state")));
     const QString source = QDir(temp.path()).filePath(QStringLiteral("source"));
@@ -394,7 +404,7 @@ void testInstallVerifyUninstallPreservesUnrelatedData() {
 }
 
 void testDryRunAndNoOverwrite() {
-    QTemporaryDir temp;
+    QTemporaryDir temp(temporaryDirectoryTemplate());
     require(temp.isValid(), QStringLiteral("temporary directory unavailable"));
     const QString source = QDir(temp.path()).filePath(QStringLiteral("source"));
     const QString prefix = QDir(temp.path()).filePath(QStringLiteral("install"));
@@ -413,7 +423,7 @@ void testDryRunAndNoOverwrite() {
     require(rejectedSystemPrefix.exitCode != 0,
             QStringLiteral("installer accepted a filesystem-root install prefix"));
 
-    QTemporaryDir sourceOnlyTemp;
+    QTemporaryDir sourceOnlyTemp(temporaryDirectoryTemplate());
     require(sourceOnlyTemp.isValid(), QStringLiteral("temporary directory unavailable for build dry-run"));
     const QString sourceOnly = QDir(sourceOnlyTemp.path()).filePath(QStringLiteral("source"));
     const QString dryPrefix = QDir(sourceOnlyTemp.path()).filePath(QStringLiteral("install"));
@@ -442,7 +452,7 @@ void testDryRunAndNoOverwrite() {
 }
 
 void testModifiedFilesArePreservedUnlessForced() {
-    QTemporaryDir temp;
+    QTemporaryDir temp(temporaryDirectoryTemplate());
     require(temp.isValid(), QStringLiteral("temporary directory unavailable"));
     const QString source = QDir(temp.path()).filePath(QStringLiteral("source"));
     const QString prefix = QDir(temp.path()).filePath(QStringLiteral("install"));
@@ -476,7 +486,7 @@ void testModifiedFilesArePreservedUnlessForced() {
 }
 
 void testUpgradeRemovesObsoleteTrackedFiles() {
-    QTemporaryDir temp;
+    QTemporaryDir temp(temporaryDirectoryTemplate());
     require(temp.isValid(), QStringLiteral("temporary directory unavailable"));
     const QString source = QDir(temp.path()).filePath(QStringLiteral("source"));
     const QString prefix = QDir(temp.path()).filePath(QStringLiteral("install"));
@@ -509,7 +519,7 @@ void testUpgradeRemovesObsoleteTrackedFiles() {
 }
 
 void testStateCleanupFailureKeepsRetryInventory() {
-    QTemporaryDir temp;
+    QTemporaryDir temp(temporaryDirectoryTemplate());
     require(temp.isValid(), QStringLiteral("temporary directory unavailable"));
     ScopedAppStateEnvironment appState(QDir(temp.path()).filePath(QStringLiteral("app-state")));
     const QString source = QDir(temp.path()).filePath(QStringLiteral("source"));
@@ -550,7 +560,7 @@ void testStateCleanupFailureKeepsRetryInventory() {
 }
 
 void testPathTraversalRejected() {
-    QTemporaryDir temp;
+    QTemporaryDir temp(temporaryDirectoryTemplate());
     require(temp.isValid(), QStringLiteral("temporary directory unavailable"));
     const QString source = QDir(temp.path()).filePath(QStringLiteral("source"));
     const QString prefix = QDir(temp.path()).filePath(QStringLiteral("install"));
@@ -592,7 +602,7 @@ void testPathTraversalRejected() {
 }
 
 void testManifestCannotClaimUnrelatedFiles() {
-    QTemporaryDir temp;
+    QTemporaryDir temp(temporaryDirectoryTemplate());
     require(temp.isValid(), QStringLiteral("temporary directory unavailable"));
     const QString source = QDir(temp.path()).filePath(QStringLiteral("source"));
     const QString prefix = QDir(temp.path()).filePath(QStringLiteral("install"));

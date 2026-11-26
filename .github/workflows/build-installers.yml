@@ -236,7 +236,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-15
+          - runner: macos-26
             arch: arm64
           - runner: macos-15-intel
             arch: x64
@@ -270,6 +270,7 @@ jobs:
           cmake -S installer-cpp -B "build/macos-${{ matrix.arch }}" -G Ninja
           -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
           "-DCMAKE_PREFIX_PATH=$QT_ROOT_DIR"
+          "-DCMAKE_OSX_ARCHITECTURES=$(uname -m)"
 
       - name: Build Release
         id: macos-build
@@ -331,6 +332,11 @@ jobs:
             echo "::error title=macOS deployment::Missing macdeployqt: $macdeployqt"
             exit 1
           fi
+          binary_archs="$(lipo -archs "$app_bundle/Contents/MacOS/vpngate-installer")"
+          case "${{ matrix.arch }}:$binary_archs" in
+            arm64:*arm64*|x64:*x86_64*) echo "Bundle architecture verified: $binary_archs" ;;
+            *) echo "::error title=macOS deployment::Unexpected app architecture: $binary_archs"; exit 1 ;;
+          esac
 
           deploy_log="$RUNNER_TEMP/macdeployqt.log"
           if ! "$macdeployqt" "$app_bundle" -always-overwrite > "$deploy_log" 2>&1; then
