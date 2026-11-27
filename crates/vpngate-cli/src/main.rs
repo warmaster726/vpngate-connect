@@ -15,7 +15,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use commands::{
-    ConnectArgs, UpgradeOffer, cmd_connect, cmd_countries, cmd_disconnect, cmd_doctor_with_update,
+    ConnectArgs, cmd_connect, cmd_countries, cmd_disconnect, cmd_doctor_with_update,
     cmd_list, cmd_mirrors, cmd_probe, cmd_refresh, cmd_reset_cooldowns, cmd_status, cmd_upgrade,
     cmd_watchdog, set_no_elevate_requested, set_skip_update_check, set_uac_already_attempted,
 };
@@ -68,7 +68,7 @@ COMMAND FLAGS:
   -S, --status                    Show connection status
   -D, --doctor                    Run system diagnostics
   -d, --disconnect                Disconnect the active tunnel
-  -y, --yes                       Skip the update-install confirmation prompt
+  -y, --yes                       Skip confirmation and open the installer workflow
 
 GLOBAL OPTIONS:
       --cache-dir <PATH>           Use a specific cache/state directory
@@ -346,12 +346,7 @@ async fn dispatch_commands(paths: &AppPaths, raw_args: &[String]) -> io::Result<
         return cmd_disconnect(paths).await;
     }
     if flag_doctor || matches!(subcmd.as_str(), "doctor" | "check" | "diag") {
-        let (rc, offer) = cmd_doctor_with_update(paths).await?;
-        return Ok(match offer {
-            UpgradeOffer::ExitAfterInstall => 0,
-            UpgradeOffer::Failed(n) => n,
-            UpgradeOffer::Continue => rc,
-        });
+        return cmd_doctor_with_update(paths).await;
     }
     if flag_status || matches!(subcmd.as_str(), "status" | "st") {
         return cmd_status(paths).await;

@@ -126,17 +126,19 @@
           <div class="card-subtitle" style="margin-top:8px">
             <strong>iPhone / iPad:</strong> Safari only. Wait for <em>LIVE HANDSHAKE</em>, tap <strong>Install Apple L2TP</strong> → Allow → Settings → Profile Downloaded → Install. OpenVPN: tap <strong>Open in OpenVPN Connect</strong> (install that app first) — the profile is handed to the app, not opened as a page.<br>
             <strong>Android / OpenVPN:</strong> After handshake, tap <strong>Open in OpenVPN Connect</strong>. If the app is missing you will be offered Play Store, then share/download.<br>
-            <strong>Linux &amp; Windows 11:</strong> Linux command is shown by default. Windows devices switch automatically. Tap a command to copy.
+            <strong>Desktop:</strong> Choose your OS. On GitHub, open the latest successful completed <code>main</code>-branch run (green check) and download the matching artifact. Each artifact is the installer file itself, not an outer ZIP.
           </div>
           <div class="pill-row" id="install-os-pills" style="margin-top:8px">
-            <button type="button" class="chip active" data-install-os="linux">Linux</button>
-            <button type="button" class="chip" data-install-os="windows">Windows</button>
+            <button type="button" class="chip active" data-install-os="linux">Linux x64</button>
+            <button type="button" class="chip" data-install-os="macos">macOS</button>
+            <button type="button" class="chip" data-install-os="windows">Windows x64</button>
           </div>
-          <div class="card-subtitle" id="install-os-hint" style="margin-top:8px">Linux / macOS · POSIX sh</div>
-          <div class="code-copy-label">Install · tap to copy</div>
-          <button type="button" class="code-copy" id="install-copy" title="Tap to copy">curl -fsSL https://raw.githubusercontent.com/warmaster726/vpngate-connect/main/install-vpngate.sh | sh -s --</button>
-          <div class="code-copy-label">Uninstall · same one-liner + --uninstall</div>
-          <button type="button" class="code-copy" id="uninstall-copy" title="Tap to copy">curl -fsSL https://raw.githubusercontent.com/warmaster726/vpngate-connect/main/install-vpngate.sh | sh -s -- --uninstall</button>
+          <div class="card-subtitle" id="install-os-hint" style="margin-top:8px">Linux x64 · self-extracting .run</div>
+          <div class="card-subtitle" id="install-os-info" style="margin-top:6px">From the latest successful main-branch run, download vpngate-installer-linux-x64-run (the artifact is the .run file itself). Run chmod +x vpngate-installer-linux-x64.run && ./vpngate-installer-linux-x64.run; add uninstall to the command to remove the client.</div>
+          <div style="margin-top:10px">
+            <a class="btn btn-sm" id="desktop-installer-link" href="https://github.com/warmaster726/vpngate-connect/actions/workflows/build-installers.yml?query=branch%3Amain" target="_blank" rel="noopener noreferrer">Open main-branch installer workflow</a>
+          </div>
+          <div class="card-subtitle" style="margin-top:8px">Artifacts are unsigned and retained for 14 days; they are not permanent release downloads. Linux and Windows packages are x64; macOS has Intel and Apple Silicon packages. Linux/Windows ARM64 users must build from source.</div>
         </details>
       </div>
 

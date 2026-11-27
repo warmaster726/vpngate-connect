@@ -9,9 +9,6 @@ on:
       - 'installer-cpp/**'
       - 'assets/vpngate-512.png'
       - 'LICENSE'
-      - 'install-vpngate.sh'
-      - 'install-vpngate.ps1'
-      - 'install-vpngate.cmd'
       - '.github/workflows/build-installers.yml'
   push:
     branches:
@@ -21,9 +18,6 @@ on:
       - 'installer-cpp/**'
       - 'assets/vpngate-512.png'
       - 'LICENSE'
-      - 'install-vpngate.sh'
-      - 'install-vpngate.ps1'
-      - 'install-vpngate.cmd'
       - '.github/workflows/build-installers.yml'
 
 permissions:

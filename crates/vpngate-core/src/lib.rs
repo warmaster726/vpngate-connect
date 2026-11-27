@@ -76,7 +76,7 @@ pub use update::{
     DesktopVersion, PRODUCT_VERSION, RemoteDesktopVersion, UpdateCheckCache, cache_is_fresh,
     cached_newer_than_installed, cached_remote_version, cargo_toml_check_urls,
     check_remote_desktop_version, default_repo_slug, fetch_public_url_text,
-    installed_desktop_version, installer_script_urls, load_update_cache, parse_version_payload,
+    installed_desktop_version, installer_workflow_url, load_update_cache, parse_version_payload,
     parse_workspace_package_version, record_update_declined, record_update_failure,
     record_update_scan, refresh_update_cache, should_auto_prompt, version_check_urls,
 };

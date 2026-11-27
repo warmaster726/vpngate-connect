@@ -21,8 +21,9 @@ use vpngate_core::cache::ServerCacheFile;
 use vpngate_core::{
     ActiveSessionState, AppPaths, DesktopVersion, InteractiveInstanceError, PRODUCT_VERSION,
     ProtocolFilter, RemoteDesktopVersion, SortBy, UpdateCheckCache, VpnServer,
-    acquire_interactive_instances, cpu_isa_label, detect_host_os_label, filter_by_country,
-    filter_by_protocol, installed_desktop_version, is_root_or_admin, load_cached_mirrors,
+    acquire_interactive_instances, cpu_isa_label, default_repo_slug, detect_host_os_label,
+    filter_by_country, filter_by_protocol, installed_desktop_version, installer_workflow_url,
+    is_root_or_admin, load_cached_mirrors,
     load_update_cache, now_unix_secs, read_json_opt, record_update_declined, refresh_update_cache,
     should_auto_prompt, sort_servers, summarize_countries, tunnel_aid_dns_cli,
 };
@@ -157,15 +158,6 @@ impl Page {
 enum UpdateKind {
     Update,
     Upgrade,
-}
-
-impl UpdateKind {
-    fn command(self) -> &'static str {
-        match self {
-            Self::Update => "update",
-            Self::Upgrade => "upgrade",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -702,19 +694,19 @@ impl GuiApp {
     }
 
     fn update_confirmation_ui(&mut self, ctx: &egui::Context) {
-        let Some(kind) = self.pending_update else {
+        let Some(_kind) = self.pending_update else {
             return;
         };
-        let mut confirmed = false;
+        let mut open_workflow = false;
         let mut dismissed = false;
-        egui::Window::new("Confirm desktop update")
+        egui::Window::new("Desktop update available")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ctx, |ui| {
                 if let Some(remote) = &self.update_offer {
                     ui.label(format!(
-                        "Installed v{PRODUCT_VERSION} · latest v{}. Installing the update is strongly recommended.",
+                        "Installed v{PRODUCT_VERSION} · latest v{}. Download the newer installer manually from GitHub Actions.",
                         remote.raw
                     ));
                     ui.label(
@@ -724,54 +716,45 @@ impl GuiApp {
                     );
                 } else {
                     ui.label(
-                        "Continue with the desktop installer? It may replace this installation.",
-                    );
-                    ui.label(
-                        RichText::new(
-                            "The update is downloaded anonymously from the public repository.",
-                        )
-                        .weak(),
+                        "Open the installer workflow to choose a platform package manually.",
                     );
                 }
                 ui.label(
                     RichText::new(
-                        "Installing replaces this desktop version and removes the old binary.",
+                        "Choose the latest successful main-branch run, download the artifact for this OS, then launch it yourself.",
                     )
                     .weak(),
                 );
+                ui.label(
+                    RichText::new(
+                        "Packages are unsigned; workflow artifacts are retained for 14 days and are not permanent release downloads.",
+                    )
+                    .weak()
+                    .small(),
+                );
                 ui.add_space(8.0);
-                if self.cli_binary.is_none() {
-                    ui.colored_label(Color32::from_rgb(190, 125, 30), self.action_service_notice());
-                }
                 ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(self.cli_binary.is_some(), egui::Button::new("Install update"))
-                        .clicked()
-                    {
-                        confirmed = true;
+                    if ui.button("Open installer workflow").clicked() {
+                        open_workflow = true;
                     }
                     if ui.button("Cancel").clicked() {
                         dismissed = true;
                     }
                 });
             });
-        if confirmed {
+        if open_workflow {
             self.pending_update = None;
-            let update_offer = self.update_offer.take();
-            self.start_cli_command(
-                kind.command(),
-                vec![kind.command().to_string(), "--yes".to_string()],
-                false,
-                true,
-            );
-            if self.worker.is_none() {
-                self.update_offer = update_offer;
-                self.pending_update = Some(kind);
-            }
+            self.update_offer = None;
+            let url = installer_workflow_url(&default_repo_slug());
+            ctx.open_url(egui::OpenUrl::new_tab(url.clone()));
+            self.push_log(format!("Opening installer workflow: {url}"));
+            self.status_message =
+                "Download and run the matching installer manually; artifacts expire after 14 days."
+                    .to_string();
         } else if dismissed {
             if let Some(remote) = self.update_offer.take() {
                 record_update_declined(&self.paths, &remote);
-                let message = "Update reminder snoozed for 24 hours. You can install later from More actions.";
+                let message = "Update reminder snoozed for 24 hours. You can open the installer workflow later from More actions.";
                 self.push_log(message.to_string());
                 self.status_message = message.to_string();
             }

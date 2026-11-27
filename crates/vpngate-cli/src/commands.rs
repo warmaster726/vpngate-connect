@@ -3,10 +3,6 @@ use std::env;
 use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
-#[cfg(windows)]
-use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,10 +14,10 @@ use vpngate_core::{
     MONITOR_INTERVAL_SECONDS, NM_PROFILE_PREFIX, OfficialMirrorSite, PRODUCT_VERSION,
     ProgressEvent, ProtocolFilter, ServerCacheFile, SortBy, cached_newer_than_installed,
     cleanup_existing_vpn_with_progress, default_repo_slug, detect_host_os_label,
-    engage_candidates_with_progress, fetch_public_url_text, filter_by_country, filter_by_protocol,
+    engage_candidates_with_progress, filter_by_country, filter_by_protocol,
     find_openvpn_bin, fix_owner, get_default_gateway, get_ppp_interfaces, get_public_ip_trace,
     get_running_monitor_pid, get_running_openvpn_pid, get_servers_cached_with_progress,
-    get_tun_interfaces, installed_desktop_version, installer_script_urls, is_root_or_admin,
+    get_tun_interfaces, installed_desktop_version, installer_workflow_url, is_root_or_admin,
     load_cached_mirrors, load_cooldowns, load_update_cache, load_watchdog_pref,
     normalize_mirror_base_url, now_unix_secs, parse_dns_list, probe_tcp, prune_stale_state_if_dead,
     query_windows_natt_rule, read_json_opt, record_update_declined, refresh_update_cache,
@@ -1504,182 +1500,82 @@ pub async fn cmd_probe(ip_raw: &str) -> io::Result<i32> {
     Ok(0)
 }
 
-fn is_dev_tree_binary() -> bool {
-    env::current_exe()
-        .ok()
-        .map(|p| p.components().any(|c| c.as_os_str() == "target"))
-        .unwrap_or(false)
-}
-
-fn canonical_install_binary() -> PathBuf {
-    if cfg!(windows) {
-        env::var("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| resolve_user_home().join("AppData").join("Local"))
-            .join("Programs")
-            .join("VPNGate")
-            .join("vpngate.exe")
-    } else {
-        PathBuf::from("/usr/local/bin/vpngate")
-    }
-}
-
-fn cargo_install_shadow_binary() -> PathBuf {
-    if cfg!(windows) {
-        resolve_user_home()
-            .join(".cargo")
-            .join("bin")
-            .join("vpngate.exe")
-    } else {
-        resolve_user_home()
-            .join(".cargo")
-            .join("bin")
-            .join("vpngate")
-    }
-}
-
-fn remove_shadow_desktop_binaries() {
-    if is_dev_tree_binary() {
-        return;
-    }
-    let canonical = canonical_install_binary();
-    let cargo_bin = cargo_install_shadow_binary();
-    if cargo_bin.is_file() && cargo_bin != canonical {
-        match fs::remove_file(&cargo_bin) {
-            Ok(()) => ok(&format!(
-                "Removed leftover previous binary {}",
-                cargo_bin.display()
-            )),
-            Err(e) => warn(&format!(
-                "Could not remove leftover {} ({e})",
-                cargo_bin.display()
-            )),
-        }
-    }
-}
-
-fn write_upgrade_installer_script(paths: &AppPaths, body: &str) -> io::Result<PathBuf> {
-    let _ = paths.ensure_dirs();
-    let dest = if cfg!(windows) {
-        paths.cache_dir.join("install-vpngate.ps1")
-    } else {
-        paths.cache_dir.join("install-vpngate.sh")
-    };
-    let payload = if cfg!(windows) {
-        body.to_string()
-    } else {
-        body.replace('\r', "")
-    };
-    fs::write(&dest, payload)?;
-    #[cfg(unix)]
+fn installer_artifact_for_current_host() -> Option<&'static str> {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&dest)?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&dest, perms)?;
+        Some("vpngate-installer-linux-x64-run")
     }
-    Ok(dest)
-}
-
-#[cfg(windows)]
-fn spawn_windows_upgrade_installer(ps1: &Path) -> io::Result<()> {
-    const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
-    let ps1_disp = ps1.display().to_string().replace('\'', "''");
-    let inner = format!(
-        "Start-Sleep -Seconds 3; powershell.exe -NoProfile -ExecutionPolicy Bypass -File '{ps1_disp}'"
-    );
-    Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            &inner,
-        ])
-        .creation_flags(CREATE_NEW_CONSOLE)
-        .stdin(Stdio::null())
-        .spawn()?;
-    Ok(())
-}
-
-async fn run_desktop_installer(paths: &AppPaths) -> io::Result<i32> {
-    info("Downloading the public installer (anonymous HTTPS, no GitHub login) ...");
-    let slug = default_repo_slug();
-    let urls = installer_script_urls(&slug);
-    let (body, src) = match fetch_public_url_text(&urls).await {
-        Ok(v) => v,
-        Err(e) => {
-            err(&e);
-            return Ok(1);
-        }
-    };
-    info(&format!("Installer source: {src}"));
-    let script = write_upgrade_installer_script(paths, &body)?;
-
-    info("Disconnecting any active VPN Gate session so the old binary can be replaced ...");
-    let _ = cmd_disconnect(paths).await;
-    stop_monitor_daemon(paths);
-
-    #[cfg(windows)]
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     {
-        remove_shadow_desktop_binaries();
-        info(
-            "Launching the Windows installer in a new window, then closing this process so vpngate.exe is not locked ...",
-        );
-        spawn_windows_upgrade_installer(&script)?;
-        ok("The installer will replace this copy and remove the previous vpngate.exe.");
-        ok("After it finishes, start VPN Gate again from the Start Menu or `vpngate`.");
-        return Ok(0);
+        Some("vpngate-installer-windows-x64-msi")
     }
-
-    #[cfg(not(windows))]
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
     {
-        info(
-            "Running the installer (it deletes /usr/local/bin/vpngate, then installs the new build) ...",
-        );
-        let status = Command::new("sh")
-            .arg(&script)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()?;
-        let rc = status.code().unwrap_or(1);
-        if rc != 0 {
-            err(
-                "Installer did not finish successfully. The previous desktop binary was left in place.",
-            );
-            return Ok(rc);
-        }
-        remove_shadow_desktop_binaries();
-        ok("Desktop update installed. The old /usr/local/bin/vpngate was replaced.");
-        ok("Close this window and open VPN Gate Connect again to use the new version.");
-        if is_stdout_tty() {
-            let _ = prompt_input("Press Enter to close...");
-        }
-        Ok(0)
+        Some("vpngate-installer-macos-x64-pkg")
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        Some("vpngate-installer-macos-arm64-pkg")
+    }
+    #[cfg(not(any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "windows", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "aarch64")
+    )))]
+    {
+        None
     }
 }
 
-pub enum UpgradeOffer {
-    Continue,
-    ExitAfterInstall,
-    Failed(i32),
+fn try_open_url(url: &str) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("explorer.exe")
+            .arg(url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .is_ok()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .is_ok()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Command::new("xdg-open")
+            .arg(url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .is_ok()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        false
+    }
 }
 
 pub async fn cmd_upgrade(paths: &AppPaths, assume_yes: bool) -> io::Result<i32> {
-    match offer_desktop_upgrade(paths, true, assume_yes).await? {
-        UpgradeOffer::Continue => Ok(0),
-        UpgradeOffer::ExitAfterInstall => Ok(0),
-        UpgradeOffer::Failed(rc) => Ok(rc),
-    }
+    offer_desktop_upgrade(paths, true, assume_yes).await?;
+    Ok(0)
 }
 
 /// Scan public `main` for a newer desktop. `force` ignores the 6h cache (used by `vpngate update`).
-pub async fn offer_desktop_upgrade(
+async fn offer_desktop_upgrade(
     paths: &AppPaths,
     force: bool,
     assume_yes: bool,
-) -> io::Result<UpgradeOffer> {
+) -> io::Result<()> {
     let installed = installed_desktop_version();
     info("Checking for a newer desktop on public main (anonymous HTTPS, no GitHub login) ...");
     let remote = match refresh_update_cache(paths, force).await {
@@ -1687,7 +1583,7 @@ pub async fn offer_desktop_upgrade(
         Err(e) => {
             err(&e);
             warn("Could not see public main. Retry with `vpngate update`.");
-            return Ok(UpgradeOffer::Continue);
+            return Ok(());
         }
     };
 
@@ -1698,7 +1594,7 @@ pub async fn offer_desktop_upgrade(
                 remote.raw
             ));
         }
-        return Ok(UpgradeOffer::Continue);
+        return Ok(());
     }
     if remote.version == installed {
         if force {
@@ -1706,15 +1602,15 @@ pub async fn offer_desktop_upgrade(
                 "VPN Gate Connect desktop {installed} is up to date."
             ));
         }
-        return Ok(UpgradeOffer::Continue);
+        return Ok(());
     }
     if !force
         && let Some(cache) = load_update_cache(paths)
         && !should_auto_prompt(&cache, &remote.version)
     {
-        return Ok(UpgradeOffer::Continue);
+        return Ok(());
     }
-    prompt_and_maybe_install(paths, &remote, assume_yes).await
+    prompt_and_open_installer_workflow(paths, &remote, assume_yes).await
 }
 
 async fn live_check_desktop_update(paths: &AppPaths) {
@@ -1725,62 +1621,54 @@ async fn live_check_desktop_update(paths: &AppPaths) {
     }
 }
 
-/// `None` if nothing was shown. Snooze is skipped when `respect_snooze` is false (mode 9 / doctor).
-async fn maybe_prompt_if_newer(
-    paths: &AppPaths,
-    respect_snooze: bool,
-) -> io::Result<Option<UpgradeOffer>> {
+/// Offer the manual installer workflow when a cached desktop version is newer.
+async fn maybe_prompt_if_newer(paths: &AppPaths, respect_snooze: bool) -> io::Result<()> {
     let Some(cache) = load_update_cache(paths) else {
-        return Ok(None);
+        return Ok(());
     };
     let Some(remote) = cached_newer_than_installed(&cache) else {
-        return Ok(None);
+        return Ok(());
     };
     if respect_snooze && !should_auto_prompt(&cache, &remote.version) {
-        return Ok(None);
+        return Ok(());
     }
-    Ok(Some(prompt_and_maybe_install(paths, &remote, false).await?))
+    prompt_and_open_installer_workflow(paths, &remote, false).await
 }
 
-pub async fn cmd_doctor_with_update(paths: &AppPaths) -> io::Result<(i32, UpgradeOffer)> {
+pub async fn cmd_doctor_with_update(paths: &AppPaths) -> io::Result<i32> {
     if is_stdout_tty() && !skip_update_check() {
         live_check_desktop_update(paths).await;
     }
     let rc = cmd_doctor(paths)?;
-    let offer = if is_stdout_tty() && !skip_update_check() {
-        maybe_prompt_if_newer(paths, false)
-            .await?
-            .unwrap_or(UpgradeOffer::Continue)
-    } else {
-        UpgradeOffer::Continue
-    };
-    Ok((rc, offer))
+    if is_stdout_tty() && !skip_update_check() {
+        maybe_prompt_if_newer(paths, false).await?;
+    }
+    Ok(rc)
 }
 
-async fn prompt_and_maybe_install(
+async fn prompt_and_open_installer_workflow(
     paths: &AppPaths,
     remote: &vpngate_core::RemoteDesktopVersion,
     assume_yes: bool,
-) -> io::Result<UpgradeOffer> {
+) -> io::Result<()> {
     let installed = installed_desktop_version();
     print_line("");
-    warn("A newer VPN Gate Connect desktop is available — installing it is strongly recommended.");
+    warn("A newer VPN Gate Connect desktop is available; installation is a manual download.");
     print_line(&format!(
         "  Installed : {YELLOW}{installed}{RESET}\n  Latest    : {GREEN}{}{RESET}  ({})",
         remote.raw, remote.source_url
     ));
-    print_line(&format!(
-        "  {BOLD}Updating replaces this install and removes the old binary.{RESET}"
-    ));
+    warn("The updater will not download or execute an installer automatically.");
     print_line("");
 
+    let interactive = is_stdout_tty();
     let accepted = if assume_yes {
         true
-    } else if !is_stdout_tty() {
-        warn("Non-interactive session: re-run `vpngate update -y` to install.");
+    } else if !interactive {
+        warn("Non-interactive session: run `vpngate update -y` to open the installer workflow.");
         false
     } else {
-        match prompt_input("Install this update now? [Y/n]: ") {
+        match prompt_input("Open the installer workflow now? [Y/n]: ") {
             None => false,
             Some(ans) => {
                 let t = ans.trim().to_ascii_lowercase();
@@ -1790,25 +1678,57 @@ async fn prompt_and_maybe_install(
     };
 
     if !accepted {
-        record_update_declined(paths, remote);
-        info("Skipped. You can install later with `vpngate update`.");
-        return Ok(UpgradeOffer::Continue);
+        if interactive {
+            record_update_declined(paths, remote);
+            info("Skipped. You can open the workflow later with `vpngate update`.");
+        } else {
+            info("No workflow was opened. Re-run `vpngate update -y` when a browser is available.");
+        }
+        return Ok(());
     }
 
-    let rc = run_desktop_installer(paths).await?;
-    if rc == 0 {
-        Ok(UpgradeOffer::ExitAfterInstall)
+    let workflow_url = installer_workflow_url(&default_repo_slug());
+    print_line("");
+    info("Installer workflow (landing page, not a permanent installer download):");
+    print_line(&format!("  {CYAN}{workflow_url}{RESET}"));
+    if let Some(artifact) = installer_artifact_for_current_host() {
+        info(&format!("Choose the `{artifact}` artifact for this host."));
     } else {
-        Ok(UpgradeOffer::Failed(rc))
+        warn("This OS/architecture has no packaged artifact in the workflow; see the README for source-build instructions.");
     }
+    info("Select the latest successful completed run on `main` (green check), then download the matching artifact.");
+    warn("Artifacts are unsigned and retained for 14 days; they are not permanent release downloads.");
+    if try_open_url(&workflow_url) {
+        ok("Requested opening the installer workflow in your browser.");
+    } else {
+        warn("Could not open a browser automatically; use the workflow URL shown above.");
+    }
+    info("Run the downloaded platform installer manually to update; this command does not install it.");
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
 
-    use super::{cmd_reset_cooldowns, quote_windows_arg};
+    use super::{cmd_reset_cooldowns, installer_artifact_for_current_host, quote_windows_arg};
     use vpngate_core::{AppPaths, CooldownStore, VpnProtocol, load_cooldowns, now_unix_secs};
+
+    #[test]
+    fn updater_selects_only_an_artifact_built_for_this_host() {
+        let expected = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            Some("vpngate-installer-linux-x64-run")
+        } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+            Some("vpngate-installer-windows-x64-msi")
+        } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+            Some("vpngate-installer-macos-x64-pkg")
+        } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            Some("vpngate-installer-macos-arm64-pkg")
+        } else {
+            None
+        };
+        assert_eq!(installer_artifact_for_current_host(), expected);
+    }
 
     #[test]
     fn cooldown_reset_command_clears_saved_penalties() {

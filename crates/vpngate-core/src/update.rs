@@ -186,18 +186,10 @@ pub fn version_check_urls(slug: &str) -> Vec<String> {
     urls
 }
 
-pub fn installer_script_urls(slug: &str) -> Vec<String> {
-    if cfg!(windows) {
-        vec![
-            format!("https://raw.githubusercontent.com/{slug}/main/install-vpngate.ps1"),
-            format!("https://cdn.jsdelivr.net/gh/{slug}@main/install-vpngate.ps1"),
-        ]
-    } else {
-        vec![
-            format!("https://raw.githubusercontent.com/{slug}/main/install-vpngate.sh"),
-            format!("https://cdn.jsdelivr.net/gh/{slug}@main/install-vpngate.sh"),
-        ]
-    }
+/// Workflow landing page for installers on `main`; this is not a direct installer URL.
+/// Artifacts are unsigned manual downloads and expire after the workflow retention period.
+pub fn installer_workflow_url(slug: &str) -> String {
+    format!("https://github.com/{slug}/actions/workflows/build-installers.yml?query=branch%3Amain")
 }
 
 /// Parse a tiny `desktop-version.txt` (`0.2.20`) or `[workspace.package] version`.
@@ -638,6 +630,14 @@ edition = "2024"
         ));
 
         let _ = std::fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn installer_workflow_url_is_a_branch_filtered_github_actions_landing_page() {
+        assert_eq!(
+            installer_workflow_url("warmaster726/vpngate-connect"),
+            "https://github.com/warmaster726/vpngate-connect/actions/workflows/build-installers.yml?query=branch%3Amain"
+        );
     }
 
     #[test]

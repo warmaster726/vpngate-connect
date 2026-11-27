@@ -52,61 +52,41 @@
     return { id: "linux", label: "Linux · Patched .ovpn + native CLI", apple: false, mobile: false };
   }
 
-  var INSTALL_SH = "https://raw.githubusercontent.com/warmaster726/vpngate-connect/main/install-vpngate.sh";
-  var INSTALL_PS1 = "https://raw.githubusercontent.com/warmaster726/vpngate-connect/main/install-vpngate.ps1";
-  var INSTALL_CMDS = {
+  var INSTALLER_WORKFLOW_URL = "https://github.com/warmaster726/vpngate-connect/actions/workflows/build-installers.yml?query=branch%3Amain";
+  var INSTALLER_INFO = {
     linux: {
-      hint: "Linux / macOS · POSIX sh",
-      install: "curl -fsSL " + INSTALL_SH + " | sh -s --",
-      uninstall: "curl -fsSL " + INSTALL_SH + " | sh -s -- --uninstall"
+      hint: "Linux x64 · self-extracting .run",
+      detail: "From the latest successful main-branch run, download vpngate-installer-linux-x64-run (the artifact is the .run file itself). Run chmod +x vpngate-installer-linux-x64.run && ./vpngate-installer-linux-x64.run; add uninstall to the command to remove the client."
     },
     windows: {
-      hint: "Windows 11 · Administrator PowerShell",
-      install: "irm " + INSTALL_PS1 + " | iex",
-      uninstall: "irm " + INSTALL_PS1 + " -OutFile $env:TEMP\\install-vpngate.ps1; powershell -ExecutionPolicy Bypass -File $env:TEMP\\install-vpngate.ps1 --uninstall"
+      hint: "Windows x64 · MSI",
+      detail: "Download and run the vpngate-installer-windows-x64-msi artifact (the MSI itself). Uninstall from Windows Settings → Apps → Installed apps."
+    },
+    macos: {
+      hint: "macOS · Intel x64 or Apple Silicon arm64 .pkg",
+      detail: "Download vpngate-installer-macos-x64-pkg for Intel or vpngate-installer-macos-arm64-pkg for Apple Silicon, then open the .pkg. The package is unsigned. To uninstall, run: sudo \"/Library/Application Support/VPN Gate Connect Installer/vpngate-installer.app/Contents/MacOS/vpngate-installer\" uninstall --yes."
     }
   };
 
   function defaultInstallOs() {
-    return (state.device && state.device.id === "windows") ? "windows" : "linux";
+    if (state.device && state.device.id === "windows") return "windows";
+    if (state.device && state.device.id === "macos") return "macos";
+    return "linux";
   }
 
   function applyInstallOs(os) {
-    if (os !== "windows") os = "linux";
+    if (!INSTALLER_INFO[os]) os = "linux";
     state.installOs = os;
-    var cmds = INSTALL_CMDS[os];
+    var info = INSTALLER_INFO[os];
     var hint = document.getElementById("install-os-hint");
-    var installBtn = document.getElementById("install-copy");
-    var uninstallBtn = document.getElementById("uninstall-copy");
-    if (hint) hint.textContent = cmds.hint;
-    if (installBtn) {
-      installBtn.textContent = cmds.install;
-      installBtn.setAttribute("data-cmd", cmds.install);
-      installBtn.setAttribute("title", cmds.install);
-    }
-    if (uninstallBtn) {
-      uninstallBtn.textContent = cmds.uninstall;
-      uninstallBtn.setAttribute("data-cmd", cmds.uninstall);
-      uninstallBtn.setAttribute("title", cmds.uninstall);
-    }
+    var detail = document.getElementById("install-os-info");
+    var link = document.getElementById("desktop-installer-link");
+    if (hint) hint.textContent = info.hint;
+    if (detail) detail.textContent = info.detail;
+    if (link) link.href = INSTALLER_WORKFLOW_URL;
     document.querySelectorAll("#install-os-pills .chip").forEach(function (c) {
       c.classList.toggle("active", c.getAttribute("data-install-os") === os);
     });
-  }
-
-  function copyDesktopCommand(btn, okMsg) {
-    var cmd = "";
-    if (btn) cmd = (btn.getAttribute("data-cmd") || btn.textContent || "").trim();
-    if (!cmd) return;
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(cmd).then(function () {
-        appendLog("ok", okMsg);
-      }).catch(function () {
-        appendLog("warn", "Copy failed — select the command manually.");
-      });
-    } else {
-      appendLog("info", cmd);
-    }
   }
 
   function flagEmoji(cc) {
@@ -1733,19 +1713,6 @@
         applyInstallOs(btn.getAttribute("data-install-os"));
       });
     }
-    var copyBtn = document.getElementById("install-copy");
-    if (copyBtn) {
-      copyBtn.addEventListener("click", function () {
-        copyDesktopCommand(copyBtn, "Desktop install command copied.");
-      });
-    }
-    var uninstallBtn = document.getElementById("uninstall-copy");
-    if (uninstallBtn) {
-      uninstallBtn.addEventListener("click", function () {
-        copyDesktopCommand(uninstallBtn, "Desktop uninstall command copied.");
-      });
-    }
-
     document.body.addEventListener("click", function (e) {
       var ovBtn = e.target.closest("[data-ovpn-href]");
       if (ovBtn) {
