@@ -6,7 +6,7 @@ Host-integration implementations now exist for all three platforms. Native CI bu
 
 ## Build
 
-Requirements: CMake 3.24+, a C++20 compiler, and Qt 6.8+ Core and Widgets. Qt 6.9+ is required when building against the macOS 26 SDK.
+Requirements: CMake 3.16+, a C++20 compiler, and Qt 6.4+ Core and Widgets. Qt 6.9+ is required when building against the macOS 26 SDK.
 
 ```sh
 cmake -S installer-cpp -B installer-cpp/build -DCMAKE_BUILD_TYPE=Release
@@ -16,9 +16,13 @@ ctest --test-dir installer-cpp/build --output-on-failure
 
 The client payload is built from the existing Rust CLI and GUI projects. The full CLI workflow can bootstrap a temporary minimal Rust toolchain if Cargo is missing; `--keep-toolchain` requests a persistent toolchain. Windows selects native MSVC tools when available or MinGW-w64 for a GNU Rust target. Signing and release publishing are outside this migration work.
 
-## Native CI bundles
+## Native CI installers
 
-`.github/workflows/build-installers.yml` builds and tests the app on native Windows Server 2022, Ubuntu 24.04, macOS 15 Intel, and macOS 26 ARM64 runners. It packages `vpngate-installer-windows-x64.zip` (Qt runtime deployed with `windeployqt`), `vpngate-installer-linux-x64.tar.gz` (a Qt-deployed AppDir), and macOS x64/ARM64 app-bundle ZIPs (Qt runtime deployed with `macdeployqt`). Each package is uploaded as a single-file artifact with `archive: false`, so downloading it from the Actions page returns the `.zip` or `.tar.gz` bundle itself rather than an additional outer ZIP; extract the downloaded bundle once. GitHub Actions retains each artifact for 14 days. The workflow runs on relevant pushes to `feature/cpp-installer` or `main`, pull requests targeting `main`, or manual dispatch; it does not create release tags or GitHub Releases. These unsigned bundles contain the C++ installer only: the Rust VPN client is downloaded/built when an install workflow is invoked. Passing CI packaging checks does not establish host-level parity or replace the legacy scripts.
+`.github/workflows/build-installers.yml` builds and tests the C++ helper on native Windows Server 2022, Ubuntu 24.04, macOS 15 Intel, and macOS 26 ARM64 runners. It produces one installer file per target: `vpngate-installer-windows-x64.msi`, `vpngate-installer-linux-x64.run`, and separate `vpngate-installer-macos-x64.pkg` / `vpngate-installer-macos-arm64.pkg` packages. The Windows MSI runs the helper as a deferred per-user custom action; Linux uses a self-extracting `.run`; macOS runs a `pkgbuild` postinstall action. The Actions artifacts are uploaded with `archive: false`, so each download is the installer itself, not an outer ZIP. GitHub Actions retains each artifact for 14 days. The workflow runs on relevant pushes to `feature/cpp-installer` or `main`, pull requests targeting `main`, or manual dispatch; it does not create release tags or GitHub Releases.
+
+At install time the helper downloads the Rust source, builds the CLI and GUI, and installs them. It reuses an available Rust/Cargo toolchain and does not remove one that was already present. If Rust is missing, it bootstraps an isolated minimal toolchain and removes that temporary toolchain after the operation (`--remove-toolchain`); the existing full workflow also cleans up any temporary native compile packages it added. The Linux `.run` can be launched with `sh ./vpngate-installer-linux-x64.run` (or made executable with `chmod +x`); pass `uninstall` to the same file to remove the client. MSI uninstall runs the matching client cleanup action. The macOS `.pkg` is architecture-specific and unsigned; it retains its helper under `/Library/Application Support/VPN Gate Connect Installer` for later maintenance or uninstall. For example, uninstall the client with `sudo "/Library/Application Support/VPN Gate Connect Installer/vpngate-installer.app/Contents/MacOS/vpngate-installer" uninstall --yes`. On a macOS package install with no logged-in console user, the postinstall action skips optional Homebrew/OpenVPN provisioning rather than attempting to run Homebrew as root. These installers require network access and may require platform build prerequisites or administrator approval. Windows installs per-user and avoids machine-wide OpenVPN changes; Linux uses the existing full system workflow, while macOS runs it for the active console user and skips optional Homebrew/OpenVPN provisioning when no user is logged in.
+
+All installers are unsigned. Passing CI packaging checks does not establish host-level parity or replace the legacy scripts; controlled install, upgrade, rollback/failure, and uninstall tests on the target operating systems remain necessary.
 
 ## CLI
 

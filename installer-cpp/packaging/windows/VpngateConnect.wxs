@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="VPN Gate Connect Installer"
+           Manufacturer="VPN Gate Connect"
+           Version="$(var.ProductVersion)"
+           UpgradeCode="c1d25155-2688-41b4-8f00-5171abc46c85"
+           Scope="perUser"
+           InstallerVersion="500">
+    <SummaryInformation Description="VPN Gate Connect installer helper" Manufacturer="VPN Gate Connect" />
+    <MajorUpgrade DowngradeErrorMessage="A newer VPN Gate Connect installer is already installed."
+                  Schedule="afterInstallInitialize" />
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="INSTALLFOLDER" Name="VPN Gate Connect">
+        <Directory Id="INSTALLDIR" Name="Installer" />
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="MainFeature" Title="VPN Gate Connect Installer" Level="1" />
+
+    <!--
+      The generated payload fragment gives every per-user file component an HKCU key path and
+      schedules removal of every created directory. The helper's install operation is transactional;
+      the MSI rollback cleanup is limited to fresh installs so it cannot erase the old client on upgrade.
+    -->
+    <CustomAction Id="InstallClient"
+                  FileRef="InstallerExecutable"
+                  ExeCommand="install --user-only --yes --remove-toolchain --skip-openvpn"
+                  Execute="deferred"
+                  Impersonate="yes"
+                  Return="check" />
+    <CustomAction Id="RollbackInstallClient"
+                  FileRef="InstallerExecutable"
+                  ExeCommand="uninstall --user-only --yes --skip-openvpn"
+                  Execute="rollback"
+                  Impersonate="yes"
+                  Return="ignore" />
+    <CustomAction Id="UninstallClient"
+                  FileRef="InstallerExecutable"
+                  ExeCommand="uninstall --user-only --yes --skip-openvpn"
+                  Execute="deferred"
+                  Impersonate="yes"
+                  Return="check" />
+
+    <InstallExecuteSequence>
+      <Custom Action="RollbackInstallClient"
+              Before="InstallClient"
+              Condition="NOT Installed AND NOT WIX_UPGRADE_DETECTED" />
+      <Custom Action="InstallClient" After="InstallFiles" Condition="NOT Installed" />
+      <Custom Action="UninstallClient" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>

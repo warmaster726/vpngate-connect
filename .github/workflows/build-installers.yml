@@ -1,4 +1,4 @@
-name: Build portable installer bundles
+name: Build platform installers
 
 on:
   workflow_dispatch:
@@ -31,17 +31,21 @@ permissions:
 
 jobs:
   windows-x64:
-    name: Windows x64 bundle
+    name: Windows x64 MSI
     runs-on: windows-2022
     steps:
       - name: Check out source
         uses: actions/checkout@v7
+      - name: Set up Python for MSI payload generation
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
 
       - name: Install Qt 6 for MSVC
         uses: jurplel/install-qt-action@v4
         with:
           # aqtinstall 3.3.x used by this action cannot yet resolve Qt 6.11+ Windows paths.
-          version: '6.8.3'
+          version: '>=6.8.0,<6.11.0'
           host: windows
           target: desktop
           arch: win64_msvc2022_64
@@ -76,7 +80,7 @@ jobs:
           }
           exit 0
 
-      - name: Deploy Qt runtime and archive
+      - name: Build single-file MSI
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -89,37 +93,58 @@ jobs:
           New-Item -ItemType Directory -Path $stage -Force | Out-Null
           Copy-Item -LiteralPath $sourceExe -Destination $stage
           Copy-Item -LiteralPath 'LICENSE' -Destination (Join-Path $stage 'LICENSE')
+          @'
+          VPN Gate Connect per-user installer helper
+
+          The MSI runs this helper as a deferred custom action to download the Rust source,
+          build and install the VPN Gate client, and remove a temporary Rust toolchain.
+          The helper is retained to support MSI uninstall and maintenance.
+          '@ | Set-Content -LiteralPath (Join-Path $stage 'README.txt') -Encoding utf8
 
           $windeployqt = Join-Path $qtRoot 'bin/windeployqt.exe'
           if (-not (Test-Path -LiteralPath $windeployqt)) { throw "Missing windeployqt: $windeployqt" }
           & $windeployqt --release --compiler-runtime --no-translations `
             --dir $stage (Join-Path $stage 'vpngate-installer.exe')
           if ($LASTEXITCODE -ne 0) { throw "windeployqt failed with exit code $LASTEXITCODE" }
-
-          @'
-          VPN Gate Connect Installer - Windows x64
-
-          Run vpngate-installer.exe --help for CLI usage, or launch it without arguments for the GUI.
-          The installer downloads/builds the VPN client when an install workflow is run.
-          '@ | Set-Content -LiteralPath (Join-Path $stage 'README.txt') -Encoding utf8
-
           & (Join-Path $stage 'vpngate-installer.exe') --help
-          if ($LASTEXITCODE -ne 0) { throw 'Packaged Windows installer --help check failed.' }
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged Windows helper --help check failed.' }
 
-          $archive = Join-Path $env:RUNNER_TEMP 'vpngate-installer-windows-x64.zip'
-          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $archive -Force
-          "WINDOWS_BUNDLE=$archive" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          $payloadWxs = Join-Path $env:RUNNER_TEMP 'vpngate-installer-payload.wxs'
+          python installer-cpp/packaging/windows/generate-payload-wxs.py `
+            --payload-dir $stage --output $payloadWxs
+          if ($LASTEXITCODE -ne 0) { throw 'Could not generate WiX payload authoring.' }
 
-      - name: Upload Windows bundle without an outer artifact ZIP
+          # WiX 7 adds a mandatory OSMF EULA acceptance; stay on the compatible 6.x line.
+          dotnet tool install --global wix --version '6.*'
+          if ($LASTEXITCODE -ne 0) { throw 'Could not install the latest WiX 6.x Toolset.' }
+          $wix = Join-Path $env:USERPROFILE '.dotnet/tools/wix.exe'
+          if (-not (Test-Path -LiteralPath $wix)) { throw "Missing WiX executable: $wix" }
+
+          $msi = Join-Path $env:RUNNER_TEMP 'vpngate-installer-windows-x64.msi'
+          $productVersion = "0.1.$env:GITHUB_RUN_NUMBER"
+          $wixArgs = @(
+            'build',
+            'installer-cpp/packaging/windows/VpngateConnect.wxs',
+            $payloadWxs,
+            '-arch', 'x64',
+            '-d', "ProductVersion=$productVersion",
+            '-o', $msi
+          )
+          & $wix @wixArgs
+          if ($LASTEXITCODE -ne 0) { throw "WiX MSI build failed with exit code $LASTEXITCODE" }
+          if (-not (Test-Path -LiteralPath $msi)) { throw "MSI output was not created: $msi" }
+
+      - name: Upload Windows MSI without an outer artifact ZIP
         uses: actions/upload-artifact@v7
         with:
-          path: ${{ runner.temp }}/vpngate-installer-windows-x64.zip
+          name: vpngate-installer-windows-x64-msi
+          path: ${{ runner.temp }}/vpngate-installer-windows-x64.msi
           archive: false
           if-no-files-found: error
           retention-days: 14
 
   linux-x64:
-    name: Linux x64 bundle
+    name: Linux x64 self-extracting installer
     runs-on: ubuntu-24.04
     steps:
       - name: Check out source
@@ -131,10 +156,10 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake ninja-build curl file patchelf desktop-file-utils
 
-      - name: Install Qt 6 LTS
+      - name: Install latest compatible Qt 6
         uses: jurplel/install-qt-action@v4
         with:
-          version: '6.12.0'
+          version: '>=6.4.0,<7.0.0'
           host: linux
           target: desktop
           arch: linux_gcc_64
@@ -172,7 +197,7 @@ jobs:
       - name: Run tests
         run: ctest --test-dir build/linux --output-on-failure
 
-      - name: Deploy Qt runtime and archive AppDir
+      - name: Build single-file Linux installer
         shell: bash
         run: |
           set -euo pipefail
@@ -193,12 +218,6 @@ jobs:
           Icon=vpngate-installer
           Categories=Network;Utility;
           Terminal=false
-          EOF
-          cat > "$appdir/README.txt" <<'EOF'
-          VPN Gate Connect Installer - Linux x64
-
-          Extract this archive and run ./AppRun --help, or launch ./AppRun without arguments for the GUI.
-          The installer downloads/builds the VPN client when an install workflow is run.
           EOF
 
           curl --fail --location --retry 3 \
@@ -224,23 +243,30 @@ jobs:
             --desktop-file "$appdir/usr/share/applications/vpngate-installer.desktop" \
             --icon-file "$appdir/usr/share/icons/hicolor/512x512/apps/vpngate-installer.png" \
             --plugin qt
-
           test -x "$appdir/AppRun"
           "$appdir/AppRun" --help
-          archive="$RUNNER_TEMP/vpngate-installer-linux-x64.tar.gz"
-          tar -czf "$archive" -C "$appdir" .
-          echo "LINUX_BUNDLE=$archive" >> "$GITHUB_OUTPUT"
 
-      - name: Upload Linux bundle without an outer artifact ZIP
+          installer="$RUNNER_TEMP/vpngate-installer-linux-x64.run"
+          sh installer-cpp/packaging/linux/create-run-installer.sh "$appdir" "$installer"
+          test -x "$installer"
+          "$installer" --dry-run --skip-deps > "$RUNNER_TEMP/linux-run-smoke.log" 2>&1 || {
+            cat "$RUNNER_TEMP/linux-run-smoke.log"
+            exit 1
+          }
+          grep -q '\[plan\] Download' "$RUNNER_TEMP/linux-run-smoke.log"
+          cat "$RUNNER_TEMP/linux-run-smoke.log"
+
+      - name: Upload Linux .run without an outer artifact ZIP
         uses: actions/upload-artifact@v7
         with:
-          path: ${{ runner.temp }}/vpngate-installer-linux-x64.tar.gz
+          name: vpngate-installer-linux-x64-run
+          path: ${{ runner.temp }}/vpngate-installer-linux-x64.run
           archive: false
           if-no-files-found: error
           retention-days: 14
 
   macos:
-    name: macOS ${{ matrix.arch }} bundle
+    name: macOS ${{ matrix.arch }} package
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -257,9 +283,8 @@ jobs:
       - name: Install Qt 6 and Ninja
         uses: jurplel/install-qt-action@v4
         with:
-          # Qt 6.9+ no longer links the removed AGL framework from the macOS 26 SDK.
-          # Qt 6.12 is the current LTS release.
-          version: '6.12.0'
+          # macOS 26 needs Qt 6.9+ because newer Qt drops the removed AGL framework.
+          version: '>=6.9.0,<7.0.0'
           host: mac
           target: desktop
           arch: clang_64
@@ -330,7 +355,7 @@ jobs:
           fi
           exit 0
 
-      - name: Deploy Qt runtime and archive app bundle
+      - name: Build single-file macOS .pkg
         shell: bash
         run: |
           set -euo pipefail
@@ -361,39 +386,49 @@ jobs:
             exit 1
           fi
           cat "$deploy_log"
+          "$app_bundle/Contents/MacOS/vpngate-installer" --help
 
-          help_log="$RUNNER_TEMP/macos-help.log"
-          if ! "$app_bundle/Contents/MacOS/vpngate-installer" --help > "$help_log" 2>&1; then
-            cat "$help_log"
-            diagnostics=$(tail -n 80 "$help_log")
-            diagnostics=${diagnostics//%/%25}
-            diagnostics=${diagnostics//$'\r'/%0D}
-            diagnostics=${diagnostics//$'\n'/%0A}
-            echo "::error title=macOS CLI smoke test::$diagnostics"
-            exit 1
-          fi
-          cat "$help_log"
+          stage="$RUNNER_TEMP/vpngate-installer-macos-${{ matrix.arch }}.pkgroot"
+          helper_dir="$stage/Library/Application Support/VPN Gate Connect Installer"
+          mkdir -p "$helper_dir"
+          ditto "$app_bundle" "$helper_dir/vpngate-installer.app"
+          cp LICENSE "$helper_dir/LICENSE"
+          cat > "$helper_dir/README.txt" <<'EOF'
+          VPN Gate Connect macOS installer helper
 
-          stage="$RUNNER_TEMP/vpngate-installer-macos-${{ matrix.arch }}"
-          mkdir -p "$stage"
-          ditto "$app_bundle" "$stage/vpngate-installer.app"
-          cp LICENSE "$stage/LICENSE"
-          cat > "$stage/README.txt" <<'EOF'
-          VPN Gate Connect Installer - macOS ${{ matrix.arch }}
+          The .pkg postinstall action downloads the Rust source, builds and installs the VPN Gate
+          client, and removes any temporary Rust toolchain. The helper is retained for maintenance.
+          To uninstall the client later, run this helper with: uninstall --yes
 
-          Open vpngate-installer.app for the GUI, or run:
-          vpngate-installer.app/Contents/MacOS/vpngate-installer --help
-          The installer downloads/builds the VPN client when an install workflow is run.
-          This CI bundle is unsigned and is intended for testing.
+          This package is unsigned; use only a package obtained from the project Actions workflow.
           EOF
 
-          archive="$RUNNER_TEMP/vpngate-installer-macos-${{ matrix.arch }}.zip"
-          ditto -c -k --sequesterRsrc --keepParent "$stage" "$archive"
+          scripts="$RUNNER_TEMP/vpngate-installer-macos-scripts"
+          mkdir -p "$scripts"
+          cp installer-cpp/packaging/macos/postinstall "$scripts/postinstall"
+          chmod 0755 "$scripts/postinstall"
+          /bin/sh -n "$scripts/postinstall"
 
-      - name: Upload macOS bundle without an outer artifact ZIP
+          package="$RUNNER_TEMP/vpngate-installer-macos-${{ matrix.arch }}.pkg"
+          package_version="0.1.${GITHUB_RUN_NUMBER}"
+          pkgbuild \
+            --root "$stage" \
+            --scripts "$scripts" \
+            --identifier "net.vpngate.connect.installer.${{ matrix.arch }}" \
+            --version "$package_version" \
+            --install-location / \
+            --ownership recommended \
+            "$package"
+          test -s "$package"
+          pkgutil --payload-files "$package" > "$RUNNER_TEMP/macos-pkg-payload.txt"
+          grep -F 'vpngate-installer.app/Contents/MacOS/vpngate-installer' \
+            "$RUNNER_TEMP/macos-pkg-payload.txt"
+
+      - name: Upload macOS .pkg without an outer artifact ZIP
         uses: actions/upload-artifact@v7
         with:
-          path: ${{ runner.temp }}/vpngate-installer-macos-${{ matrix.arch }}.zip
+          name: vpngate-installer-macos-${{ matrix.arch }}-pkg
+          path: ${{ runner.temp }}/vpngate-installer-macos-${{ matrix.arch }}.pkg
           archive: false
           if-no-files-found: error
           retention-days: 14

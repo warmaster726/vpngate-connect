@@ -1463,6 +1463,11 @@ void installRuntimePackages(Options &options, QStringList *output) {
         output->append(QStringLiteral("[warn] xcode-select was not found; install Apple Command Line Tools before compiling from source."));
     }
 
+    if (options.skipOpenVPN) {
+        output->append(QStringLiteral("[skip] OpenVPN installation was disabled with --skip-openvpn."));
+        return;
+    }
+
     QString brew = QStandardPaths::findExecutable(QStringLiteral("brew"));
     if (brew.isEmpty()) {
         for (const QString &candidate : {QStringLiteral("/opt/homebrew/bin/brew"),

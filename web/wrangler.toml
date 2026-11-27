@@ -11,8 +11,14 @@
 
 name = 'connect'
 main = "build/index.js"
-compatibility_date = "2026-10-26"
+compatibility_date = "2026-10-01"
 workers_dev = true
+
+[placement]
+mode = "smart"
+
+[cache]
+enabled = true
 
 [build]
 command = "if ! command -v rustc >/dev/null 2>&1; then curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y; fi; . \"$HOME/.cargo/env\"; rustup target add wasm32-unknown-unknown; cargo install -q worker-build@^0.8; worker-build --release"
