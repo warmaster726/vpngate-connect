@@ -253,7 +253,7 @@ jobs:
             cat "$RUNNER_TEMP/linux-run-smoke.log"
             exit 1
           }
-          grep -q '\[plan\] Download' "$RUNNER_TEMP/linux-run-smoke.log"
+          grep -q '\[plan\] Would build the Rust CLI and GUI with Cargo first' "$RUNNER_TEMP/linux-run-smoke.log"
           cat "$RUNNER_TEMP/linux-run-smoke.log"
 
       - name: Upload Linux .run without an outer artifact ZIP
